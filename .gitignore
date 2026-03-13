@@ -1,0 +1,21 @@
+# Secrets
+bridge/config.json
+.session-token
+
+# Runtime
+bridge/state.json
+bridge/bridge.pid
+telegram-images/
+
+# Logs
+logs/
+
+# User data (populated during use)
+workspace/memory/*.md
+workspace/feedback/*.md
+
+# macOS
+.DS_Store
+
+# Node
+node_modules/

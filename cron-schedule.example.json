@@ -1,0 +1,34 @@
+{
+  "description": "NativeClaw cron schedule. The bridge reads this on startup and checks every 60 seconds.",
+  "timezone": "America/New_York",
+  "crons": [
+    {
+      "name": "morning-brief",
+      "schedule": "30 7 * * *",
+      "timeout": 300,
+      "model": "sonnet",
+      "prompt": "Good morning. Check the user's calendar for today, check for any urgent emails, and send a morning briefing via bash $HOME/.claude/scripts/telegram_direct.sh \"[briefing text]\""
+    },
+    {
+      "name": "end-of-day-summary",
+      "schedule": "0 20 * * *",
+      "timeout": 300,
+      "model": "sonnet",
+      "prompt": "End of day. Read today's daily log from memory/. Summarize what was accomplished, what's still open, and what's coming tomorrow. Send via bash $HOME/.claude/scripts/telegram_direct.sh \"[summary]\""
+    },
+    {
+      "name": "heartbeat",
+      "schedule": "*/30 * * * *",
+      "timeout": 300,
+      "model": "sonnet",
+      "prompt": "Heartbeat check. Read HEARTBEAT.md for instructions. Only alert the user if something needs attention. Quiet hours: 10 PM - 6 AM — skip during quiet hours."
+    },
+    {
+      "name": "task-queue-recovery",
+      "schedule": "20 * * * *",
+      "timeout": 300,
+      "model": "sonnet",
+      "prompt": "TASK QUEUE RECOVERY. Read $HOME/.claude/workspace/system/task-queue/queue.json. If any tasks have status 'pending' or 'rate-limited': attempt them now. Update status in queue.json. retryCount >= 5 = 'failed'. Do NOT message the user."
+    }
+  ]
+}

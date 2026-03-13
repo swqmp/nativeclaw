@@ -1,0 +1,8 @@
+{
+  "botToken": "YOUR_TELEGRAM_BOT_TOKEN",
+  "allowedChatIds": ["YOUR_CHAT_ID"],
+  "workspace": "$HOME/.claude/workspace",
+  "mcpConfig": "$HOME/.claude/workspace/.mcp.json",
+  "cronSchedule": "$HOME/.claude/cron-schedule.json",
+  "model": "sonnet"
+}

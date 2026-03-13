@@ -1,0 +1,25 @@
+{
+  "mcpServers": {
+    "google-calendar": {
+      "command": "node",
+      "args": ["PATH_TO_GOOGLE_CALENDAR_MCP/dist/index.js"],
+      "env": {
+        "GOOGLE_CLIENT_ID": "YOUR_CLIENT_ID",
+        "GOOGLE_CLIENT_SECRET": "YOUR_CLIENT_SECRET",
+        "GOOGLE_REDIRECT_URI": "http://localhost:3000/oauth2callback"
+      }
+    },
+    "email": {
+      "command": "node",
+      "args": ["PATH_TO_EMAIL_MCP/dist/index.js"],
+      "env": {
+        "IMAP_HOST": "imap.gmail.com",
+        "IMAP_USER": "your@gmail.com",
+        "IMAP_PASS": "YOUR_APP_PASSWORD",
+        "SMTP_HOST": "smtp.gmail.com",
+        "SMTP_USER": "your@gmail.com",
+        "SMTP_PASS": "YOUR_APP_PASSWORD"
+      }
+    }
+  }
+}

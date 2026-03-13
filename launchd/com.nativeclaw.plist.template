@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.nativeclaw.session</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>__HOME__/.claude/scripts/claude-restart.sh</string>
+    </array>
+
+    <!-- 71 hours = 255600 seconds. Restarts before Claude Code's 72-hour session expiry. -->
+    <key>StartInterval</key>
+    <integer>255600</integer>
+
+    <!-- Start immediately when loaded -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on crash (non-zero exit), NOT on clean exit -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/.claude/logs/launchd-session.stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/.claude/logs/launchd-session.stderr.log</string>
+
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+
+    <key>WorkingDirectory</key>
+    <string>__HOME__/.claude/workspace</string>
+</dict>
+</plist>

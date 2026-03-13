@@ -1,0 +1,23 @@
+[Unit]
+Description=NativeClaw — Personal AI Agent via Telegram
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=__USER__
+Environment=PATH=/usr/local/bin:/usr/bin:/bin:__HOME__/.local/bin
+ExecStart=/bin/bash __HOME__/.claude/scripts/claude-restart.sh
+Restart=on-failure
+RestartSec=30
+
+# 71 hours = 255600 seconds. Restart before Claude Code's 72-hour session expiry.
+RuntimeMaxSec=255600
+
+StandardOutput=append:__HOME__/.claude/logs/launchd-session.stdout.log
+StandardError=append:__HOME__/.claude/logs/launchd-session.stderr.log
+
+WorkingDirectory=__HOME__/.claude/workspace
+
+[Install]
+WantedBy=default.target
