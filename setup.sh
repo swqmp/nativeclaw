@@ -203,20 +203,12 @@ echo "[7/8] Auth token..."
 
 if [ -s "$CLAUDE_DIR/.session-token" ]; then
     echo "  Token already configured. Skipping."
-elif [ -n "$CLAUDE_CODE_SESSION_ACCESS_TOKEN" ]; then
-    echo "$CLAUDE_CODE_SESSION_ACCESS_TOKEN" > "$CLAUDE_DIR/.session-token"
-    chmod 600 "$CLAUDE_DIR/.session-token"
-    echo "  Auth token saved automatically."
 else
-    echo "  Auth token not detected. This is normal — the token only"
-    echo "  exists inside a running Claude Code session."
+    echo "  Setting up auth token. This will open your browser."
     echo ""
-    echo "  To save your token, open Claude Code and run this command:"
+    claude setup-token
     echo ""
-    echo "    bash -c 'echo \"\$CLAUDE_CODE_SESSION_ACCESS_TOKEN\" > ~/.claude/.session-token && chmod 600 ~/.claude/.session-token && echo \"Token saved.\"'"
-    echo ""
-    echo "  NativeClaw won't work until this is done."
-    read -p "  Press Enter to continue setup..."
+    echo "  Auth token configured."
 fi
 
 echo ""
