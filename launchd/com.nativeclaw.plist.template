@@ -12,9 +12,9 @@
         <string>__HOME__/.claude/scripts/claude-restart.sh</string>
     </array>
 
-    <!-- 71 hours = 255600 seconds. Restarts before Claude Code's 72-hour session expiry. -->
+    <!-- 7 days = 604800 seconds. Weekly restart for general hygiene. -->
     <key>StartInterval</key>
-    <integer>255600</integer>
+    <integer>604800</integer>
 
     <!-- Start immediately when loaded -->
     <key>RunAtLoad</key>

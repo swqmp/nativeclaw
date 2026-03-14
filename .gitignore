@@ -1,6 +1,5 @@
 # Secrets
 bridge/config.json
-.session-token
 
 # Runtime
 bridge/state.json

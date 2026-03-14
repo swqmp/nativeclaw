@@ -1,11 +1,10 @@
 #!/bin/bash
 # NativeClaw — Session Lifecycle Manager
-# Called by launchd every 71 hours (before 72-hour session expiry)
-# Reads auth token from file, starts the Telegram bridge
+# Called by launchd/systemd. Starts the Telegram bridge.
+# Auth is handled by Claude's keychain credentials (via claude setup-token).
 
 BRIDGE_DIR="$HOME/.claude/telegram-bridge"
 BRIDGE_PID_FILE="$BRIDGE_DIR/bridge.pid"
-TOKEN_FILE="$HOME/.claude/.session-token"
 LOG_DIR="$HOME/.claude/logs"
 LOG="$LOG_DIR/restart.log"
 
@@ -54,26 +53,11 @@ if [ -f "$BRIDGE_PID_FILE" ]; then
     rm -f "$BRIDGE_PID_FILE"
 fi
 
-# Read auth token
-if [ ! -f "$TOKEN_FILE" ]; then
-    log "ERROR: No auth token file at $TOKEN_FILE"
-    log "Fix: Run this from a terminal where Claude is authenticated:"
-    log "  echo \"\$CLAUDE_CODE_SESSION_ACCESS_TOKEN\" > $TOKEN_FILE && chmod 600 $TOKEN_FILE"
-    while true; do sleep 3600 & wait; done
-fi
-
-TOKEN=$(cat "$TOKEN_FILE" | tr -d '[:space:]')
-if [ -z "$TOKEN" ]; then
-    log "ERROR: Auth token file is empty."
-    while true; do sleep 3600 & wait; done
-fi
-
-log "Auth token loaded from $TOKEN_FILE"
-
 # Start the bridge
+# Auth is handled automatically by claude -p via keychain credentials.
 log "Starting Telegram bridge..."
 cd "$BRIDGE_DIR"
-CLAUDE_CODE_SESSION_ACCESS_TOKEN="$TOKEN" nohup /opt/homebrew/bin/node bridge.js >> "$LOG_DIR/telegram-bridge.log" 2>&1 &
+nohup node bridge.js >> "$LOG_DIR/telegram-bridge.log" 2>&1 &
 sleep 3
 
 if [ -f "$BRIDGE_PID_FILE" ]; then
@@ -84,7 +68,7 @@ fi
 
 log "=== Restart cycle complete. Blocking until next cycle. ==="
 
-# Block forever — launchd manages lifecycle via SIGTERM + StartInterval
+# Block forever — service manager handles lifecycle
 while true; do
     sleep 3600 &
     wait
