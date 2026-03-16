@@ -7,7 +7,7 @@ NativeClaw gives you a 24/7 AI assistant that:
 - Runs scheduled tasks (morning briefs, end-of-day summaries, heartbeat checks)
 - Maintains persistent memory across conversations
 - Manages itself via macOS launchd or Linux systemd (auto-restarts, survives reboots)
-- Supports image analysis, model switching, extended thinking
+- Supports image analysis, voice messages, file attachments, model switching, extended thinking
 
 ## Requirements
 
@@ -15,6 +15,7 @@ NativeClaw gives you a 24/7 AI assistant that:
 - **Claude Max subscription** (provides Claude Code CLI access)
 - **Node.js** (v18+)
 - **Telegram account** + a bot from [@BotFather](https://t.me/BotFather)
+- **Whisper** (optional, for voice message transcription) — `pip install openai-whisper`
 
 ## Quick Start
 
@@ -43,7 +44,7 @@ You (Telegram) → Bridge (Node.js) → Claude Code CLI (claude -p) → Response
 ```
 
 - **Bridge** (`bridge.js`) — Polls Telegram for messages, spawns `claude -p` subprocesses, sends responses back
-- **Service manager** — launchd (macOS) or systemd (Linux) keeps the bridge running 24/7, restarts on crash, cycles every 71 hours
+- **Service manager** — launchd (macOS) or systemd (Linux) keeps the bridge running 24/7, restarts on crash, weekly restart for hygiene
 - **Workspace** — Agent's brain: personality (SOUL.md), rules (AGENTS.md), memory (MEMORY.md), tools (.mcp.json)
 
 ## File Structure
@@ -66,7 +67,6 @@ You (Telegram) → Bridge (Node.js) → Claude Code CLI (claude -p) → Response
 │   ├── claude-restart.sh  # Lifecycle manager
 │   └── telegram_direct.sh # Direct Telegram messaging (for crons)
 ├── cron-schedule.json     # Scheduled tasks
-├── .session-token         # Claude auth token
 └── logs/
     └── telegram-bridge.log
 ```
@@ -121,6 +121,18 @@ tail -f ~/.claude/logs/telegram-bridge.log
 | `/stats` | Last response stats |
 | `/status` | System status |
 | `/help` | All commands |
+
+## Supported Media
+
+| Type | How It Works |
+|---|---|
+| **Text** | Sent directly to Claude |
+| **Images** | Downloaded, passed to Claude for visual analysis |
+| **Voice messages** | Transcribed locally with Whisper, sent as text to Claude |
+| **Audio files** | Same as voice — transcribed with Whisper |
+| **Files** (PDF, DOCX, XLSX, PPTX, TXT, CSV, JSON, Markdown) | Downloaded, passed to Claude for reading |
+
+Send a file with a caption to tell the agent what to do with it. No caption defaults to "Read and summarize."
 
 ## Customization
 

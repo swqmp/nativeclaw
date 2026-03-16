@@ -141,12 +141,12 @@ function splitText(text, maxLen) {
 // TELEGRAM IMAGE DOWNLOAD
 // ============================================================
 
-async function downloadTelegramFile(fileId) {
+async function downloadTelegramFile(fileId, prefix = 'file') {
   // Get file path from Telegram
   const fileInfo = await tg('getFile', { file_id: fileId });
   const filePath = fileInfo.file_path;
-  const ext = path.extname(filePath) || '.jpg';
-  const localName = `photo_${Date.now()}${ext}`;
+  const ext = path.extname(filePath) || '';
+  const localName = `${prefix}_${Date.now()}${ext}`;
   const localPath = path.join(IMAGE_DIR, localName);
 
   // Download the file
@@ -158,6 +158,25 @@ async function downloadTelegramFile(fileId) {
 
   log(`Downloaded Telegram file: ${localPath} (${buffer.length} bytes)`);
   return localPath;
+}
+
+async function transcribeVoice(audioPath) {
+  const { execSync } = require('child_process');
+  const outputDir = path.dirname(audioPath);
+  const baseName = path.basename(audioPath, path.extname(audioPath));
+
+  execSync(
+    `whisper "${audioPath}" --model base --output_format txt --output_dir "${outputDir}" --language en`,
+    { timeout: 60000, env: { ...process.env, PATH: `/Users/iamiahbartlett/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH}` } }
+  );
+
+  const txtPath = path.join(outputDir, `${baseName}.txt`);
+  const transcript = fs.readFileSync(txtPath, 'utf8').trim();
+
+  // Clean up whisper output file
+  try { fs.unlinkSync(txtPath); } catch {}
+
+  return transcript;
 }
 
 // ============================================================
@@ -763,10 +782,53 @@ async function pollTelegram() {
         });
       }
 
-      // Handle voice messages (placeholder — needs whisper integration)
+      // Handle voice messages — transcribe with Whisper, send to Claude
       if (msg.voice) {
-        log(`Voice message from ${chatId} — voice handling not yet implemented`);
-        await sendMessage(chatId, 'Voice messages not supported yet. Please send text.');
+        try {
+          const voicePath = await downloadTelegramFile(msg.voice.file_id, 'voice');
+          log(`Voice message from ${userName}: ${msg.voice.duration}s`);
+          const transcript = await transcribeVoice(voicePath);
+          log(`Transcribed voice: ${transcript.substring(0, 100)}...`);
+          // Clean up audio file
+          try { fs.unlinkSync(voicePath); } catch {}
+          if (transcript) {
+            enqueueTelegram({
+              chatId,
+              text: transcript,
+              username: msg.from?.username,
+              firstName: msg.from?.first_name,
+            });
+          } else {
+            await sendMessage(chatId, "Couldn't transcribe that voice message. Try again or send text.");
+          }
+        } catch (err) {
+          log(`Voice transcription failed: ${err.message}`);
+          await sendMessage(chatId, `Voice transcription failed: ${err.message}`);
+        }
+      }
+
+      // Handle audio files (forwarded voice notes, audio attachments)
+      if (msg.audio) {
+        try {
+          const audioPath = await downloadTelegramFile(msg.audio.file_id, 'audio');
+          log(`Audio file from ${userName}: ${msg.audio.duration}s`);
+          const transcript = await transcribeVoice(audioPath);
+          log(`Transcribed audio: ${transcript.substring(0, 100)}...`);
+          try { fs.unlinkSync(audioPath); } catch {}
+          if (transcript) {
+            enqueueTelegram({
+              chatId,
+              text: transcript,
+              username: msg.from?.username,
+              firstName: msg.from?.first_name,
+            });
+          } else {
+            await sendMessage(chatId, "Couldn't transcribe that audio. Try again or send text.");
+          }
+        } catch (err) {
+          log(`Audio transcription failed: ${err.message}`);
+          await sendMessage(chatId, `Audio transcription failed: ${err.message}`);
+        }
       }
 
       // Handle photos
@@ -788,16 +850,39 @@ async function pollTelegram() {
         }
       }
 
-      // Handle document uploads (images only)
+      // Handle document uploads (images + files)
       if (msg.document) {
         const mime = msg.document.mime_type || '';
-        if (mime.startsWith('image/')) {
+        const fileName = msg.document.file_name || 'unknown';
+        const caption = msg.caption || '';
+
+        // Supported file types
+        const imageTypes = ['image/'];
+        const fileTypes = [
+          'application/pdf',
+          'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // docx
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // xlsx
+          'application/vnd.openxmlformats-officedocument.presentationml.presentation', // pptx
+          'application/msword', // doc
+          'application/vnd.ms-excel', // xls
+          'text/plain',
+          'text/csv',
+          'text/markdown',
+          'application/json',
+          'application/xml',
+          'text/html',
+        ];
+
+        const isImage = imageTypes.some(t => mime.startsWith(t));
+        const isFile = fileTypes.some(t => mime === t) || fileName.match(/\.(pdf|docx?|xlsx?|pptx?|txt|csv|md|json|xml|html)$/i);
+
+        if (isImage) {
           try {
-            const imagePath = await downloadTelegramFile(msg.document.file_id);
-            const caption = msg.caption || 'Describe what you see.';
+            const imagePath = await downloadTelegramFile(msg.document.file_id, 'photo');
+            const prompt = caption || 'Describe what you see.';
             enqueueTelegram({
               chatId,
-              text: `Read the image at ${imagePath} and respond to it. ${caption}`,
+              text: `Read the image at ${imagePath} and respond to it. ${prompt}`,
               username: msg.from?.username,
               firstName: msg.from?.first_name,
               _imagePath: imagePath,
@@ -806,8 +891,24 @@ async function pollTelegram() {
             log(`Failed to download document image: ${err.message}`);
             await sendMessage(chatId, `Failed to download image: ${err.message}`);
           }
+        } else if (isFile) {
+          try {
+            const filePath = await downloadTelegramFile(msg.document.file_id, 'doc');
+            const prompt = caption || `Read and summarize this file: ${fileName}`;
+            log(`File attachment from ${userName}: ${fileName} (${mime})`);
+            enqueueTelegram({
+              chatId,
+              text: `Read the file at ${filePath} (original name: ${fileName}). ${prompt}`,
+              username: msg.from?.username,
+              firstName: msg.from?.first_name,
+              _imagePath: filePath, // reuse cleanup mechanism
+            });
+          } catch (err) {
+            log(`Failed to download file: ${err.message}`);
+            await sendMessage(chatId, `Failed to download file: ${err.message}`);
+          }
         } else {
-          await sendMessage(chatId, `${mime} files not supported yet. Images only for now.`);
+          await sendMessage(chatId, `${mime || 'Unknown'} file type not supported. Supported: images, PDF, DOCX, XLSX, PPTX, TXT, CSV, JSON, Markdown.`);
         }
       }
     }
