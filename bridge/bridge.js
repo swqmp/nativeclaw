@@ -17,12 +17,15 @@ const path = require('path');
 // CONFIG & STATE
 // ============================================================
 
+const HOME = process.env.HOME || process.env.USERPROFILE;
+const IS_WINDOWS = process.platform === 'win32';
+
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const STATE_PATH = path.join(__dirname, 'state.json');
 const PID_PATH = path.join(__dirname, 'bridge.pid');
-const LOG_DIR = path.join(process.env.HOME, '.claude', 'logs');
+const LOG_DIR = path.join(HOME, '.claude', 'logs');
 const LOG_PATH = path.join(LOG_DIR, 'telegram-bridge.log');
-const IMAGE_DIR = path.join(process.env.HOME, '.claude', 'telegram-images');
+const IMAGE_DIR = path.join(HOME, '.claude', 'telegram-images');
 
 // Ensure log and image directories exist
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -165,9 +168,13 @@ async function transcribeVoice(audioPath) {
   const outputDir = path.dirname(audioPath);
   const baseName = path.basename(audioPath, path.extname(audioPath));
 
+  const whisperEnv = IS_WINDOWS
+    ? { ...process.env }
+    : { ...process.env, PATH: `${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH}` };
+
   execSync(
     `whisper "${audioPath}" --model base --output_format txt --output_dir "${outputDir}" --language en`,
-    { timeout: 60000, env: { ...process.env, PATH: `/Users/iamiahbartlett/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH}` } }
+    { timeout: 60000, env: whisperEnv }
   );
 
   const txtPath = path.join(outputDir, `${baseName}.txt`);
@@ -223,6 +230,7 @@ function runClaude(prompt, sessionId, options = {}) {
       cwd: WORKSPACE,
       env: cleanEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
+      shell: IS_WINDOWS,
     });
 
     activeSubprocess = proc;
@@ -237,8 +245,8 @@ function runClaude(prompt, sessionId, options = {}) {
     const timeoutMs = (options.timeout || 300) * 1000;
     const timer = setTimeout(() => {
       log(`Claude subprocess timed out after ${timeoutMs}ms, killing...`);
-      proc.kill('SIGTERM');
-      setTimeout(() => proc.kill('SIGKILL'), 5000);
+      proc.kill(IS_WINDOWS ? 'SIGTERM' : 'SIGTERM');
+      setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 5000);
     }, timeoutMs);
 
     proc.on('close', (code) => {
@@ -954,7 +962,8 @@ async function main() {
   // Verify claude is available
   try {
     const { execSync } = require('child_process');
-    const version = execSync('claude --version 2>/dev/null || echo "unknown"').toString().trim();
+    const versionCmd = IS_WINDOWS ? 'claude --version 2>nul || echo unknown' : 'claude --version 2>/dev/null || echo "unknown"';
+    const version = execSync(versionCmd).toString().trim();
     log(`Claude Code version: ${version}`);
   } catch {
     log('WARNING: Could not detect Claude Code version');

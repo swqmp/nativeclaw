@@ -23,9 +23,15 @@ echo ""
 # -------------------------------------------------------
 echo "[1/8] Checking prerequisites..."
 
+OS="$(uname -s)"
+
 if ! command -v node &> /dev/null; then
     echo "ERROR: Node.js is not installed."
-    echo "Install it: brew install node (macOS) or https://nodejs.org"
+    if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
+        echo "Install it: https://nodejs.org"
+    else
+        echo "Install it: brew install node (macOS) or https://nodejs.org"
+    fi
     exit 1
 fi
 
@@ -125,11 +131,16 @@ echo "[5/8] Installing files..."
 # Bridge
 cp "$REPO_DIR/bridge/bridge.js" "$BRIDGE_DIR/bridge.js"
 
-# Scripts
-cp "$REPO_DIR/scripts/claude-restart.sh" "$SCRIPTS_DIR/claude-restart.sh"
-cp "$REPO_DIR/scripts/telegram_direct.sh" "$SCRIPTS_DIR/telegram_direct.sh"
-chmod +x "$SCRIPTS_DIR/claude-restart.sh"
-chmod +x "$SCRIPTS_DIR/telegram_direct.sh"
+# Scripts — platform-specific
+if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
+    cp "$REPO_DIR/windows/claude-restart.ps1" "$SCRIPTS_DIR/claude-restart.ps1"
+    cp "$REPO_DIR/windows/telegram_direct.ps1" "$SCRIPTS_DIR/telegram_direct.ps1"
+else
+    cp "$REPO_DIR/scripts/claude-restart.sh" "$SCRIPTS_DIR/claude-restart.sh"
+    cp "$REPO_DIR/scripts/telegram_direct.sh" "$SCRIPTS_DIR/telegram_direct.sh"
+    chmod +x "$SCRIPTS_DIR/claude-restart.sh"
+    chmod +x "$SCRIPTS_DIR/telegram_direct.sh"
+fi
 
 # Workspace templates (only if they don't already exist — don't overwrite)
 for file in CLAUDE.md SOUL.md AGENTS.md MEMORY.md USER.md HEARTBEAT.md IDENTITY.md TOOLS.md; do
@@ -192,7 +203,12 @@ cat > "$BRIDGE_DIR/config.json" << EOF
 }
 EOF
 
-chmod 600 "$BRIDGE_DIR/config.json"
+if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
+    WIN_CONFIG=$(cygpath -w "$BRIDGE_DIR/config.json")
+    icacls "$WIN_CONFIG" /inheritance:r /grant:r "$USERNAME:(R,W)" > /dev/null 2>&1
+else
+    chmod 600 "$BRIDGE_DIR/config.json"
+fi
 echo "  Config written to $BRIDGE_DIR/config.json"
 echo ""
 
@@ -217,8 +233,6 @@ echo ""
 # Install service (launchd on macOS, systemd on Linux)
 # -------------------------------------------------------
 echo "[8/8] Installing service..."
-
-OS="$(uname -s)"
 
 if [ "$OS" = "Darwin" ]; then
     # macOS — launchd
@@ -281,6 +295,46 @@ elif [ "$OS" = "Linux" ]; then
     echo "  Restart: systemctl --user restart nativeclaw"
     echo "  Status:  systemctl --user status nativeclaw"
     echo "  Logs:    tail -f ~/.claude/logs/telegram-bridge.log"
+    echo "============================================"
+
+elif [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
+    # Windows — Task Scheduler
+    WIN_HOME=$(cygpath -w "$HOME")
+    WIN_USERNAME=$(whoami)
+    TASK_XML="$SCRIPTS_DIR/nativeclaw-task.xml"
+
+    sed -e "s|__HOME__|$WIN_HOME|g" -e "s|__USERNAME__|$WIN_USERNAME|g" "$REPO_DIR/windows/nativeclaw-task.xml" > "$TASK_XML"
+
+    echo "  Task Scheduler XML written to $TASK_XML"
+    echo ""
+
+    read -p "  Register and start NativeClaw task now? [y/N]: " START_NOW
+
+    if [[ "$START_NOW" =~ ^[Yy]$ ]]; then
+        WIN_TASK_XML=$(cygpath -w "$TASK_XML")
+        schtasks /create /tn "NativeClaw" /xml "$WIN_TASK_XML" /f > /dev/null 2>&1
+        if [ $? -eq 0 ]; then
+            schtasks /run /tn "NativeClaw" > /dev/null 2>&1
+            echo "  NativeClaw is running!"
+        else
+            echo "  Failed to register task. Try running Git Bash as Administrator."
+            echo "  Or register manually:"
+            echo "    schtasks /create /tn \"NativeClaw\" /xml \"$WIN_TASK_XML\" /f"
+        fi
+    else
+        echo "  To start later, run in an admin terminal:"
+        echo "    schtasks /create /tn \"NativeClaw\" /xml \"$(cygpath -w "$TASK_XML")\" /f"
+        echo "    schtasks /run /tn \"NativeClaw\""
+    fi
+
+    echo ""
+    echo "============================================"
+    echo "  Setup complete!"
+    echo ""
+    echo "  Start:   schtasks /run /tn \"NativeClaw\""
+    echo "  Stop:    schtasks /end /tn \"NativeClaw\""
+    echo "  Delete:  schtasks /delete /tn \"NativeClaw\" /f"
+    echo "  Logs:    type %USERPROFILE%\\.claude\\logs\\telegram-bridge.log"
     echo "============================================"
 
 else
