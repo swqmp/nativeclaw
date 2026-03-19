@@ -3,6 +3,7 @@
 // Telegram Bridge for Claude Code Native Setup
 // Custom built — no external dependencies, Node.js built-in modules only
 // Handles: Telegram message reception/response + cron job scheduling
+// Version: 1.5.1
 //
 // Architecture:
 //   Telegram polling → message queue → claude -p subprocess → response back to Telegram
@@ -17,15 +18,12 @@ const path = require('path');
 // CONFIG & STATE
 // ============================================================
 
-const HOME = process.env.HOME || process.env.USERPROFILE;
-const IS_WINDOWS = process.platform === 'win32';
-
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const STATE_PATH = path.join(__dirname, 'state.json');
 const PID_PATH = path.join(__dirname, 'bridge.pid');
-const LOG_DIR = path.join(HOME, '.claude', 'logs');
+const LOG_DIR = path.join(process.env.HOME, '.claude', 'logs');
 const LOG_PATH = path.join(LOG_DIR, 'telegram-bridge.log');
-const IMAGE_DIR = path.join(HOME, '.claude', 'telegram-images');
+const IMAGE_DIR = path.join(process.env.HOME, '.claude', 'telegram-images');
 
 // Ensure log and image directories exist
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -168,13 +166,9 @@ async function transcribeVoice(audioPath) {
   const outputDir = path.dirname(audioPath);
   const baseName = path.basename(audioPath, path.extname(audioPath));
 
-  const whisperEnv = IS_WINDOWS
-    ? { ...process.env }
-    : { ...process.env, PATH: `${HOME}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH}` };
-
   execSync(
     `whisper "${audioPath}" --model base --output_format txt --output_dir "${outputDir}" --language en`,
-    { timeout: 60000, env: whisperEnv }
+    { timeout: 60000, env: { ...process.env, PATH: `/Users/iamiahbartlett/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH}` } }
   );
 
   const txtPath = path.join(outputDir, `${baseName}.txt`);
@@ -230,7 +224,6 @@ function runClaude(prompt, sessionId, options = {}) {
       cwd: WORKSPACE,
       env: cleanEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
-      shell: IS_WINDOWS,
     });
 
     activeSubprocess = proc;
@@ -245,8 +238,8 @@ function runClaude(prompt, sessionId, options = {}) {
     const timeoutMs = (options.timeout || 300) * 1000;
     const timer = setTimeout(() => {
       log(`Claude subprocess timed out after ${timeoutMs}ms, killing...`);
-      proc.kill(IS_WINDOWS ? 'SIGTERM' : 'SIGTERM');
-      setTimeout(() => { try { proc.kill('SIGKILL'); } catch {} }, 5000);
+      proc.kill('SIGTERM');
+      setTimeout(() => proc.kill('SIGKILL'), 5000);
     }, timeoutMs);
 
     proc.on('close', (code) => {
@@ -314,9 +307,24 @@ const cronQueue = [];
 let processingTelegram = false;
 let processingCron = false;
 
+// Debounce: collect Telegram chunks before processing
+const chatDebounceTimers = {};
+const DEBOUNCE_MS = 1500;
+
 function enqueueTelegram(item) {
   telegramQueue.push(item);
-  processTelegramQueue();
+
+  // Start typing indicator immediately so it doesn't feel unresponsive during debounce
+  tg('sendChatAction', { chat_id: item.chatId, action: 'typing' }).catch(() => {});
+
+  // Reset debounce timer for this chat — wait until chunks stop arriving
+  if (chatDebounceTimers[item.chatId]) {
+    clearTimeout(chatDebounceTimers[item.chatId]);
+  }
+  chatDebounceTimers[item.chatId] = setTimeout(() => {
+    delete chatDebounceTimers[item.chatId];
+    processTelegramQueue();
+  }, DEBOUNCE_MS);
 }
 
 function enqueueCron(item) {
@@ -330,6 +338,17 @@ async function processTelegramQueue() {
 
   while (telegramQueue.length > 0) {
     const item = telegramQueue.shift();
+
+    // Collapse consecutive messages from the same chat (Telegram splits long messages into chunks)
+    while (telegramQueue.length > 0 && telegramQueue[0].chatId === item.chatId) {
+      const next = telegramQueue.shift();
+      item.text = item.text + '\n' + next.text;
+      // Carry over attachments from subsequent chunks
+      if (next._imagePath && !item._imagePath) {
+        item._imagePath = next._imagePath;
+      }
+    }
+
     try {
       await handleTelegramMessage(item);
     } catch (err) {
@@ -962,8 +981,7 @@ async function main() {
   // Verify claude is available
   try {
     const { execSync } = require('child_process');
-    const versionCmd = IS_WINDOWS ? 'claude --version 2>nul || echo unknown' : 'claude --version 2>/dev/null || echo "unknown"';
-    const version = execSync(versionCmd).toString().trim();
+    const version = execSync('claude --version 2>/dev/null || echo "unknown"').toString().trim();
     log(`Claude Code version: ${version}`);
   } catch {
     log('WARNING: Could not detect Claude Code version');
