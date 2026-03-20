@@ -3,7 +3,7 @@
 // Telegram Bridge for Claude Code Native Setup
 // Custom built — no external dependencies, Node.js built-in modules only
 // Handles: Telegram message reception/response + cron job scheduling
-// Version: 1.5.1
+// Version: 1.5.2
 //
 // Architecture:
 //   Telegram polling → message queue → claude -p subprocess → response back to Telegram
@@ -167,7 +167,7 @@ async function transcribeVoice(audioPath) {
   const baseName = path.basename(audioPath, path.extname(audioPath));
 
   execSync(
-    `whisper "${audioPath}" --model base --output_format txt --output_dir "${outputDir}" --language en`,
+    `whisper "${audioPath}" --model base.en --output_format txt --output_dir "${outputDir}" --language en`,
     { timeout: 60000, env: { ...process.env, PATH: `/Users/iamiahbartlett/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH}` } }
   );
 
@@ -813,7 +813,8 @@ async function pollTelegram() {
       if (msg.voice) {
         try {
           const voicePath = await downloadTelegramFile(msg.voice.file_id, 'voice');
-          log(`Voice message from ${userName}: ${msg.voice.duration}s`);
+          const voiceSender = msg.from?.first_name || msg.from?.username || 'User';
+          log(`Voice message from ${voiceSender}: ${msg.voice.duration}s`);
           const transcript = await transcribeVoice(voicePath);
           log(`Transcribed voice: ${transcript.substring(0, 100)}...`);
           // Clean up audio file
@@ -838,7 +839,8 @@ async function pollTelegram() {
       if (msg.audio) {
         try {
           const audioPath = await downloadTelegramFile(msg.audio.file_id, 'audio');
-          log(`Audio file from ${userName}: ${msg.audio.duration}s`);
+          const audioSender = msg.from?.first_name || msg.from?.username || 'User';
+          log(`Audio file from ${audioSender}: ${msg.audio.duration}s`);
           const transcript = await transcribeVoice(audioPath);
           log(`Transcribed audio: ${transcript.substring(0, 100)}...`);
           try { fs.unlinkSync(audioPath); } catch {}
