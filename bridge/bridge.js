@@ -3,7 +3,7 @@
 // Telegram Bridge for Claude Code Native Setup
 // Custom built — no external dependencies, Node.js built-in modules only
 // Handles: Telegram message reception/response + cron job scheduling
-// Version: 1.5.2
+// Version: 1.5.3
 //
 // Architecture:
 //   Telegram polling → message queue → claude -p subprocess → response back to Telegram
@@ -520,6 +520,7 @@ async function handleSlashCommand(chatId, text) {
         '/session — Show session info',
         '/status — System status',
         '/stop — Kill current task and clear queue',
+        '/restart — Restart the NativeClaw service',
         '/search <query> — Search memory (QMD)',
         '/help — This message',
       ].join('\n');
@@ -796,6 +797,23 @@ async function pollTelegram() {
         } else {
           await sendMessage(chatId, 'Nothing running to stop.');
         }
+        continue;
+      }
+
+      // Handle /restart — send confirmation then restart the service
+      if (msg.text && msg.text.trim().toLowerCase() === '/restart') {
+        const restartCmd = config.restartCommand;
+        if (!restartCmd) {
+          await sendMessage(chatId, 'No restartCommand configured in config.json.');
+          continue;
+        }
+        log('/restart received — restarting service...');
+        await sendMessage(\`Restarting... I\'ll be back in a few seconds.\`);
+        setTimeout(() => {
+          require('child_process').exec(restartCmd.replace(/~/g, process.env.HOME), (err) => {
+            if (err) log(`Restart error: ${err.message}`);
+          });
+        }, 500);
         continue;
       }
 

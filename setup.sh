@@ -295,6 +295,14 @@ echo ""
 # -------------------------------------------------------
 echo "[6/8] Generating config..."
 
+if [ "$OS" = "Darwin" ]; then
+    RESTART_CMD="launchctl unload ~/Library/LaunchAgents/com.nativeclaw.session.plist && launchctl load ~/Library/LaunchAgents/com.nativeclaw.session.plist"
+elif [ "$OS" = "Linux" ]; then
+    RESTART_CMD="systemctl --user restart nativeclaw"
+else
+    RESTART_CMD="schtasks /end /tn \"NativeClaw\" && schtasks /run /tn \"NativeClaw\""
+fi
+
 cat > "$BRIDGE_DIR/config.json" << EOF
 {
   "botToken": "$BOT_TOKEN",
@@ -302,7 +310,8 @@ cat > "$BRIDGE_DIR/config.json" << EOF
   "workspace": "$WORKSPACE_DIR",
   "mcpConfig": "$WORKSPACE_DIR/.mcp.json",
   "cronSchedule": "$CLAUDE_DIR/cron-schedule.json",
-  "model": "$MODEL"
+  "model": "$MODEL",
+  "restartCommand": "$RESTART_CMD"
 }
 EOF
 
