@@ -29,8 +29,8 @@ cleanup() {
         rm -f "$BRIDGE_PID_FILE"
     fi
 
-    log "Cleanup complete. Exiting 0."
-    exit 0
+    log "Cleanup complete. Exiting 1."
+    exit 1
 }
 
 trap cleanup SIGTERM SIGINT

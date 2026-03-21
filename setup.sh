@@ -296,11 +296,11 @@ echo ""
 echo "[6/8] Generating config..."
 
 if [ "$OS" = "Darwin" ]; then
-    RESTART_CMD="launchctl unload ~/Library/LaunchAgents/com.nativeclaw.session.plist && launchctl load ~/Library/LaunchAgents/com.nativeclaw.session.plist"
+    RESTART_CMD="nohup bash -c 'sleep 2 && launchctl unload ~/Library/LaunchAgents/com.nativeclaw.session.plist && launchctl load ~/Library/LaunchAgents/com.nativeclaw.session.plist' >/dev/null 2>&1 &"
 elif [ "$OS" = "Linux" ]; then
-    RESTART_CMD="systemctl --user restart nativeclaw"
+    RESTART_CMD="nohup bash -c 'sleep 2 && systemctl --user restart nativeclaw' >/dev/null 2>&1 &"
 else
-    RESTART_CMD="schtasks /end /tn \"NativeClaw\" && schtasks /run /tn \"NativeClaw\""
+    RESTART_CMD="nohup bash -c 'sleep 2 && schtasks /end /tn NativeClaw && schtasks /run /tn NativeClaw' >/dev/null 2>&1 &"
 fi
 
 cat > "$BRIDGE_DIR/config.json" << EOF
