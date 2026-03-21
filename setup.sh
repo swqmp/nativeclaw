@@ -325,6 +325,53 @@ echo "  Config written to $BRIDGE_DIR/config.json"
 echo ""
 
 # -------------------------------------------------------
+# Optional: Nano Banana image generation (Google Gemini)
+# -------------------------------------------------------
+echo "[Optional] Image Generation (Nano Banana)"
+echo ""
+echo "  Nano Banana enables AI image generation via Google Gemini."
+echo "  Get a free API key at: https://aistudio.google.com/apikey"
+echo "  (Press Enter to skip)"
+echo ""
+read -p "  Enter your Google AI API key: " GOOGLE_AI_KEY
+
+if [ -n "$GOOGLE_AI_KEY" ]; then
+    SETTINGS_FILE="$CLAUDE_DIR/settings.json"
+    python3 -c "
+import json, sys
+
+path = sys.argv[1]
+key = sys.argv[2]
+
+try:
+    with open(path, 'r') as f:
+        data = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    data = {}
+
+if 'mcpServers' not in data:
+    data['mcpServers'] = {}
+
+data['mcpServers']['nanobanana-mcp'] = {
+    'command': 'npx',
+    'args': ['-y', '@ycse/nanobanana-mcp'],
+    'env': {
+        'GOOGLE_AI_API_KEY': key,
+        'NANOBANANA_MODEL': 'gemini-3.1-flash-image-preview'
+    }
+}
+
+with open(path, 'w') as f:
+    json.dump(data, f, indent=2)
+print('  Nano Banana configured in settings.json')
+" "$SETTINGS_FILE" "$GOOGLE_AI_KEY"
+else
+    echo "  Skipping Nano Banana (no key provided)."
+fi
+
+echo ""
+
+# -------------------------------------------------------
 # Save auth token
 # -------------------------------------------------------
 echo "[7/8] Auth token..."
