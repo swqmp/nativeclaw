@@ -143,7 +143,7 @@ else
 fi
 
 # Workspace templates (only if they don't already exist — don't overwrite)
-for file in CLAUDE.md SOUL.md AGENTS.md MEMORY.md USER.md HEARTBEAT.md IDENTITY.md TOOLS.md; do
+for file in CLAUDE.md SOUL.md AGENTS.md MEMORY.md USER.md HEARTBEAT.md IDENTITY.md TOOLS.md NATIVECLAW.md; do
     if [ ! -f "$WORKSPACE_DIR/$file" ]; then
         cp "$REPO_DIR/workspace/$file" "$WORKSPACE_DIR/$file"
         echo "  Created $file"
@@ -169,6 +169,109 @@ fi
 if [ -d "$REPO_DIR/workspace/skills/mcp-builder" ]; then
     cp -R "$REPO_DIR/workspace/skills/mcp-builder" "$WORKSPACE_DIR/skills/" 2>/dev/null
     echo "  Installed skill: mcp-builder"
+fi
+if [ -d "$REPO_DIR/workspace/skills/onboarding" ]; then
+    cp -R "$REPO_DIR/workspace/skills/onboarding" "$WORKSPACE_DIR/skills/" 2>/dev/null
+    echo "  Installed skill: onboarding"
+fi
+
+# Write device.md with correct OS-specific commands
+if [ ! -f "$WORKSPACE_DIR/device.md" ]; then
+    if [ "$OS" = "Darwin" ]; then
+        PLIST="$HOME/Library/LaunchAgents/com.nativeclaw.session.plist"
+        cat > "$WORKSPACE_DIR/device.md" << DEVICEEOF
+# Device Configuration
+
+**OS:** macOS
+**Platform:** macOS (launchd)
+**Hostname:** $(hostname)
+
+## Service Commands
+
+**Start:**
+\`\`\`
+launchctl load $PLIST
+\`\`\`
+
+**Stop:**
+\`\`\`
+launchctl unload $PLIST
+\`\`\`
+
+**Restart:**
+\`\`\`
+launchctl unload $PLIST && launchctl load $PLIST
+\`\`\`
+
+**View logs:**
+\`\`\`
+tail -f ~/.claude/logs/telegram-bridge.log
+\`\`\`
+DEVICEEOF
+    elif [ "$OS" = "Linux" ]; then
+        cat > "$WORKSPACE_DIR/device.md" << DEVICEEOF
+# Device Configuration
+
+**OS:** Linux
+**Platform:** Linux (systemd)
+**Hostname:** $(hostname)
+
+## Service Commands
+
+**Start:**
+\`\`\`
+systemctl --user start nativeclaw
+\`\`\`
+
+**Stop:**
+\`\`\`
+systemctl --user stop nativeclaw
+\`\`\`
+
+**Restart:**
+\`\`\`
+systemctl --user restart nativeclaw
+\`\`\`
+
+**View logs:**
+\`\`\`
+journalctl --user -u nativeclaw -f
+\`\`\`
+DEVICEEOF
+    else
+        cat > "$WORKSPACE_DIR/device.md" << DEVICEEOF
+# Device Configuration
+
+**OS:** Windows
+**Platform:** Windows (Task Scheduler)
+**Hostname:** $(hostname)
+
+## Service Commands
+
+**Start:**
+\`\`\`
+schtasks /run /tn "NativeClaw"
+\`\`\`
+
+**Stop:**
+\`\`\`
+schtasks /end /tn "NativeClaw"
+\`\`\`
+
+**Restart:**
+\`\`\`
+schtasks /end /tn "NativeClaw" && schtasks /run /tn "NativeClaw"
+\`\`\`
+
+**View logs:**
+\`\`\`
+type %USERPROFILE%\.claude\logs\telegram-bridge.log
+\`\`\`
+DEVICEEOF
+    fi
+    echo "  Created device.md ($(uname -s))"
+else
+    echo "  Skipped device.md (already exists)"
 fi
 
 # Cron schedule
