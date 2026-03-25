@@ -1,5 +1,27 @@
 # NativeClaw Changelog
 
+## v1.6.0 — Performance & Reliability
+
+### Bridge (bridge.js)
+- **Lightweight cron context:** Cron jobs now run from `workspace/cron-workspace/` instead of the full workspace. Crons load ~80 lines of system prompt instead of your full agent context. Faster crons, less token waste, less identity confusion.
+- **Checkpoint enforcement:** Bridge tracks exchange count per session. After 8 messages without a daily log update, injects a checkpoint reminder into the next prompt. Prevents memory loss during long sessions.
+- **Exchange counter reset on /reset.**
+
+### New Files
+- `workspace/cron-workspace/CLAUDE.md` — Lightweight system prompt for cron jobs
+- `workspace/cron/CONTEXT_LITE.md` — Condensed context template for crons/heartbeats
+- `workspace/system/EVAL_FRAMEWORK.md` — Weekly self-evaluation template (5 metrics)
+- `scripts/agent-browser.sh` — Persistent Chromium via CDP for browser tasks needing login persistence (macOS + Linux)
+
+### Templates
+- **AGENTS.md** — Improved template with session start checklist, compaction canary, file organization guidance (keep under 200 lines)
+- **cron-schedule.example.json** — All example prompts now include identity prefix + weekly eval cron
+
+### Documentation
+- **OPERATIONS.md** — Added: hooks documentation (memory-check + feedback-detection), persistent browser setup, REFERENCE.md pattern
+
+---
+
 ## v1.5.2 — Voice transcription fix
 **Bug fixes:**
 - Fixed voice transcription failing on first run — Whisper was downloading the multilingual `base` model (139MB) on each invocation when not cached, causing timeouts. Switched to `base.en` (English-only, 72MB) which is faster, smaller, and caches reliably.

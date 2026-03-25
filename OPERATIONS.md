@@ -92,6 +92,75 @@ tail -30 ~/.claude/logs/restart.log
 | `~/.claude/workspace/.mcp.json` | MCP server configs |
 | `~/.claude/logs/telegram-bridge.log` | Activity log |
 
+## Hooks (Claude Code Settings)
+
+Hooks run shell commands in response to Claude Code events. Configure them in `~/.claude/settings.json` under `"hooks"`. Two patterns that dramatically improve agent reliability:
+
+### Memory Check Hook
+
+Triggers when the user mentions a client, person, or historical event. Injects a reminder to search memory before responding.
+
+Create a trigger file at `~/.claude/workspace/system/memory-hook-clients.txt` with one name per line:
+```
+client name
+another client
+lead name
+```
+
+Add to `settings.json` under `hooks.UserPromptSubmit`:
+```json
+{
+  "type": "command",
+  "command": "msg=$(jq -r '.tool_input.prompt // .tool_input.message // \"\"' 2>/dev/null | tr '[:upper:]' '[:lower:]'); clients=$(paste -sd'|' $HOME/.claude/workspace/system/memory-hook-clients.txt 2>/dev/null || echo ''); keywords='when did|what happened|do you remember|did we|last time|previously|how much|who is'; if echo \"$msg\" | grep -qiE \"$clients|$keywords\"; then jq -n '{\"hookSpecificOutput\": {\"hookEventName\": \"UserPromptSubmit\", \"additionalContext\": \"MEMORY CHECK: Search memory before responding with any historical claims.\"}}'; fi"
+}
+```
+
+When you add a new client or lead, add their name to `memory-hook-clients.txt`. No bridge restart needed.
+
+### Feedback Detection Hook
+
+Triggers when the user's message sounds like a correction. Injects a reminder to log the feedback immediately.
+
+Add as a second hook in the same `UserPromptSubmit` array:
+```json
+{
+  "type": "command",
+  "command": "msg=$(jq -r '.tool_input.prompt // .tool_input.message // \"\"' 2>/dev/null | tr '[:upper:]' '[:lower:]'); corrections='no,? not that|don.t do that|stop doing|that.s wrong|fix that|you forgot|you missed|go back|try again|i told you'; if echo \"$msg\" | grep -qiE \"$corrections\"; then jq -n '{\"hookSpecificOutput\": {\"hookEventName\": \"UserPromptSubmit\", \"additionalContext\": \"FEEDBACK DETECTED: The user may have corrected you. Log actionable feedback to the matching feedback/*.md file before continuing.\"}}'; fi"
+}
+```
+
+### Why Hooks Matter
+
+Without hooks, the agent relies entirely on its own discipline to search memory and log feedback. Hooks provide a mechanical enforcement layer — the bridge injects the reminder into the prompt before the agent sees it, so it can't skip the step.
+
+## Persistent Browser (Optional)
+
+For agents that need web browsing with persistent logins (Duo, OAuth, etc.):
+
+1. Install Chromium separately from your personal browser:
+   - macOS: `brew install --cask chromium` then `xattr -cr /Applications/Chromium.app`
+   - Linux: `sudo apt install chromium-browser`
+
+2. The repo includes `scripts/agent-browser.sh` — start/stop/status for a Chromium instance on CDP port 9222.
+
+3. Configure Playwright MCP to connect via CDP instead of spawning its own browser:
+   ```json
+   "browser": {
+     "command": "npx",
+     "args": ["@playwright/mcp@latest", "--cdp-endpoint", "http://localhost:9222"]
+   }
+   ```
+
+4. Agent runs `bash ~/.claude/scripts/agent-browser.sh start` before browser tasks, `stop` when done. Logins and cookies persist in the profile across messages.
+
+## REFERENCE.md Pattern
+
+As MEMORY.md grows past ~150 lines, split it:
+- **MEMORY.md** (~100-150 lines): Active context — current projects, pipeline, team, revenue
+- **REFERENCE.md** (~150+ lines): Static reference — devices, infrastructure, credentials notes, calendar color maps, folder structure
+
+Don't load REFERENCE.md into the system prompt. Index it in your search tool (e.g., QMD) so the agent can look it up on demand without burning context on every message.
+
 ## Troubleshooting
 
 **Bot not responding?**

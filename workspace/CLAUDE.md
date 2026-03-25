@@ -10,6 +10,9 @@
 ## This Device
 @device.md
 
+## Tools
+@TOOLS.md
+
 ## Context
 @MEMORY.md
 

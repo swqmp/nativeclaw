@@ -9,6 +9,17 @@ NativeClaw gives you a 24/7 AI assistant that:
 - Manages itself via macOS launchd, Linux systemd, or Windows Task Scheduler (auto-restarts, survives reboots)
 - Supports image analysis, voice messages, file attachments, model switching, extended thinking
 
+## What's New in v1.6.0
+
+- **Lightweight cron context** — Crons load ~80 lines instead of your full system prompt. Faster, cheaper, no identity confusion.
+- **Checkpoint enforcement** — Bridge automatically reminds the agent to write memory after 8 exchanges. No more memory loss from long sessions.
+- **Identity prefix pattern** — Cron prompts include agent identity, preventing "I'm a Claude Code UI" confusion.
+- **Persistent browser** — Shared Chromium via CDP so logins survive across messages.
+- **Eval framework** — Weekly self-evaluation with scored metrics.
+- **Hooks documentation** — Memory-check and feedback-detection hooks with file-based trigger lists.
+
+See [CHANGELOG.md](CHANGELOG.md) for full details.
+
 ## Requirements
 
 - **macOS, Linux, or Windows** (uses launchd on macOS, systemd on Linux, Task Scheduler on Windows)
@@ -55,22 +66,32 @@ You (Telegram) → Bridge (Node.js) → Claude Code CLI (claude -p) → Response
 ```
 ~/.claude/
 ├── telegram-bridge/
-│   ├── bridge.js          # Core bridge
+│   ├── bridge.js          # Core bridge (v1.6.0)
 │   ├── config.json        # Your bot token, chat ID, settings
-│   └── state.json         # Session state (auto-managed)
+│   └── state.json         # Session + exchange counter state (auto-managed)
 ├── workspace/
 │   ├── CLAUDE.md          # Agent instructions + onboarding
 │   ├── SOUL.md            # Agent personality
-│   ├── AGENTS.md          # Agent rules
-│   ├── MEMORY.md          # Persistent memory
+│   ├── AGENTS.md          # Agent rules (keep under 200 lines)
+│   ├── MEMORY.md          # Active business context
 │   ├── USER.md            # Info about you
+│   ├── TOOLS.md           # Tool reference
+│   ├── HEARTBEAT.md       # Heartbeat instructions
 │   ├── .mcp.json          # MCP server configs
-│   └── memory/            # Daily logs
+│   ├── memory/            # Daily logs
+│   ├── feedback/          # Output feedback logs
+│   ├── cron/
+│   │   └── CONTEXT_LITE.md  # Condensed context for crons
+│   ├── cron-workspace/
+│   │   └── CLAUDE.md      # Lightweight cron system prompt
+│   └── system/
+│       └── EVAL_FRAMEWORK.md  # Weekly self-eval metrics
 ├── scripts/
 │   ├── claude-restart.sh   # Lifecycle manager (macOS/Linux)
 │   ├── claude-restart.ps1  # Lifecycle manager (Windows)
-│   ├── telegram_direct.sh  # Direct Telegram messaging for crons (macOS/Linux)
-│   └── telegram_direct.ps1 # Direct Telegram messaging for crons (Windows)
+│   ├── telegram_direct.sh  # Direct Telegram messaging (macOS/Linux)
+│   ├── telegram_direct.ps1 # Direct Telegram messaging (Windows)
+│   └── agent-browser.sh   # Persistent Chromium for browser tasks
 ├── cron-schedule.json     # Scheduled tasks
 └── logs/
     └── telegram-bridge.log

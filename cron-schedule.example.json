@@ -7,28 +7,35 @@
       "schedule": "30 7 * * *",
       "timeout": 300,
       "model": "sonnet",
-      "prompt": "Good morning. Check the user's calendar for today, check for any urgent emails, and send a morning briefing via bash $HOME/.claude/scripts/telegram_direct.sh \"[briefing text]\""
+      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. Good morning. Check the user's calendar for today, check for any urgent emails, and send a morning briefing via bash $HOME/.claude/workspace/system/scripts/telegram_direct.sh \"[briefing text]\""
     },
     {
       "name": "end-of-day-summary",
       "schedule": "0 20 * * *",
       "timeout": 300,
       "model": "sonnet",
-      "prompt": "End of day. Read today's daily log from memory/. Summarize what was accomplished, what's still open, and what's coming tomorrow. Send via bash $HOME/.claude/scripts/telegram_direct.sh \"[summary]\""
+      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. End of day. Read today's daily log from memory/. Summarize what was accomplished, what's still open, and what's coming tomorrow. Send via bash $HOME/.claude/workspace/system/scripts/telegram_direct.sh \"[summary]\""
     },
     {
       "name": "heartbeat",
       "schedule": "*/30 * * * *",
       "timeout": 300,
       "model": "sonnet",
-      "prompt": "Heartbeat check. Read HEARTBEAT.md for instructions. Only alert the user if something needs attention. Quiet hours: 10 PM - 6 AM — skip during quiet hours."
+      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. Heartbeat check. Read HEARTBEAT.md for instructions. Only alert the user if something needs attention. Quiet hours: 10 PM - 6 AM — skip during quiet hours."
     },
     {
       "name": "task-queue-recovery",
       "schedule": "20 * * * *",
       "timeout": 300,
       "model": "sonnet",
-      "prompt": "TASK QUEUE RECOVERY. Read $HOME/.claude/workspace/system/task-queue/queue.json. If any tasks have status 'pending' or 'rate-limited': attempt them now. Update status in queue.json. retryCount >= 5 = 'failed'. Do NOT message the user."
+      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. TASK QUEUE RECOVERY. Read $HOME/.claude/workspace/system/task-queue/queue.json. If any tasks have status 'pending' or 'rate-limited': attempt them now. Update status in queue.json. retryCount >= 5 = 'failed'. Do NOT message the user."
+    },
+    {
+      "name": "weekly-eval",
+      "schedule": "0 21 * * 0",
+      "timeout": 300,
+      "model": "sonnet",
+      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. Weekly self-eval. Read system/EVAL_FRAMEWORK.md for metric definitions and scorecard format. Read all daily logs from the past 7 days. Score each metric. Save scorecard to memory/evals/YYYY-MM-DD-eval.md. Send via bash $HOME/.claude/workspace/system/scripts/telegram_direct.sh \"[scorecard]\""
     }
   ]
 }

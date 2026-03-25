@@ -3,7 +3,7 @@
 // Telegram Bridge for Claude Code Native Setup
 // Custom built — no external dependencies, Node.js built-in modules only
 // Handles: Telegram message reception/response + cron job scheduling
-// Version: 1.5.3
+// Version: 1.6.0
 //
 // Architecture:
 //   Telegram polling → message queue → claude -p subprocess → response back to Telegram
@@ -42,6 +42,7 @@ const BOT_TOKEN = config.botToken;
 const CLAUDE_API_KEY = config.claudeApiKey;
 const ALLOWED_CHAT_IDS = config.allowedChatIds.map(Number);
 const WORKSPACE = config.workspace;
+const CRON_WORKSPACE = path.join(config.workspace, 'cron-workspace');
 const MCP_CONFIG = config.mcpConfig;
 const CRON_SCHEDULE_PATH = config.cronSchedule;
 const DEFAULT_MODEL = config.model || 'sonnet';
@@ -50,14 +51,20 @@ const DEFAULT_MODEL = config.model || 'sonnet';
 let chatSettings = {};
 
 // Load or initialize state
-let state = { updateOffset: 0, sessions: {} };
+let state = { updateOffset: 0, sessions: {}, exchangeCount: {} };
 if (fs.existsSync(STATE_PATH)) {
   try {
     state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+    if (!state.exchangeCount) state.exchangeCount = {};
   } catch {
     // Corrupted state, start fresh
+    state = { updateOffset: 0, sessions: {}, exchangeCount: {} };
   }
 }
+
+// Checkpoint enforcement: track exchanges per session
+const CHECKPOINT_THRESHOLD = 8;
+const MEMORY_DIR = path.join(WORKSPACE, 'memory');
 
 // Write PID file for restart script
 fs.writeFileSync(PID_PATH, String(process.pid));
@@ -212,7 +219,10 @@ function runClaude(prompt, sessionId, options = {}) {
       args.push('--max-thinking-tokens', '10000');
     }
 
-    log(`Spawning: claude ${args.slice(0, 6).join(' ')}...`);
+    // Use lightweight cron workspace for cron jobs, full workspace for user messages
+    const cwd = options.isCron ? CRON_WORKSPACE : WORKSPACE;
+
+    log(`Spawning: claude ${args.slice(0, 6).join(' ')}... (cwd: ${options.isCron ? 'cron' : 'main'})`);
 
     // Strip only the "nested session" detection vars, keep session auth token
     const cleanEnv = { ...process.env };
@@ -221,7 +231,7 @@ function runClaude(prompt, sessionId, options = {}) {
     delete cleanEnv.MCP_CLAUDE;
 
     const proc = spawn('claude', args, {
-      cwd: WORKSPACE,
+      cwd: cwd,
       env: cleanEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -458,6 +468,7 @@ async function handleSlashCommand(chatId, text) {
     case '/reset':
     case '/new':
       delete state.sessions[sessionKey];
+      delete state.exchangeCount[sessionKey];
       saveState();
       return 'Session cleared. Next message starts a fresh conversation.';
 
@@ -561,10 +572,34 @@ async function handleTelegramMessage(item) {
   // Get existing session for this chat
   let sessionId = state.sessions[sessionKey] || null;
 
+  // Increment exchange counter for this session
+  if (!state.exchangeCount[sessionKey]) state.exchangeCount[sessionKey] = 0;
+  state.exchangeCount[sessionKey]++;
+
   // Build prompt — for /search, wrap with QMD instruction
   let prompt = text;
   if (text.startsWith('/search ')) {
     prompt = `Search memory using the QMD search_memory tool for: ${text.slice(8)}. Return the results.`;
+  }
+
+  // Checkpoint enforcement: inject reminder after N exchanges without a checkpoint
+  if (state.exchangeCount[sessionKey] >= CHECKPOINT_THRESHOLD) {
+    const today = new Date().toISOString().slice(0, 10);
+    const dailyLog = path.join(MEMORY_DIR, `${today}.md`);
+    let needsCheckpoint = true;
+    try {
+      if (fs.existsSync(dailyLog)) {
+        const logStat = fs.statSync(dailyLog);
+        const minutesSinceWrite = (Date.now() - logStat.mtimeMs) / (1000 * 60);
+        if (minutesSinceWrite < 5) needsCheckpoint = false; // Recently written
+      }
+    } catch {}
+    if (needsCheckpoint) {
+      prompt = `[SYSTEM REMINDER: You have exchanged ${state.exchangeCount[sessionKey]} messages without writing a checkpoint. Write to memory/${today}.md NOW before continuing. Include: what you did, decisions made, open questions, next actions, feedback logged. Then reindex memory if available.]\n\n${prompt}`;
+      log(`Checkpoint reminder injected after ${state.exchangeCount[sessionKey]} exchanges`);
+    }
+    state.exchangeCount[sessionKey] = 0; // Reset after injection or recent write
+    saveState();
   }
 
   // Determine model (per-chat override or default)
@@ -641,6 +676,7 @@ async function handleCronJob(item) {
       timeout: timeout || 300,
       model: model || DEFAULT_MODEL,
       maxTurns: 100,
+      isCron: true,
     });
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -808,7 +844,7 @@ async function pollTelegram() {
           continue;
         }
         log('/restart received — restarting service...');
-        await sendMessage(\`Restarting... I\'ll be back in a few seconds.\`);
+        await sendMessage(chatId, "Restarting... I'll be back in a few seconds.");
         setTimeout(() => {
           require('child_process').exec(restartCmd.replace(/~/g, process.env.HOME), (err) => {
             if (err) log(`Restart error: ${err.message}`);
