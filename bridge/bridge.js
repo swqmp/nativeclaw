@@ -21,9 +21,10 @@ const path = require('path');
 const CONFIG_PATH = path.join(__dirname, 'config.json');
 const STATE_PATH = path.join(__dirname, 'state.json');
 const PID_PATH = path.join(__dirname, 'bridge.pid');
-const LOG_DIR = path.join(process.env.HOME, '.claude', 'logs');
+const HOME_DIR = process.env.HOME || process.env.USERPROFILE;
+const LOG_DIR = path.join(HOME_DIR, '.claude', 'logs');
 const LOG_PATH = path.join(LOG_DIR, 'telegram-bridge.log');
-const IMAGE_DIR = path.join(process.env.HOME, '.claude', 'telegram-images');
+const IMAGE_DIR = path.join(HOME_DIR, '.claude', 'telegram-images');
 
 // Ensure log and image directories exist
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -175,7 +176,7 @@ async function transcribeVoice(audioPath) {
 
   execSync(
     `whisper "${audioPath}" --model base.en --output_format txt --output_dir "${outputDir}" --language en`,
-    { timeout: 60000, env: { ...process.env, PATH: `/Users/iamiahbartlett/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:${process.env.PATH}` } }
+    { timeout: 60000, env: { ...process.env, PATH: process.platform === 'darwin' ? `/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:${process.env.PATH}` : process.env.PATH } }
   );
 
   const txtPath = path.join(outputDir, `${baseName}.txt`);
@@ -846,7 +847,7 @@ async function pollTelegram() {
         log('/restart received — restarting service...');
         await sendMessage(chatId, "Restarting... I'll be back in a few seconds.");
         setTimeout(() => {
-          require('child_process').exec(restartCmd.replace(/~/g, process.env.HOME), (err) => {
+          require('child_process').exec(restartCmd.replace(/~/g, process.env.HOME || process.env.USERPROFILE), (err) => {
             if (err) log(`Restart error: ${err.message}`);
           });
         }, 500);

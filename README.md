@@ -39,6 +39,18 @@ bash setup.sh
 
 > **Windows users:** Run this in Git Bash or MSYS2, not Command Prompt or PowerShell.
 
+> [!WARNING]
+> **Windows — Run PowerShell as Administrator (required)**
+> 
+> Before running setup or any `.ps1` scripts, open PowerShell as Administrator and run:
+> ```powershell
+> Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+> ```
+> This is a one-time step. Without it, Windows will block all PowerShell scripts and the bridge won't start.
+> 
+> To open PowerShell as Administrator: right-click the Start button → **Windows PowerShell (Admin)** or **Terminal (Admin)**.
+> You do NOT need admin for day-to-day use — only for this one-time setup step.
+
 The setup wizard will:
 1. Check prerequisites (Node.js, Claude CLI)
 2. Walk you through Telegram bot setup
