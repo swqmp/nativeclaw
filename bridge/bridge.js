@@ -3,7 +3,7 @@
 // Telegram Bridge for Claude Code Native Setup
 // Custom built — no external dependencies, Node.js built-in modules only
 // Handles: Telegram message reception/response + cron job scheduling
-// Version: 1.6.0
+// Version: 1.6.1
 //
 // Architecture:
 //   Telegram polling → message queue → claude -p subprocess → response back to Telegram
@@ -47,6 +47,7 @@ const CRON_WORKSPACE = path.join(config.workspace, 'cron-workspace');
 const MCP_CONFIG = config.mcpConfig;
 const CRON_SCHEDULE_PATH = config.cronSchedule;
 const DEFAULT_MODEL = config.model || 'sonnet';
+const OPENAI_API_KEY = config.openaiApiKey || '';
 
 // Per-chat settings (model overrides, thinking, etc.)
 let chatSettings = {};
@@ -110,20 +111,54 @@ async function tg(method, params = {}) {
   }
 }
 
+// Convert GitHub-flavored markdown to Telegram-compatible HTML
+function mdToHtml(text) {
+  const codeBlocks = [];
+  const inlineCode = [];
+
+  text = text.replace(/```\w*\n?([\s\S]*?)```/g, (_, code) => {
+    codeBlocks.push(code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+    return `\x00CB${codeBlocks.length - 1}\x00`;
+  });
+
+  text = text.replace(/`([^`]+)`/g, (_, code) => {
+    inlineCode.push(code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+    return `\x00IC${inlineCode.length - 1}\x00`;
+  });
+
+  text = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  text = text.replace(/^#{1,6}\s+(.+)$/gm, '<b>$1</b>');
+  text = text.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+  text = text.replace(/__(.+?)__/g, '<b>$1</b>');
+  text = text.replace(/\*(.+?)\*/g, '<i>$1</i>');
+  text = text.replace(/_(.+?)_/g, '<i>$1</i>');
+  text = text.replace(/^---+$/gm, '');
+  text = text.replace(/^\|(.+)\|$/gm, (_, row) =>
+    row.split('|').map(c => c.trim()).filter(Boolean).join('   ')
+  );
+  text = text.replace(/^[\s|:-]+$/gm, '');
+  text = text.replace(/\x00IC(\d+)\x00/g, (_, i) => `<code>${inlineCode[i]}</code>`);
+  text = text.replace(/\x00CB(\d+)\x00/g, (_, i) => `<pre>${codeBlocks[i]}</pre>`);
+  return text;
+}
+
 async function sendMessage(chatId, text) {
-  // Telegram message limit is 4096 chars — split if needed
-  const chunks = splitText(text, 4000);
+  const html = mdToHtml(text);
+  const chunks = splitText(html, 4000);
   for (const chunk of chunks) {
     try {
-      await tg('sendMessage', { chat_id: chatId, text: chunk, parse_mode: 'Markdown' });
+      await tg('sendMessage', { chat_id: chatId, text: chunk, parse_mode: 'HTML' });
     } catch (err) {
-      // If markdown fails, retry without parse_mode (plain text fallback)
-      log(`Markdown send failed, retrying plain: ${err.message}`);
-      try {
-        await tg('sendMessage', { chat_id: chatId, text: chunk });
-      } catch (retryErr) {
-        log(`sendMessage retry failed: ${retryErr.message}`);
+      log(`HTML send failed, retrying plain: ${err.message}`);
+      const plainChunks = splitText(text, 4000);
+      for (const plain of plainChunks) {
+        try {
+          await tg('sendMessage', { chat_id: chatId, text: plain });
+        } catch (retryErr) {
+          log(`sendMessage retry failed: ${retryErr.message}`);
+        }
       }
+      break;
     }
   }
 }
@@ -170,22 +205,29 @@ async function downloadTelegramFile(fileId, prefix = 'file') {
 }
 
 async function transcribeVoice(audioPath) {
-  const { execSync } = require('child_process');
-  const outputDir = path.dirname(audioPath);
-  const baseName = path.basename(audioPath, path.extname(audioPath));
+  if (!OPENAI_API_KEY) throw new Error('openaiApiKey not set in config.json');
 
-  execSync(
-    `whisper "${audioPath}" --model base.en --output_format txt --output_dir "${outputDir}" --language en`,
-    { timeout: 60000, env: { ...process.env, PATH: process.platform === 'darwin' ? `/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:${process.env.PATH}` : process.env.PATH } }
-  );
+  const audioBuffer = fs.readFileSync(audioPath);
+  const fileName = path.basename(audioPath);
 
-  const txtPath = path.join(outputDir, `${baseName}.txt`);
-  const transcript = fs.readFileSync(txtPath, 'utf8').trim();
+  const formData = new FormData();
+  formData.append('file', new Blob([audioBuffer]), fileName);
+  formData.append('model', 'whisper-1');
+  formData.append('language', 'en');
 
-  // Clean up whisper output file
-  try { fs.unlinkSync(txtPath); } catch {}
+  const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+    body: formData
+  });
 
-  return transcript;
+  if (!res.ok) {
+    const err = await res.text();
+    throw new Error(`OpenAI Whisper API error ${res.status}: ${err}`);
+  }
+
+  const data = await res.json();
+  return (data.text || '').trim();
 }
 
 // ============================================================
@@ -584,7 +626,8 @@ async function handleTelegramMessage(item) {
   }
 
   // Checkpoint enforcement: inject reminder after N exchanges without a checkpoint
-  if (state.exchangeCount[sessionKey] >= CHECKPOINT_THRESHOLD) {
+  // Fires at 8, 16, 24, etc. — not every message after 8
+  if (state.exchangeCount[sessionKey] >= CHECKPOINT_THRESHOLD && state.exchangeCount[sessionKey] % CHECKPOINT_THRESHOLD === 0) {
     const today = new Date().toISOString().slice(0, 10);
     const dailyLog = path.join(MEMORY_DIR, `${today}.md`);
     let needsCheckpoint = true;
@@ -596,10 +639,12 @@ async function handleTelegramMessage(item) {
       }
     } catch {}
     if (needsCheckpoint) {
-      prompt = `[SYSTEM REMINDER: You have exchanged ${state.exchangeCount[sessionKey]} messages without writing a checkpoint. Write to memory/${today}.md NOW before continuing. Include: what you did, decisions made, open questions, next actions, feedback logged. Then reindex memory if available.]\n\n${prompt}`;
+      prompt = `[SYSTEM REMINDER: You have exchanged ${state.exchangeCount[sessionKey]} messages without writing a checkpoint. Write to memory/${today}.md NOW using the Edit or Write tool (NOT bash cat/echo — those may be blocked). Include: what you did, decisions made, open questions, next actions, feedback logged. Then reindex memory if available.]\n\n${prompt}`;
       log(`Checkpoint reminder injected after ${state.exchangeCount[sessionKey]} exchanges`);
+    } else {
+      // Write succeeded recently — reset counter
+      state.exchangeCount[sessionKey] = 0;
     }
-    state.exchangeCount[sessionKey] = 0; // Reset after injection or recent write
     saveState();
   }
 
@@ -682,6 +727,19 @@ async function handleCronJob(item) {
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
     log(`Cron ${name} completed: ${duration}s, ${result.turns} turns, $${result.cost}`);
+
+    // After session-audit completes, mechanically clear the session
+    // Don't rely on the LLM to do this — it's unreliable
+    if (name === 'session-audit') {
+      for (const key of Object.keys(state.sessions)) {
+        if (state.sessions[key]) {
+          log(`Session-audit: clearing session ${state.sessions[key]} for chat ${key}`);
+          state.sessions[key] = '';
+          state.exchangeCount[key] = 0;
+        }
+      }
+      saveState();
+    }
 
     // Cron prompts handle their own Telegram delivery via telegram_direct.sh
     // So we don't need to send the output here
@@ -979,7 +1037,8 @@ async function pollTelegram() {
           try {
             const filePath = await downloadTelegramFile(msg.document.file_id, 'doc');
             const prompt = caption || `Read and summarize this file: ${fileName}`;
-            log(`File attachment from ${userName}: ${fileName} (${mime})`);
+            const senderName = msg.from?.first_name || msg.from?.username || 'User';
+            log(`File attachment from ${senderName}: ${fileName} (${mime})`);
             enqueueTelegram({
               chatId,
               text: `Read the file at ${filePath} (original name: ${fileName}). ${prompt}`,

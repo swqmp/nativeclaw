@@ -1,5 +1,20 @@
 # NativeClaw Changelog
 
+## v1.6.1 — Session Rot Fix & Polish
+
+### Bridge (bridge.js)
+- **Telegram HTML formatting:** New `mdToHtml` converter — messages render with bold, italic, code blocks, and headers in Telegram instead of raw markdown
+- **Session-audit auto-clear:** Bridge mechanically clears session IDs after `session-audit` cron completes. No longer relies on the LLM to execute a python3 command (which it was silently skipping)
+- **Checkpoint modulo fix:** Reminder now fires at 8, 16, 24 exchanges — not every message after 8. Previous behavior caused infinite reminder spam that produced empty responses
+- **File attachment crash fix:** `userName` undefined → `senderName` — sending files via Telegram no longer crashes the bridge
+- **OpenAI Whisper API:** Voice transcription uses cloud API (`whisper-1`) instead of local Whisper binary. Faster, no local CPU load. Requires `openaiApiKey` in config.json
+
+### Templates
+- **AGENTS.md:** Added MEMORY.md staleness rule (update if 3+ days stale), feedback path clarification (`feedback/general.md` not `feedback_general.md`), write method rule (Edit/Write tools, not bash)
+- **cron-schedule.example.json:** Added `session-audit` cron example (daily 5:10 AM)
+
+---
+
 ## v1.6.0 — Performance & Reliability
 
 ### Bridge (bridge.js)

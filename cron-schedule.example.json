@@ -31,6 +31,13 @@
       "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. TASK QUEUE RECOVERY. Read $HOME/.claude/workspace/system/task-queue/queue.json. If any tasks have status 'pending' or 'rate-limited': attempt them now. Update status in queue.json. retryCount >= 5 = 'failed'. Do NOT message the user."
     },
     {
+      "name": "session-audit",
+      "schedule": "10 5 * * *",
+      "timeout": 300,
+      "model": "sonnet",
+      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. Daily session audit before reset. The bridge will clear the session automatically after this cron completes.\n\n1. Read the active session ID from ~/.claude/telegram-bridge/state.json.\n2. If no active session, respond HEARTBEAT_OK and stop.\n3. Read the session transcript at ~/.claude/projects/[workspace-path]/<session-id>.jsonl. Scan the last 200 lines.\n4. Check: any pipeline/client/status changes not reflected in MEMORY.md? If yes, update now.\n5. Check: any user corrections not logged in feedback/*.md? If yes, log them. Path: feedback/general.md (NOT feedback_general.md).\n6. Check: does today's daily log have a recent checkpoint? If not, write a final one.\n7. Do NOT send any Telegram message. Silent maintenance only."
+    },
+    {
       "name": "weekly-eval",
       "schedule": "0 21 * * 0",
       "timeout": 300,
