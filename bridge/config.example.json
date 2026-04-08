@@ -7,5 +7,6 @@
   "mcpConfig": "$HOME/.claude/workspace/.mcp.json",
   "cronSchedule": "$HOME/.claude/cron-schedule.json",
   "model": "sonnet",
+  "provider": "claude",
   "openaiApiKey": "YOUR_OPENAI_API_KEY"
 }
