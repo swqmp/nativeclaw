@@ -12,6 +12,7 @@ NativeClaw gives you a 24/7 AI assistant that:
 ## What's New in v1.7.0
 
 - **Codex provider support** — Set `"provider": "codex"` in config.json to use OpenAI Codex CLI instead of Claude Code. Useful for teams running both, or for users who want to run NativeClaw on top of a different model.
+- **`nc` CLI switcher** — Switch providers, change models, and inspect config from your terminal. See [nc CLI](#nc-cli) below.
 
 ## What's New in v1.6.0
 
@@ -103,6 +104,7 @@ You (Telegram) → Bridge (Node.js) → Claude Code CLI (claude -p) → Response
 │   └── system/
 │       └── EVAL_FRAMEWORK.md  # Weekly self-eval metrics
 ├── scripts/
+│   ├── nc                  # Provider/model switcher CLI (chmod +x, symlink to PATH)
 │   ├── claude-restart.sh   # Lifecycle manager (macOS/Linux)
 │   ├── claude-restart.ps1  # Lifecycle manager (Windows)
 │   ├── telegram_direct.sh  # Direct Telegram messaging (macOS/Linux)
@@ -220,6 +222,73 @@ When using `"provider": "codex"`, available model aliases change to:
 | `o3` | `o3` |
 
 **Note:** Codex sessions are stateless. Each message starts fresh — there is no equivalent to Claude's session resumption (`-r` flag). For persistent memory across messages, the agent must write to workspace files (MEMORY.md, daily logs) rather than relying on conversation history.
+
+## nc CLI
+
+`scripts/nc` is a terminal CLI for switching providers, changing models, and inspecting your bridge config without editing JSON manually.
+
+### Setup
+
+```bash
+# Make it executable
+chmod +x scripts/nc
+
+# Optionally symlink to somewhere on your PATH
+ln -s "$(pwd)/scripts/nc" /usr/local/bin/nc
+# or
+ln -s ~/.claude/scripts/nc ~/bin/nc
+```
+
+### Usage
+
+```
+nc switch claude       switch to claude provider, restore saved model, restart bridge
+nc switch codex        switch to codex provider, restore saved model, restart bridge
+nc model <name>        set model for current provider
+nc config              print current config
+nc status              show bridge status, provider, and model
+nc help                show usage
+```
+
+### Examples
+
+```bash
+# Switch from Claude to Codex — restores your last-used Codex model
+nc switch codex
+
+# Switch back to Claude — restores your last-used Claude model
+nc switch claude
+
+# Change model for the current provider
+nc model opus
+nc model codex-mini-latest
+
+# Check what's running
+nc status
+# Bridge:   running
+# Provider: claude
+# Model:    sonnet
+
+# Inspect full config (chat IDs are masked)
+nc config
+```
+
+### How provider switching works
+
+When you run `nc switch <provider>`, the script:
+1. Saves your current model to `claudeModel` or `codexModel` in config.json (depending on which provider you're leaving)
+2. Sets `provider` to the new value
+3. Restores the saved model for the target provider (or sets a sensible default if none saved yet)
+4. Writes config.json
+5. Runs `config.restartCommand` to restart the bridge, if set
+
+This means you can switch back and forth without losing your model preference for each provider.
+
+### Config file location
+
+The script reads `$NATIVECLAW_CONFIG` if set, otherwise falls back to:
+1. `~/.claude/telegram-bridge/config.json` (preferred — matches bridge.js)
+2. `~/.claude/bridge/config.json`
 
 ## Customization
 

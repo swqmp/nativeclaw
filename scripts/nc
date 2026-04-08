@@ -1,0 +1,253 @@
+#!/usr/bin/env node
+
+// nc — NativeClaw CLI config switcher
+// Self-contained, no npm dependencies. Node.js builtins only.
+//
+// Usage:
+//   nc switch claude       switch provider to claude, restore saved claude model, restart bridge
+//   nc switch codex        switch provider to codex, restore saved codex model, restart bridge
+//   nc model <name>        change model for current provider (saves to claudeModel or codexModel)
+//   nc config              print current config (provider, model, chatId masked, restartCommand)
+//   nc status              is bridge running? provider? model?
+//   nc help                usage
+//
+// Config file: $NATIVECLAW_CONFIG or ~/.claude/bridge/config.json
+
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const { exec, execSync } = require('child_process');
+
+// ── Config path resolution ────────────────────────────────────────────────────
+
+const HOME = process.env.HOME || process.env.USERPROFILE || '';
+const DEFAULT_CONFIG = path.join(HOME, '.claude', 'bridge', 'config.json');
+
+// Also check the canonical bridge location used by bridge.js itself
+const BRIDGE_CONFIG = path.join(HOME, '.claude', 'telegram-bridge', 'config.json');
+
+function resolveConfigPath() {
+  if (process.env.NATIVECLAW_CONFIG) {
+    return process.env.NATIVECLAW_CONFIG;
+  }
+  // Prefer the telegram-bridge location if it exists (matches bridge.js)
+  if (fs.existsSync(BRIDGE_CONFIG)) return BRIDGE_CONFIG;
+  return DEFAULT_CONFIG;
+}
+
+function loadConfig(configPath) {
+  if (!fs.existsSync(configPath)) {
+    die(`Config not found: ${configPath}\nSet NATIVECLAW_CONFIG or create ~/.claude/bridge/config.json`);
+  }
+  try {
+    return JSON.parse(fs.readFileSync(configPath, 'utf8'));
+  } catch (err) {
+    die(`Failed to parse config at ${configPath}: ${err.message}`);
+  }
+}
+
+function saveConfig(configPath, config) {
+  try {
+    fs.writeFileSync(configPath, JSON.stringify(config, null, 2) + '\n');
+  } catch (err) {
+    die(`Failed to write config at ${configPath}: ${err.message}`);
+  }
+}
+
+// ── Utilities ─────────────────────────────────────────────────────────────────
+
+function die(msg) {
+  console.error(`nc: ${msg}`);
+  process.exit(1);
+}
+
+function isBridgeRunning() {
+  try {
+    // pgrep -f matches against the full command line
+    execSync('pgrep -f bridge.js', { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function mask(value) {
+  if (!value) return '(not set)';
+  const s = String(value);
+  if (s.length <= 6) return '***';
+  return s.slice(0, 3) + '***' + s.slice(-3);
+}
+
+function restartBridge(config) {
+  const cmd = config.restartCommand;
+  if (!cmd) {
+    console.log('  (no restartCommand set in config — restart the bridge manually for changes to take effect)');
+    return;
+  }
+  const expanded = cmd.replace(/~/g, HOME);
+  console.log(`  Restarting bridge: ${expanded}`);
+  exec(expanded, (err, stdout, stderr) => {
+    if (err) {
+      console.error(`  Restart failed: ${err.message}`);
+    } else {
+      console.log('  Bridge restart triggered.');
+    }
+  });
+}
+
+// ── Commands ──────────────────────────────────────────────────────────────────
+
+function cmdSwitch(provider) {
+  if (provider !== 'claude' && provider !== 'codex') {
+    die(`Unknown provider "${provider}". Use: claude or codex`);
+  }
+
+  const configPath = resolveConfigPath();
+  const config = loadConfig(configPath);
+
+  const currentProvider = config.provider || 'claude';
+  const currentModel = config.model;
+
+  // Save the current model back to the per-provider slot before switching
+  if (currentModel) {
+    if (currentProvider === 'claude') {
+      config.claudeModel = currentModel;
+    } else if (currentProvider === 'codex') {
+      config.codexModel = currentModel;
+    }
+  }
+
+  // Switch provider
+  config.provider = provider;
+
+  // Restore saved model for the target provider (if we have one)
+  const savedModel = provider === 'claude' ? config.claudeModel : config.codexModel;
+  if (savedModel) {
+    config.model = savedModel;
+    console.log(`Switched to provider: ${provider}`);
+    console.log(`Restored model: ${savedModel}`);
+  } else {
+    // Set sensible defaults when no saved model exists
+    const defaults = { claude: 'sonnet', codex: 'codex-mini-latest' };
+    config.model = defaults[provider];
+    console.log(`Switched to provider: ${provider}`);
+    console.log(`Model set to default: ${config.model}`);
+  }
+
+  saveConfig(configPath, config);
+  console.log(`Config saved: ${configPath}`);
+  restartBridge(config);
+}
+
+function cmdModel(modelName) {
+  if (!modelName) {
+    die('Usage: nc model <name>');
+  }
+
+  const configPath = resolveConfigPath();
+  const config = loadConfig(configPath);
+
+  const provider = config.provider || 'claude';
+  config.model = modelName;
+
+  // Also persist to the provider-specific slot
+  if (provider === 'claude') {
+    config.claudeModel = modelName;
+  } else if (provider === 'codex') {
+    config.codexModel = modelName;
+  }
+
+  saveConfig(configPath, config);
+  console.log(`Model set to: ${modelName} (provider: ${provider})`);
+  console.log(`Config saved: ${configPath}`);
+  restartBridge(config);
+}
+
+function cmdConfig() {
+  const configPath = resolveConfigPath();
+  const config = loadConfig(configPath);
+
+  const provider = config.provider || 'claude';
+  const model = config.model || '(not set)';
+  const chatIds = (config.allowedChatIds || []).map(mask);
+  const restartCommand = config.restartCommand || '(not set)';
+  const claudeModel = config.claudeModel || '(not saved)';
+  const codexModel = config.codexModel || '(not saved)';
+
+  console.log(`Config: ${configPath}`);
+  console.log(`  provider:       ${provider}`);
+  console.log(`  model:          ${model}`);
+  console.log(`  claudeModel:    ${claudeModel}`);
+  console.log(`  codexModel:     ${codexModel}`);
+  console.log(`  allowedChatIds: [${chatIds.join(', ')}]`);
+  console.log(`  restartCommand: ${restartCommand}`);
+}
+
+function cmdStatus() {
+  const configPath = resolveConfigPath();
+  const config = loadConfig(configPath);
+
+  const running = isBridgeRunning();
+  const provider = config.provider || 'claude';
+  const model = config.model || '(not set)';
+
+  console.log(`Bridge:   ${running ? 'running' : 'not running'}`);
+  console.log(`Provider: ${provider}`);
+  console.log(`Model:    ${model}`);
+  console.log(`Config:   ${configPath}`);
+}
+
+function cmdHelp() {
+  console.log([
+    'nc — NativeClaw CLI config switcher',
+    '',
+    'Usage:',
+    '  nc switch claude       switch to claude provider, restore saved model, restart bridge',
+    '  nc switch codex        switch to codex provider, restore saved model, restart bridge',
+    '  nc model <name>        set model for current provider (e.g. sonnet, opus, codex-mini-latest)',
+    '  nc config              print current config',
+    '  nc status              show bridge process status, provider, and model',
+    '  nc help                show this message',
+    '',
+    'Config file:',
+    '  Reads $NATIVECLAW_CONFIG if set, otherwise ~/.claude/telegram-bridge/config.json',
+    '  (falls back to ~/.claude/bridge/config.json)',
+    '',
+    'Provider switching saves your current model before switching and restores',
+    "  your previous model for the target provider (tracked as 'claudeModel' /",
+    "  'codexModel' in config.json).",
+    '',
+    'After any config change, the bridge is restarted via config.restartCommand',
+    '  if set. Otherwise, restart manually.',
+  ].join('\n'));
+}
+
+// ── Entry point ───────────────────────────────────────────────────────────────
+
+const [,, command, ...args] = process.argv;
+
+switch (command) {
+  case 'switch':
+    cmdSwitch(args[0]);
+    break;
+  case 'model':
+    cmdModel(args[0]);
+    break;
+  case 'config':
+    cmdConfig();
+    break;
+  case 'status':
+    cmdStatus();
+    break;
+  case 'help':
+  case '--help':
+  case '-h':
+  case undefined:
+    cmdHelp();
+    break;
+  default:
+    console.error(`nc: unknown command "${command}"`);
+    console.error('Run "nc help" for usage.');
+    process.exit(1);
+}
