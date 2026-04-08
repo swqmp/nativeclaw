@@ -9,6 +9,10 @@ NativeClaw gives you a 24/7 AI assistant that:
 - Manages itself via macOS launchd, Linux systemd, or Windows Task Scheduler (auto-restarts, survives reboots)
 - Supports image analysis, voice messages, file attachments, model switching, extended thinking
 
+## What's New in v1.7.0
+
+- **Codex provider support** — Set `"provider": "codex"` in config.json to use OpenAI Codex CLI instead of Claude Code. Useful for teams running both, or for users who want to run NativeClaw on top of a different model.
+
 ## What's New in v1.6.0
 
 - **Lightweight cron context** — Crons load ~80 lines instead of your full system prompt. Faster, cheaper, no identity confusion.
@@ -190,6 +194,32 @@ type %USERPROFILE%\.claude\logs\telegram-bridge.log
 | **Files** (PDF, DOCX, XLSX, PPTX, TXT, CSV, JSON, Markdown) | Downloaded, passed to Claude for reading |
 
 Send a file with a caption to tell the agent what to do with it. No caption defaults to "Read and summarize."
+
+## Provider Options
+
+NativeClaw defaults to Claude Code (`claude` CLI) but can be switched to OpenAI Codex CLI by setting `provider` in your `config.json`:
+
+```json
+{
+  "provider": "claude"
+}
+```
+
+| Value | CLI | Notes |
+|---|---|---|
+| `"claude"` (default) | `claude -p` | Full session resumption via `-r` flag. Requires Claude Max subscription. |
+| `"codex"` | `codex --approval-mode full-auto` | Stateless — no session resumption between messages. Requires OpenAI Codex CLI installed and authenticated. |
+
+When using `"provider": "codex"`, available model aliases change to:
+
+| Alias | Model |
+|---|---|
+| `mini` | `codex-mini-latest` |
+| `codex-mini` | `codex-mini-latest` |
+| `o4-mini` | `o4-mini` |
+| `o3` | `o3` |
+
+**Note:** Codex sessions are stateless. Each message starts fresh — there is no equivalent to Claude's session resumption (`-r` flag). For persistent memory across messages, the agent must write to workspace files (MEMORY.md, daily logs) rather than relying on conversation history.
 
 ## Customization
 
