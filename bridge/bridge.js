@@ -3,7 +3,7 @@
 // Telegram Bridge for Claude Code Native Setup
 // Custom built — no external dependencies, Node.js built-in modules only
 // Handles: Telegram message reception/response + cron job scheduling
-// Version: 1.6.1
+// Version: 1.7.0
 //
 // Architecture:
 //   Telegram polling → message queue → claude -p subprocess → response back to Telegram
@@ -351,6 +351,63 @@ function runClaude(prompt, sessionId, options = {}) {
   });
 }
 
+function runCodex(prompt, options = {}) {
+  return new Promise((resolve, reject) => {
+    const model = options.model || config.model || 'codex-mini-latest';
+    const args = [
+      '--approval-mode', 'full-auto',
+      '-q',
+      '--model', model,
+      prompt,
+    ];
+
+    const cwd = options.isCron ? CRON_WORKSPACE : WORKSPACE;
+    log(`Spawning: codex ${args.slice(0, 4).join(' ')}... (cwd: ${options.isCron ? 'cron' : 'main'})`);
+
+    const proc = spawn('codex', args, {
+      cwd,
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    activeSubprocess = proc;
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    const timeoutMs = (options.timeout || 300) * 1000;
+    const timer = setTimeout(() => {
+      log(`Codex subprocess timed out after ${timeoutMs}ms, killing...`);
+      proc.kill('SIGTERM');
+      setTimeout(() => proc.kill('SIGKILL'), 5000);
+    }, timeoutMs);
+
+    proc.on('close', (code) => {
+      activeSubprocess = null;
+      clearTimeout(timer);
+      if (code !== 0 && !stdout.trim()) {
+        return reject(new Error(stderr.trim() || `codex exited with code ${code}`));
+      }
+      resolve({ text: stdout.trim(), sessionId: null, cost: 0, turns: 0 });
+    });
+
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      reject(new Error(`Failed to spawn codex: ${err.message}`));
+    });
+  });
+}
+
+function runLLM(prompt, sessionId, options = {}) {
+  const provider = config.provider || 'claude';
+  if (provider === 'codex') {
+    return runCodex(prompt, options);
+  }
+  return runClaude(prompt, sessionId, options);
+}
+
 // ============================================================
 // MESSAGE QUEUES & WORKERS
 // ============================================================
@@ -446,6 +503,13 @@ const MODEL_ALIASES = {
   'haiku-4.5': 'haiku',
 };
 
+const CODEX_MODEL_ALIASES = {
+  'mini': 'codex-mini-latest',
+  'codex-mini': 'codex-mini-latest',
+  'o4-mini': 'o4-mini',
+  'o3': 'o3',
+};
+
 const MODEL_DISPLAY = {
   'opus': 'Opus 4.6',
   'sonnet': 'Sonnet 4.6',
@@ -474,9 +538,13 @@ async function handleSlashCommand(chatId, text) {
         const display = MODEL_DISPLAY[current] || current;
         return `Current model: ${display}`;
       }
-      const alias = MODEL_ALIASES[arg.toLowerCase()];
+      const isCodex = (config.provider || 'claude') === 'codex';
+      const alias = isCodex
+        ? (CODEX_MODEL_ALIASES[arg.toLowerCase()] || MODEL_ALIASES[arg.toLowerCase()])
+        : MODEL_ALIASES[arg.toLowerCase()];
       if (!alias) {
-        const available = Object.entries(MODEL_ALIASES)
+        const aliasMap = isCodex ? CODEX_MODEL_ALIASES : MODEL_ALIASES;
+        const available = Object.entries(aliasMap)
           .filter(([k, v], i, arr) => arr.findIndex(([k2, v2]) => v2 === v) === i)
           .map(([k, v]) => `  ${k} → ${MODEL_DISPLAY[v] || v}`)
           .join('\n');
@@ -652,7 +720,7 @@ async function handleTelegramMessage(item) {
   const model = settings.model || DEFAULT_MODEL;
 
   try {
-    const result = await runClaude(prompt, sessionId, {
+    const result = await runLLM(prompt, sessionId, {
       timeout: 14400,
       model: model,
       thinking: settings.thinking,
@@ -718,7 +786,7 @@ async function handleCronJob(item) {
   const startTime = Date.now();
 
   try {
-    const result = await runClaude(prompt, null, {
+    const result = await runLLM(prompt, null, {
       timeout: timeout || 300,
       model: model || DEFAULT_MODEL,
       maxTurns: 100,
@@ -1086,21 +1154,25 @@ function sleep(ms) {
 // ============================================================
 
 async function main() {
+  const provider = config.provider || 'claude';
+  const cliName = provider === 'codex' ? 'codex' : 'claude';
+
   log('========================================');
   log('Telegram Bridge starting');
   log(`Workspace: ${WORKSPACE}`);
   log(`MCP Config: ${MCP_CONFIG}`);
   log(`Allowed chats: ${ALLOWED_CHAT_IDS.join(', ')}`);
   log(`Model: ${DEFAULT_MODEL}`);
+  log(`Provider: ${provider}`);
   log('========================================');
 
-  // Verify claude is available
+  // Verify CLI is available
   try {
     const { execSync } = require('child_process');
-    const version = execSync('claude --version 2>/dev/null || echo "unknown"').toString().trim();
-    log(`Claude Code version: ${version}`);
+    const version = execSync(`${cliName} --version 2>/dev/null || echo "unknown"`).toString().trim();
+    log(`Starting NativeClaw bridge (${cliName} ${version})`);
   } catch {
-    log('WARNING: Could not detect Claude Code version');
+    log(`WARNING: Could not detect ${cliName} version`);
   }
 
   // Validate bot token
