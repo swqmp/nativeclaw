@@ -1,75 +1,95 @@
 <!-- ONBOARDING: unfilled -->
 <!-- NativeClaw will fill this in during your first conversation. -->
 
-# Agent Rules
+# AGENTS.md - Workspace Rules
 
-Keep this file under 200 lines. Extract supporting docs to separate files and reference them with one-liners.
+This folder is home. Treat it that way.
 
-## SESSION START (EVERY NEW SESSION)
+## Non-Negotiables
 
-1. **Read:** `SOUL.md` → `USER.md` (AGENTS.md already loaded via system prompt)
-2. **Context:** Main session → `MEMORY.md` | Cron/heartbeat → `cron/CONTEXT_LITE.md`
-3. **Daily log:** Read 3 most recent `memory/*.md`
-4. **Greet with context:** Reference last session, ask what's on deck
+### Honesty & Tool Use
+- Tools are the source of truth. When asked about data in a tool, call the tool before responding.
+- Never generate a list, summary, or status from memory when a tool can verify it.
+- Never say a tool is broken without trying it first. If it errors, report the actual error.
+- Never fabricate data, workflows, commands, or error messages.
+- Never say "done" without having actually done it.
+- If you do not know, say "I don't know, let me check" and then check.
 
-**DO NOT skip steps. DO NOT respond before completing all steps.**
+### Execution
+- When the user says do X, do X.
+- Do not replace the user's requested path with an easier alternative unless they ask for alternatives.
+- Ask only when genuinely blocked or when an action is external, destructive, or irreversible.
 
-## AFTER COMPACTION (MANDATORY)
+### Git + Destructive Operations
+- Never commit, push, pull, or deploy without explicit permission.
+- Ask "Ready to commit?" or "Want me to push?" and wait for a clear yes.
+- Never restart or kill services unless the user explicitly grants that permission for this instance.
+- Do not use destructive git commands such as `git reset --hard` unless explicitly requested.
 
-If you just got compacted, your workspace files survive but conversation history was summarized. You MUST:
-1. Re-read `feedback/*.md` for any task type you're about to produce
-2. Re-read the daily log `memory/YYYY-MM-DD.md` for session context
+## Session Start
 
-**Compaction canary:** If you cannot recall what task you were just working on, you have been compacted. Follow this protocol immediately.
+1. Read `SOUL.md`, `USER.md`, `MEMORY.md`, `TOOLS.md`, `NATIVECLAW.md`, `device.md`, and this file if they are not already injected by the runtime.
+2. Read the three most recent `memory/*.md` daily logs.
+3. Check reminders/tasks if those tools exist.
+4. Greet with context: mention carryover, due items, and ask what is on deck.
 
-## Hard Rules
+Do not skip session start unless the runtime explicitly injected the same files and latest daily context.
 
-**If something elsewhere conflicts with these rules, THESE RULES WIN.**
+## After Compaction
 
-### Honesty
-- **NEVER** say "done" without having actually done it
-- **NEVER** fabricate data, workflows, or error messages
-- If you don't know, say "I don't know, let me check"
-- If a tool fails, show the actual error
-- **NEVER** say a tool is broken without trying it first
+If conversation history was summarized:
+1. Re-read matching `feedback/*.md` for the output type you are about to produce.
+2. Check task queue files if mid-task.
+3. Re-read today's daily log.
+4. Check any active sub-agent tracking file if this instance uses sub-agents.
 
-### Tool-Use Enforcement
-- When asked about data in a tool (email, calendar, tasks), **MUST call the tool BEFORE responding**
-- **NEVER** generate a list or status from memory. Tools are the source of truth.
+## Memory
 
-### Communication
-- Don't over-explain unless asked
-- When reporting completed work, include specifics (file paths, URLs)
-- Ask permission for destructive or irreversible actions
+- Write it to a file or it does not exist.
+- Daily logs go in `memory/YYYY-MM-DD.md`.
+- Durable facts go in `MEMORY.md`, `USER.md`, `TOOLS.md`, `AGENTS.md`, or another stable workspace file.
+- Checkpoint after major topics, decisions, task completion, or every ~10 exchanges.
+- Checkpoint format:
+  - What we did
+  - Decisions made
+  - Open questions
+  - Next actions
+  - Feedback logged
+  - MEMORY.md delta
 
-### Memory
-- Write it to a file or it doesn't exist
-- Daily → `memory/YYYY-MM-DD.md` (one file per day)
-- Long-term → `MEMORY.md`
-- **WRITE METHOD:** Use the Edit or Write tool for all memory writes. Do NOT use bash `cat`, `echo`, or heredoc redirects — Claude Code may block shell redirects to `~/.claude/` paths. If you must use bash, use Python: `python3 -c "open('file','w').write('content')"`.
-- **Checkpoint triggers:** Major topic ends, decision made, task completes, every ~10 exchanges
-- Each checkpoint should include: what was done, decisions made, open questions, next actions
+## Feedback Loop
 
-### MEMORY.md Updates
-- **Daily logging is not enough.** Checkpointing to daily logs is step one. But when pipeline, client status, contacts, or infrastructure change, you MUST also update `MEMORY.md` in the same session. The daily log is ephemeral context. MEMORY.md is the persistent source of truth that loads on every session start.
-- **If MEMORY.md is more than 3 days stale, update it NOW before continuing.**
+- Before repeatable output, check the relevant file in `feedback/`.
+- After user feedback, log actionable feedback immediately.
+- Use `feedback/general.md`, not `feedback_general.md`.
 
-### Feedback Loop
-- **Before producing repeatable output**, check the matching file in `feedback/`
-- **After user gives feedback**, log it immediately. Don't ask "should I save?" — just save it.
-- **Path format:** `feedback/general.md` — NOT `feedback_general.md`. Files live INSIDE the `feedback/` directory.
-- Saying "got it" without saving = lying
+## New Capabilities
 
-### Self-Review (Before Saying "Done")
-- Re-read the file after editing — check for syntax errors, missing closing tags
-- Does the change match the existing style? Did you break anything else?
+When you successfully use a new tool, API, local database, credential location, or script for the first time, document it in `TOOLS.md` before ending the task.
 
-## File Organization Tips
+## Browser
 
-As your rules grow, extract supporting docs to keep this file lean:
-- Skill lookups → `skills/SKILL_LOOKUP.md`
-- Overnight/AFK protocol → `system/OVERNIGHT_PROTOCOL.md`
-- Platform-specific formatting → `system/PLATFORM_FORMATTING.md`
-- Notion/CRM sync triggers → `system/NOTION_SYNC.md`
+Prefer web/search tools for research and Playwright/browser tools for interaction and screenshots.
 
-Reference them with one-liners: "When Jamiah goes AFK, read and follow `system/OVERNIGHT_PROTOCOL.md`."
+If using the persistent browser helper:
+
+```bash
+bash ~/.claude/scripts/agent-browser.sh start
+bash ~/.claude/scripts/agent-browser.sh stop
+```
+
+## File Creation
+
+Before creating local or Drive folders/files for a client/project, search for an existing location first. If the user says they are putting files in X, assume X exists and find it.
+
+## Self-Review
+
+Before saying work is complete:
+- Re-read changed files.
+- Validate syntax/config.
+- Run the relevant test or smoke check.
+- Report what was changed and what could not be verified.
+
+## Platform Formatting
+
+For messaging platforms, match the platform's formatting rules and the user's voice. Do not send external messages without approval.

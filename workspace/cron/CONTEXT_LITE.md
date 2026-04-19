@@ -8,7 +8,7 @@
 - **Wake:** [e.g. ~6:00 AM] | **Bed:** [e.g. ~10:00 PM]
 
 ## Alert Method
-- Telegram: `system/scripts/telegram_direct.sh "message"`
+- Telegram: `~/.claude/scripts/telegram_direct.sh "message"`
 - Quiet hours: [bed time] - [wake time] (no alerts unless urgent)
 
 ## Active Work
@@ -17,4 +17,4 @@
 ## Rules
 1. User messages > everything else. Always.
 2. Execute instructions, don't negotiate.
-3. Use telegram_direct.sh for alerts, not subagents.
+3. Use `~/.claude/scripts/telegram_direct.sh` for alerts, not subagents.

@@ -3,14 +3,14 @@
 // Telegram Bridge for Claude Code Native Setup
 // Custom built — no external dependencies, Node.js built-in modules only
 // Handles: Telegram message reception/response + cron job scheduling
-// Version: 1.6.1
+// Version: 1.9.4 — unified effort/verbosity controls
 //
 // Architecture:
 //   Telegram polling → message queue → claude -p subprocess → response back to Telegram
-//   Cron scheduler → cron queue → claude -p subprocess → output logged / sent to Telegram
+//   Cron scheduler → cron queue → active backend subprocess / shell command → logs / Telegram
 //   Two concurrent workers (telegram + cron) so messages aren't blocked by long crons
 
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
@@ -47,21 +47,65 @@ const CRON_WORKSPACE = path.join(config.workspace, 'cron-workspace');
 const MCP_CONFIG = config.mcpConfig;
 const CRON_SCHEDULE_PATH = config.cronSchedule;
 const DEFAULT_MODEL = config.model || 'sonnet';
-const OPENAI_API_KEY = config.openaiApiKey || '';
 
-// Per-chat settings (model overrides, thinking, etc.)
+// Per-chat settings (model overrides, effort, verbosity, etc.)
 let chatSettings = {};
 
 // Load or initialize state
-let state = { updateOffset: 0, sessions: {}, exchangeCount: {} };
+let state = {
+  updateOffset: 0,
+  sessions: {},         // { chatId: string } — Claude session IDs (legacy flat shape, kept for compat)
+  codexSessions: {},    // { chatId: string } — Codex thread IDs
+  backends: {},         // { chatId: "claude" | "codex" }
+  pendingTransfer: {},  // { chatId: {from, to, context?} } — one-shot flag to inject cross-backend context on next message
+  exchangeCount: {},
+};
 if (fs.existsSync(STATE_PATH)) {
   try {
-    state = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+    const loaded = JSON.parse(fs.readFileSync(STATE_PATH, 'utf8'));
+    state = { ...state, ...loaded };
+    // Back-fill any missing fields from older state.json versions
     if (!state.exchangeCount) state.exchangeCount = {};
+    if (!state.codexSessions) state.codexSessions = {};
+    if (!state.backends) state.backends = {};
+    if (!state.pendingTransfer) state.pendingTransfer = {};
+    // Restore persisted chat settings (model choices survive restart)
+    if (loaded.chatSettings) {
+      for (const [cid, s] of Object.entries(loaded.chatSettings)) {
+        chatSettings[cid] = { ...s, lastResult: null };
+      }
+    }
   } catch {
-    // Corrupted state, start fresh
-    state = { updateOffset: 0, sessions: {}, exchangeCount: {} };
+    // Corrupted state, keep defaults
   }
+}
+
+function getBackend(chatId) {
+  return state.backends[String(chatId)] || config.defaultBackend || 'claude';
+}
+
+function setBackend(chatId, backend, transfer = undefined) {
+  const key = String(chatId);
+  const prev = getBackend(chatId);
+  state.backends[key] = backend;
+  if (prev !== backend) {
+    // Backend switches should be clean handoffs, not resumes of old target
+    // backend threads. The transfer summary carries continuity; stale target
+    // sessions are what caused massive cumulative Codex token usage.
+    if (backend === 'codex') {
+      if (state.codexSessions[key]) log(`Switch ${prev}→${backend}: clearing stale Codex thread ${state.codexSessions[key]} for ${key}`);
+      delete state.codexSessions[key];
+    } else if (backend === 'claude') {
+      if (state.sessions[key]) log(`Switch ${prev}→${backend}: clearing stale Claude session ${state.sessions[key]} for ${key}`);
+      delete state.sessions[key];
+    }
+    delete state.exchangeCount[key];
+    // Queue a one-shot context transfer on the next message.
+    // `transfer.context` can be precomputed by slash commands so the first
+    // real message on the new backend does not pay the handoff latency.
+    state.pendingTransfer[key] = { from: prev, to: backend, ...(transfer || {}) };
+  }
+  saveState();
 }
 
 // Checkpoint enforcement: track exchanges per session
@@ -78,6 +122,674 @@ fs.writeFileSync(PID_PATH, String(process.pid));
 function log(msg) {
   const line = `[${new Date().toISOString()}] ${msg}\n`;
   fs.appendFileSync(LOG_PATH, line);
+}
+
+// ============================================================
+// SESSION PRIMER — inject recent daily logs on fresh sessions
+// ============================================================
+// When a session is cleared (by /reset or session-audit cron), the next
+// message spawns a fresh claude -p with no memory of prior days. AGENTS.md
+// tells the agent to read recent daily logs on session start, but that's a
+// rule, not a mechanism. This injects the logs via --append-system-prompt
+// so they're guaranteed to be loaded.
+
+function buildSessionPrimer() {
+  try {
+    if (!fs.existsSync(MEMORY_DIR)) return null;
+    const files = fs.readdirSync(MEMORY_DIR)
+      .filter(f => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
+      .sort()
+      .reverse()
+      .slice(0, 3);
+
+    if (files.length === 0) return null;
+
+    const sections = [];
+    for (const f of files) {
+      try {
+        const content = fs.readFileSync(path.join(MEMORY_DIR, f), 'utf8');
+        if (content.trim().length < 100) continue; // skip stub files
+        sections.push(`=== memory/${f} ===\n${content.trim()}`);
+      } catch {}
+    }
+
+    if (sections.length === 0) return null;
+
+    return [
+      '# RECENT CONTEXT (auto-injected on fresh session)',
+      '',
+      'Your session was cleared since the last conversation. Below are the 3 most recent daily logs so you have continuity. Read them before responding to the user\'s message.',
+      '',
+      sections.join('\n\n'),
+    ].join('\n');
+  } catch (err) {
+    log(`Session primer build failed: ${err.message}`);
+    return null;
+  }
+}
+
+// ============================================================
+// CODEX BACKEND — models, context, transcript replay
+// ============================================================
+
+const CODEX_MODELS = {
+  '5.4':             { id: 'gpt-5.4',             display: 'GPT-5.4 (frontier, default)' },
+  '5.4-mini':        { id: 'gpt-5.4-mini',        display: 'GPT-5.4 Mini' },
+  '5.3-codex':       { id: 'gpt-5.3-codex',       display: 'GPT-5.3 Codex' },
+  '5.2':             { id: 'gpt-5.2',             display: 'GPT-5.2' },
+  '5.2-codex':       { id: 'gpt-5.2-codex',       display: 'GPT-5.2 Codex' },
+  '5.1-codex-max':   { id: 'gpt-5.1-codex-max',   display: 'GPT-5.1 Codex Max' },
+  '5.1-codex-mini':  { id: 'gpt-5.1-codex-mini',  display: 'GPT-5.1 Codex Mini' },
+};
+const CODEX_DEFAULT_MODEL = 'gpt-5.4';
+const HANDOFF_SUMMARY_MODEL = 'sonnet';
+
+// Files to inject as standing context on fresh Codex threads.
+// AGENTS.md is excluded because Codex auto-loads it from the workspace.
+const CODEX_BASE_CONTEXT_FILES = [
+  'SOUL.md',
+  'USER.md',
+  'TOOLS.md',
+  'NATIVECLAW.md',
+  'device.md',
+];
+
+const CODEX_PREAMBLE = `# CODEX BACKEND — OPERATING CONSTRAINTS
+
+You are a NativeClaw agent running through the OpenAI Codex CLI as an alternate backend.
+The user switched to you from Claude. You share the same identity (SOUL.md),
+user context (USER.md), tool notes (TOOLS.md), runtime notes (NATIVECLAW.md),
+device reference (device.md), and business memory (MEMORY.md when needed).
+
+## What you CAN do
+- Read and write files on this device
+- Run shell commands (bash, python, node, git, etc.)
+- Chat, brainstorm, answer questions
+- Edit code, build websites, run scripts
+- Access the internet via shell tools (curl, etc.)
+- MCP tools — config is mirrored in ~/.codex/config.toml when Codex tool access is configured
+- Bridge-level cron jobs, heartbeats, and session-audit can run while either
+  Claude or Codex is active. The bridge owns scheduling.
+
+## What you CANNOT do
+- Claude Code skills (/commit, /banana, /gsd-*, etc.) — those are Claude-specific
+- Codex does not have its own native cron system
+- Claude-specific flags (--append-system-prompt, --mcp-config, etc.)
+
+## Rules that still apply
+- Identity, personality, tone from SOUL.md
+- Git rules from AGENTS.md — never commit/push/deploy without permission
+- Honesty rules — never fabricate, never say "done" without doing it
+- Memory writes — use file-editing tools or python to write to workspace files
+- Long-term context from MEMORY.md; live data should come from the configured source-of-truth tool
+- Tool-Use Enforcement from AGENTS.md — MUST call tools before answering data questions
+
+## Memory Retrieval (CRITICAL)
+You have access to QMD search_memory MCP tool. It semantically searches all daily
+logs, MEMORY.md, and feedback files. When the user asks about ANY client, lead,
+past event, decision, price, agreement, or history — call search_memory FIRST,
+then answer. Do NOT guess from standing context alone. The standing context is a
+summary; search_memory has the full history.
+
+When you see instructions referencing Claude-specific features like Claude
+Code slash commands, skip them silently. MCP tools ARE available to you — use them.
+`;
+
+function extractLatestCheckpoint(logContent) {
+  const chunks = logContent.split(/^## /m).filter(Boolean);
+  if (chunks.length === 0) return null;
+  const latest = chunks[chunks.length - 1].trim();
+  const lines = latest.split('\n');
+  if (lines.length > 40) return lines.slice(0, 40).join('\n') + '\n[...truncated]';
+  return latest;
+}
+
+// Context profiles control how much gets injected per interaction type.
+const CONTEXT_PROFILES = {
+  chat: {
+    files: CODEX_BASE_CONTEXT_FILES,
+    injectCheckpoint: true,
+    injectMemory: false,
+  },
+  work: {
+    files: [...CODEX_BASE_CONTEXT_FILES, 'MEMORY.md'],
+    injectCheckpoint: true,
+    injectMemory: false,
+  },
+  cron: {
+    files: [],
+    injectCheckpoint: false,
+    injectMemory: false,
+  },
+};
+
+function detectContextProfile(prompt) {
+  const lower = (prompt || '').toLowerCase();
+  const workSignals = [
+    'build', 'fix', 'deploy', 'update', 'create', 'implement', 'add', 'remove',
+    'edit', 'write', 'code', 'debug', 'test', 'review', 'check', 'run',
+    'client', 'project', 'task', 'pipeline', 'website', 'site', 'page',
+    'api', 'endpoint', 'database', 'server', 'css', 'html', 'js',
+    'email', 'send', 'draft', 'schedule', 'call', 'meeting',
+    'trello', 'linear', 'hq', 'drive', 'sheet', 'doc',
+    'codex', 'claude', 'backend', 'bridge', 'config', 'agent',
+    'system', 'heartbeat', 'cron', 'nativeclaw', 'tools', 'memory',
+  ];
+  for (const signal of workSignals) {
+    if (lower.includes(signal)) return 'work';
+  }
+  return 'chat';
+}
+
+function buildCodexContext(profile) {
+  profile = profile || 'work';
+  const cfg = CONTEXT_PROFILES[profile] || CONTEXT_PROFILES.work;
+  const sections = [];
+
+  for (const fname of cfg.files) {
+    const fpath = path.join(WORKSPACE, fname);
+    try {
+      if (!fs.existsSync(fpath)) continue;
+      const content = fs.readFileSync(fpath, 'utf8').trim();
+      if (content.length < 50) continue;
+      sections.push(`=== ${fname} ===\n${content}`);
+    } catch {}
+  }
+
+  if (cfg.injectCheckpoint) {
+    try {
+      if (fs.existsSync(MEMORY_DIR)) {
+        const files = fs.readdirSync(MEMORY_DIR)
+          .filter(f => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
+          .sort()
+          .reverse();
+        for (const f of files.slice(0, 2)) {
+          try {
+            const content = fs.readFileSync(path.join(MEMORY_DIR, f), 'utf8').trim();
+            if (content.length < 100) continue;
+            const checkpoint = extractLatestCheckpoint(content);
+            if (checkpoint) {
+              sections.push(`=== memory/${f} (latest checkpoint) ===\n${checkpoint}`);
+              break;
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+  }
+
+  if (sections.length === 0) return '';
+
+  return [
+    `# STANDING CONTEXT (profile: ${profile})`,
+    '',
+    sections.join('\n\n'),
+    '',
+    '# END STANDING CONTEXT',
+  ].join('\n');
+}
+
+function buildCodexCronContext() {
+  return [
+    '# CODEX CRON CONTEXT',
+    '',
+    'You are a NativeClaw agent running a scheduled background cron through the Telegram bridge.',
+    `Workspace: ${WORKSPACE}`,
+    '',
+    'Rules:',
+    '- Obey AGENTS.md and workspace memory rules.',
+    '- Use MCP tools when the cron prompt asks for external data.',
+    '- Read SOUL.md, USER.md, MEMORY.md, TOOLS.md, NATIVECLAW.md, device.md, daily logs, or feedback files only when needed for the specific cron.',
+    '- Do not send Telegram messages unless the cron prompt explicitly tells you to.',
+    '- Keep silent maintenance tasks silent.',
+  ].join('\n');
+}
+
+// Find the rollout file for a Codex thread.
+// Codex rollout path: ~/.codex/sessions/YYYY/MM/DD/rollout-<ts>-<thread_id>.jsonl
+function findCodexRolloutPath(threadId) {
+  if (!threadId) return '';
+  try {
+    const sessionsRoot = path.join(HOME_DIR, '.codex', 'sessions');
+    if (!fs.existsSync(sessionsRoot)) return '';
+
+    // Walk year/month/day to find the rollout file matching this thread_id
+    let rolloutPath = null;
+    const years = fs.readdirSync(sessionsRoot).sort().reverse();
+    outer: for (const y of years) {
+      const yp = path.join(sessionsRoot, y);
+      if (!fs.statSync(yp).isDirectory()) continue;
+      const months = fs.readdirSync(yp).sort().reverse();
+      for (const m of months) {
+        const mp = path.join(yp, m);
+        if (!fs.statSync(mp).isDirectory()) continue;
+        const days = fs.readdirSync(mp).sort().reverse();
+        for (const d of days) {
+          const dp = path.join(mp, d);
+          if (!fs.statSync(dp).isDirectory()) continue;
+          const files = fs.readdirSync(dp);
+          const match = files.find(f => f.endsWith(`${threadId}.jsonl`));
+          if (match) {
+            rolloutPath = path.join(dp, match);
+            break outer;
+          }
+        }
+      }
+    }
+    return rolloutPath || '';
+  } catch (err) {
+    log(`findCodexRolloutPath failed: ${err.message}`);
+    return '';
+  }
+}
+
+// Extract the last N user/assistant exchanges from a Codex session rollout.
+// Shared by buildCodexTranscriptReplay and buildCodexHandoffSummary.
+function extractCodexTranscriptExchanges(threadId, maxExchanges = 30) {
+  const rolloutPath = findCodexRolloutPath(threadId);
+  if (!rolloutPath) return [];
+  try {
+    const lines = fs.readFileSync(rolloutPath, 'utf8').trim().split('\n');
+    const exchanges = [];
+
+    for (const line of lines) {
+      try {
+        const ev = JSON.parse(line);
+        // Codex logs conversation as response_item events with role + content[].
+        // User sends look like input_text, assistant sends look like output_text.
+        if (ev.type !== 'response_item') continue;
+        const p = ev.payload;
+        if (!p || p.type !== 'message') continue;
+        const role = p.role;
+        if (role !== 'user' && role !== 'assistant') continue;
+
+        const texts = [];
+        if (Array.isArray(p.content)) {
+          for (const c of p.content) {
+            if (typeof c.text === 'string' && (c.type === 'input_text' || c.type === 'output_text')) {
+              const t = c.text.trim();
+              // Skip Codex/bridge injected context blocks; only preserve real user/assistant conversation.
+              if (
+                !t ||
+                t.startsWith('<permissions') ||
+                t.startsWith('<environment') ||
+                t.startsWith('<skills_instructions') ||
+                t.startsWith('# AGENTS.md instructions') ||
+                t.startsWith('# CODEX BACKEND') ||
+                t.startsWith('# HANDOFF BRIEF') ||
+                t.startsWith('# STANDING CONTEXT')
+              ) continue;
+              texts.push(t);
+            }
+          }
+        }
+        if (texts.length === 0) continue;
+        const joined = texts.join('\n').trim();
+        if (!joined) continue;
+        exchanges.push({ role, text: joined.slice(0, 4000) });
+      } catch {}
+    }
+
+    return exchanges.slice(-maxExchanges);
+  } catch (err) {
+    log(`extractCodexTranscriptExchanges failed: ${err.message}`);
+    return [];
+  }
+}
+
+// Format raw Codex exchanges as a replay block for Claude context injection.
+function buildCodexTranscriptReplay(threadId, maxExchanges = 20) {
+  const tail = extractCodexTranscriptExchanges(threadId, maxExchanges);
+  if (tail.length === 0) return '';
+
+  const rendered = tail
+    .map(e => `[${e.role.toUpperCase()}]: ${e.text}`)
+    .join('\n\n');
+
+  return [
+    '# PRIOR CONVERSATION (from Codex session, for continuity)',
+    '',
+    'The user just switched from Codex back to you (Claude). Below is the tail of that conversation so you can pick up where Codex left off. Do not re-greet or restart — continue naturally.',
+    '',
+    rendered,
+    '',
+    '# END PRIOR CONVERSATION',
+  ].join('\n');
+}
+
+function buildLatestExchangeBlock(exchanges, label) {
+  if (!Array.isArray(exchanges) || exchanges.length === 0) return '';
+  let latestUser = null;
+  let latestAssistant = null;
+
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    if (!latestAssistant && exchanges[i].role === 'assistant') latestAssistant = exchanges[i].text;
+    if (!latestUser && exchanges[i].role === 'user') latestUser = exchanges[i].text;
+    if (latestUser && latestAssistant) break;
+  }
+
+  const lines = [
+    `# LATEST ${label} EXCHANGE (verbatim)`,
+    '',
+    'This block is exact continuity data. Preserve short answers, test phrases, IDs, tokens, command output, and user wording verbatim.',
+    '',
+  ];
+  if (latestUser) lines.push(`[USER]: ${latestUser}`, '');
+  if (latestAssistant) lines.push(`[ASSISTANT]: ${latestAssistant}`, '');
+  lines.push(`# END LATEST ${label} EXCHANGE`);
+  return lines.join('\n');
+}
+
+// Generate a meta-prompt handoff summary from Codex back to Claude.
+// Returns a formatted handoff block, or null on failure (caller falls back to raw replay).
+async function buildCodexHandoffSummary(threadId) {
+  if (!threadId) return null;
+  try {
+    const exchanges = extractCodexTranscriptExchanges(threadId, 30);
+    if (exchanges.length === 0) return null;
+
+    const transcriptText = exchanges
+      .map(e => `[${e.role.toUpperCase()}]: ${e.text}`)
+      .join('\n\n');
+
+    const metaPrompt = [
+      '# CODEX CONVERSATION TO SUMMARIZE',
+      '',
+      transcriptText,
+      '',
+      '---',
+      '',
+      'Generate a structured handoff brief for a backend switch. The user is switching from Codex back to Claude. Claude already has its earlier Claude session history, so focus only on what happened while Codex was active.',
+      '',
+      'Include:',
+      '1. Current task or topic — what Codex was working on or discussing',
+      '2. Key decisions — what was decided and why (be specific)',
+      '3. Rules or feedback established — any new rules the user set, corrections they gave, or behavioral guidance. Include the exact rule and where it was saved (file path). This is CRITICAL — dropped rules cause repeated mistakes.',
+      '4. Files modified — every file that was created, edited, or written to during this session (exact paths)',
+      '5. Active artifacts — URLs, commands, code snippets, or API responses still in play',
+      '6. Open questions — anything unresolved or waiting on someone',
+      '7. Next action — what Claude should do next if we were mid-task',
+      '8. Latest exchange — include the latest user message and latest assistant answer verbatim. This is mandatory for short answers, test phrases, IDs, tokens, command output, and context checks.',
+      '',
+      'Keep it under 1500 tokens. Be specific — vague summaries are useless. Rules, feedback, and exact latest exchange data are the HIGHEST priority items. If there was no active task (just chatting), summarize the key points briefly but preserve short answers and test phrases verbatim.',
+      '',
+      'Output ONLY the handoff brief. No preamble.',
+    ].join('\n');
+
+    log(`Generating Codex→Claude handoff summary for thread ${threadId}...`);
+
+    const summary = await new Promise((resolve) => {
+      const args = [
+        '-p', metaPrompt,
+        '--output-format', 'json',
+        '--dangerously-skip-permissions',
+        '--model', HANDOFF_SUMMARY_MODEL,
+        '--max-turns', '1',
+      ];
+
+      const cleanEnv = { ...process.env };
+      delete cleanEnv.CLAUDECODE;
+      delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
+      delete cleanEnv.MCP_CLAUDE;
+
+      const proc = spawn('claude', args, {
+        cwd: WORKSPACE,
+        env: cleanEnv,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      proc.stdout.on('data', (d) => { stdout += d.toString(); });
+      proc.stderr.on('data', () => {}); // suppress stderr noise
+
+      const timer = setTimeout(() => {
+        proc.kill('SIGTERM');
+        log(`Codex→Claude handoff summary timed out for thread ${threadId}`);
+        resolve(null);
+      }, 45000);
+
+      proc.on('close', () => {
+        clearTimeout(timer);
+        try {
+          const lines = stdout.trim().split('\n');
+          for (let i = lines.length - 1; i >= 0; i--) {
+            try {
+              const parsed = JSON.parse(lines[i]);
+              if (parsed.type === 'result') {
+                resolve(parsed.result || parsed.message || null);
+                return;
+              }
+            } catch {}
+          }
+          resolve(stdout.trim() || null);
+        } catch {
+          resolve(null);
+        }
+      });
+
+      proc.on('error', () => {
+        clearTimeout(timer);
+        resolve(null);
+      });
+    });
+
+    if (!summary) {
+      log(`Codex→Claude handoff summary returned empty — falling back to transcript replay`);
+      return null;
+    }
+
+    log(`Codex→Claude handoff summary generated (${summary.length} chars) for thread ${threadId}`);
+    return [
+      '# HANDOFF BRIEF (from Codex session)',
+      '',
+      'You are the Claude backend. The user just switched back from Codex. Below is a curated handoff summary of what happened while Codex was active. Continue naturally from where things left off. Do not re-greet.',
+      '',
+      buildLatestExchangeBlock(exchanges, 'CODEX'),
+      '',
+      summary.trim(),
+      '',
+      '# END HANDOFF BRIEF',
+    ].join('\n');
+  } catch (err) {
+    log(`buildCodexHandoffSummary failed: ${err.message}`);
+    return null;
+  }
+}
+
+function findClaudeTranscriptPath(sessionId) {
+  if (!sessionId) return null;
+  const projectsRoot = path.join(HOME_DIR, '.claude', 'projects');
+  try {
+    if (!fs.existsSync(projectsRoot)) return null;
+
+    const dirs = fs.readdirSync(projectsRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => path.join(projectsRoot, entry.name));
+
+    for (const dir of dirs) {
+      const candidate = path.join(dir, `${sessionId}.jsonl`);
+      if (fs.existsSync(candidate)) return candidate;
+    }
+  } catch (err) {
+    log(`findClaudeTranscriptPath failed: ${err.message}`);
+  }
+  return null;
+}
+
+// Extract the last N user/assistant exchanges from a Claude session transcript.
+// Shared by buildClaudeTranscriptReplay and buildClaudeHandoffSummary.
+function extractClaudeTranscriptExchanges(sessionId, maxExchanges = 30) {
+  if (!sessionId) return [];
+  try {
+    const transcriptPath = findClaudeTranscriptPath(sessionId);
+    if (!transcriptPath) return [];
+    if (!fs.existsSync(transcriptPath)) return [];
+
+    const lines = fs.readFileSync(transcriptPath, 'utf8').trim().split('\n');
+    const exchanges = [];
+
+    for (const line of lines) {
+      try {
+        const entry = JSON.parse(line);
+        if (entry.type === 'user' && entry.message?.content) {
+          const content = Array.isArray(entry.message.content)
+            ? entry.message.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
+            : entry.message.content;
+          if (typeof content === 'string' && content.trim() && !content.startsWith('<')) {
+            exchanges.push({ role: 'user', text: content.trim().slice(0, 4000) });
+          }
+        } else if (entry.type === 'assistant' && entry.message?.content) {
+          const content = Array.isArray(entry.message.content)
+            ? entry.message.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
+            : entry.message.content;
+          if (typeof content === 'string' && content.trim()) {
+            exchanges.push({ role: 'assistant', text: content.trim().slice(0, 4000) });
+          }
+        }
+      } catch {}
+    }
+
+    return exchanges.slice(-maxExchanges);
+  } catch (err) {
+    log(`extractClaudeTranscriptExchanges failed: ${err.message}`);
+    return [];
+  }
+}
+
+// Format raw exchanges as a replay block for Codex context injection.
+function buildClaudeTranscriptReplay(sessionId, maxExchanges = 20) {
+  const exchanges = extractClaudeTranscriptExchanges(sessionId, maxExchanges);
+  if (exchanges.length === 0) return '';
+
+  const rendered = exchanges
+    .map(e => `[${e.role.toUpperCase()}]: ${e.text}`)
+    .join('\n\n');
+
+  return [
+    '# PRIOR CONVERSATION (from Claude session, for continuity)',
+    '',
+    'The user just switched from the Claude backend to you (Codex). Below is the tail of that conversation so you can pick up where Claude left off. Do not re-greet or restart — continue naturally from the last exchange.',
+    '',
+    rendered,
+    '',
+    '# END PRIOR CONVERSATION',
+  ].join('\n');
+}
+
+// Generate a meta-prompt handoff summary via a fresh Claude subprocess.
+// Returns a formatted handoff block, or null on failure (caller falls back to raw replay).
+async function buildClaudeHandoffSummary(sessionId) {
+  if (!sessionId) return null;
+  try {
+    const exchanges = extractClaudeTranscriptExchanges(sessionId, 30);
+    if (exchanges.length === 0) return null;
+
+    const transcriptText = exchanges
+      .map(e => `[${e.role.toUpperCase()}]: ${e.text}`)
+      .join('\n\n');
+
+    const metaPrompt = [
+      '# CONVERSATION TO SUMMARIZE',
+      '',
+      transcriptText,
+      '',
+      '---',
+      '',
+      'Generate a structured handoff brief for a backend switch. The user is switching to a different AI backend (Codex) that will not have access to this conversation history — only this summary.',
+      '',
+      'Include:',
+      '1. Current task or topic — what we were working on or discussing',
+      '2. Key decisions — what was decided and why (be specific)',
+      '3. Rules or feedback established — any new rules the user set, corrections they gave, or behavioral guidance. Include the exact rule and where it was saved (file path). This is CRITICAL — dropped rules cause repeated mistakes.',
+      '4. Files modified — every file that was created, edited, or written to during this session (exact paths)',
+      '5. Active artifacts — URLs, commands, code snippets, or API responses still in play',
+      '6. Open questions — anything unresolved or waiting on someone',
+      '7. Next action — what to do next if we were mid-task',
+      '8. Latest exchange — include the latest user message and latest assistant answer verbatim. This is mandatory for short answers, test phrases, IDs, tokens, command output, and context checks.',
+      '',
+      'Keep it under 1500 tokens. Be specific — vague summaries are useless. Rules, feedback, and exact latest exchange data are the HIGHEST priority items. If there was no active task (just chatting), summarize the key points briefly but preserve short answers and test phrases verbatim.',
+      '',
+      'Output ONLY the handoff brief. No preamble.',
+    ].join('\n');
+
+    log(`Generating handoff summary for session ${sessionId}...`);
+
+    const summary = await new Promise((resolve) => {
+      const args = [
+        '-p', metaPrompt,
+        '--output-format', 'json',
+        '--dangerously-skip-permissions',
+        '--model', HANDOFF_SUMMARY_MODEL,
+        '--max-turns', '1',
+      ];
+
+      const cleanEnv = { ...process.env };
+      delete cleanEnv.CLAUDECODE;
+      delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
+      delete cleanEnv.MCP_CLAUDE;
+
+      const proc = spawn('claude', args, {
+        cwd: WORKSPACE,
+        env: cleanEnv,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      proc.stdout.on('data', (d) => { stdout += d.toString(); });
+      proc.stderr.on('data', () => {}); // suppress stderr noise
+
+      const timer = setTimeout(() => {
+        proc.kill('SIGTERM');
+        log(`Handoff summary timed out for session ${sessionId}`);
+        resolve(null);
+      }, 45000);
+
+      proc.on('close', () => {
+        clearTimeout(timer);
+        try {
+          const lines = stdout.trim().split('\n');
+          for (let i = lines.length - 1; i >= 0; i--) {
+            try {
+              const parsed = JSON.parse(lines[i]);
+              if (parsed.type === 'result') {
+                resolve(parsed.result || parsed.message || null);
+                return;
+              }
+            } catch {}
+          }
+          resolve(stdout.trim() || null);
+        } catch {
+          resolve(null);
+        }
+      });
+
+      proc.on('error', () => {
+        clearTimeout(timer);
+        resolve(null);
+      });
+    });
+
+    if (!summary) {
+      log(`Handoff summary generation returned empty — falling back to transcript replay`);
+      return null;
+    }
+
+    log(`Handoff summary generated (${summary.length} chars) for session ${sessionId}`);
+    return [
+      '# HANDOFF BRIEF (from Claude session)',
+      '',
+      'You are the Codex backend. The user just switched from Claude. Below is a curated handoff summary — not raw history. Continue naturally from where things left off. Do not re-greet.',
+      '',
+      buildLatestExchangeBlock(exchanges, 'CLAUDE'),
+      '',
+      summary.trim(),
+      '',
+      '# END HANDOFF BRIEF',
+    ].join('\n');
+  } catch (err) {
+    log(`buildClaudeHandoffSummary failed: ${err.message}`);
+    return null;
+  }
 }
 
 // ============================================================
@@ -111,56 +823,125 @@ async function tg(method, params = {}) {
   }
 }
 
+async function sendPhoto(chatId, imagePath, caption = '') {
+  const https = require('https');
+  return new Promise((resolve, reject) => {
+    const boundary = '----NativeClawBoundary' + Math.random().toString(36).slice(2);
+    const fileName = path.basename(imagePath);
+    const fileBuffer = fs.readFileSync(imagePath);
+    const parts = [
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`),
+      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="${fileName}"\r\nContent-Type: image/${path.extname(fileName).slice(1) || 'png'}\r\n\r\n`),
+      fileBuffer,
+      Buffer.from('\r\n'),
+    ];
+    if (caption) {
+      parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`));
+    }
+    parts.push(Buffer.from(`--${boundary}--\r\n`));
+    const body = Buffer.concat(parts);
+    const options = {
+      method: 'POST',
+      host: 'api.telegram.org',
+      path: `/bot${BOT_TOKEN}/sendPhoto`,
+      headers: {
+        'Content-Type': `multipart/form-data; boundary=${boundary}`,
+        'Content-Length': body.length,
+      },
+    };
+    const req = https.request(options, res => {
+      let body = '';
+      res.on('data', d => body += d);
+      res.on('end', () => {
+        try {
+          const data = JSON.parse(body);
+          if (!data.ok) { log(`sendPhoto failed: ${data.description}`); sendMessage(chatId, `[Image failed to send: ${data.description}]`); }
+          resolve(data);
+        } catch (e) { reject(e); }
+      });
+    });
+    req.on('error', err => { log(`sendPhoto error: ${err.message}`); sendMessage(chatId, `[Image failed to send: ${err.message}]`); reject(err); });
+    req.write(body);
+    req.end();
+  });
+}
+
 // Convert GitHub-flavored markdown to Telegram-compatible HTML
 function mdToHtml(text) {
   const codeBlocks = [];
   const inlineCode = [];
 
+  // Extract code blocks first (preserve content, escape HTML inside them)
   text = text.replace(/```\w*\n?([\s\S]*?)```/g, (_, code) => {
     codeBlocks.push(code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
     return `\x00CB${codeBlocks.length - 1}\x00`;
   });
 
+  // Extract inline code
   text = text.replace(/`([^`]+)`/g, (_, code) => {
     inlineCode.push(code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
     return `\x00IC${inlineCode.length - 1}\x00`;
   });
 
+  // Escape HTML in remaining text
   text = text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  // Headers → bold
   text = text.replace(/^#{1,6}\s+(.+)$/gm, '<b>$1</b>');
+
+  // Bold
   text = text.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
   text = text.replace(/__(.+?)__/g, '<b>$1</b>');
+
+  // Italic
   text = text.replace(/\*(.+?)\*/g, '<i>$1</i>');
   text = text.replace(/_(.+?)_/g, '<i>$1</i>');
+
+  // Horizontal rules → remove
   text = text.replace(/^---+$/gm, '');
+
+  // Tables → space-separated plain text
   text = text.replace(/^\|(.+)\|$/gm, (_, row) =>
     row.split('|').map(c => c.trim()).filter(Boolean).join('   ')
   );
   text = text.replace(/^[\s|:-]+$/gm, '');
+
+  // Restore inline code and code blocks
   text = text.replace(/\x00IC(\d+)\x00/g, (_, i) => `<code>${inlineCode[i]}</code>`);
   text = text.replace(/\x00CB(\d+)\x00/g, (_, i) => `<pre>${codeBlocks[i]}</pre>`);
+
   return text;
 }
 
 async function sendMessage(chatId, text) {
   const html = mdToHtml(text);
   const chunks = splitText(html, 4000);
-  for (const chunk of chunks) {
+  let sentCount = 0;
+  let failedCount = 0;
+
+  for (let i = 0; i < chunks.length; i++) {
     try {
-      await tg('sendMessage', { chat_id: chatId, text: chunk, parse_mode: 'HTML' });
+      await tg('sendMessage', { chat_id: chatId, text: chunks[i], parse_mode: 'HTML' });
+      sentCount++;
     } catch (err) {
-      log(`HTML send failed, retrying plain: ${err.message}`);
-      const plainChunks = splitText(text, 4000);
-      for (const plain of plainChunks) {
-        try {
-          await tg('sendMessage', { chat_id: chatId, text: plain });
-        } catch (retryErr) {
-          log(`sendMessage retry failed: ${retryErr.message}`);
-        }
+      // HTML parse failed for this chunk, retry it as plain text
+      log(`HTML send failed on chunk ${i + 1}/${chunks.length}: ${err.message}`);
+      try {
+        // Strip HTML tags for plain text fallback of THIS chunk only
+        const plain = chunks[i].replace(/<[^>]+>/g, '');
+        await tg('sendMessage', { chat_id: chatId, text: plain });
+        sentCount++;
+      } catch (retryErr) {
+        failedCount++;
+        log(`sendMessage chunk ${i + 1}/${chunks.length} FAILED (both HTML and plain): ${retryErr.message}`);
       }
-      break;
     }
   }
+
+  if (failedCount > 0) {
+    log(`WARNING: ${failedCount}/${chunks.length} message chunks failed to send`);
+  }
+  return { sent: sentCount, failed: failedCount, total: chunks.length };
 }
 
 function splitText(text, maxLen) {
@@ -175,8 +956,31 @@ function splitText(text, maxLen) {
     // Try to split at a newline
     let splitAt = remaining.lastIndexOf('\n', maxLen);
     if (splitAt < maxLen * 0.3) splitAt = maxLen; // No good newline, hard split
-    chunks.push(remaining.slice(0, splitAt));
+    let chunk = remaining.slice(0, splitAt);
     remaining = remaining.slice(splitAt).trimStart();
+
+    // Fix unclosed HTML tags in this chunk
+    const openTags = [];
+    const tagRegex = /<\/?([a-z]+)>/gi;
+    let match;
+    while ((match = tagRegex.exec(chunk)) !== null) {
+      if (match[0].startsWith('</')) {
+        // Closing tag — pop if it matches
+        if (openTags.length > 0 && openTags[openTags.length - 1] === match[1].toLowerCase()) {
+          openTags.pop();
+        }
+      } else {
+        openTags.push(match[1].toLowerCase());
+      }
+    }
+    // Close any unclosed tags at end of chunk (reverse order)
+    if (openTags.length > 0) {
+      chunk += openTags.reverse().map(t => `</${t}>`).join('');
+      // Re-open them at the start of the remaining text
+      remaining = openTags.reverse().map(t => `<${t}>`).join('') + remaining;
+    }
+
+    chunks.push(chunk);
   }
   return chunks;
 }
@@ -205,29 +1009,137 @@ async function downloadTelegramFile(fileId, prefix = 'file') {
 }
 
 async function transcribeVoice(audioPath) {
-  if (!OPENAI_API_KEY) throw new Error('openaiApiKey not set in config.json');
+  const https = require('https');
+  const openaiKey = config.openaiApiKey;
 
-  const audioBuffer = fs.readFileSync(audioPath);
-  const fileName = path.basename(audioPath);
-
-  const formData = new FormData();
-  formData.append('file', new Blob([audioBuffer]), fileName);
-  formData.append('model', 'whisper-1');
-  formData.append('language', 'en');
-
-  const res = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-    body: formData
-  });
-
-  if (!res.ok) {
-    const err = await res.text();
-    throw new Error(`OpenAI Whisper API error ${res.status}: ${err}`);
+  if (!openaiKey) {
+    throw new Error('No OpenAI API key in config.json — cannot transcribe voice');
   }
 
-  const data = await res.json();
-  return (data.text || '').trim();
+   return new Promise((resolve, reject) => {
+     const boundary = '----FormBoundary' + Math.random().toString(36).substr(2);
+     const audioBuffer = fs.readFileSync(audioPath);
+     const fileName = path.basename(audioPath);
+
+     const parts = [];
+     parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n`));
+     parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nen\r\n`));
+     parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: audio/ogg\r\n\r\n`));
+     parts.push(audioBuffer);
+     parts.push(Buffer.from(`\r\n--${boundary}--\r\n`));
+     const body = Buffer.concat(parts);
+
+     // keepAlive: false prevents stale connections from being reused across requests
+     const agent = new https.Agent({ keepAlive: false });
+
+     const options = {
+       hostname: 'api.openai.com',
+       path: '/v1/audio/transcriptions',
+       method: 'POST',
+       agent,
+       headers: {
+         'Authorization': `Bearer ${openaiKey}`,
+         'Content-Type': `multipart/form-data; boundary=${boundary}`,
+         'Content-Length': body.length
+       }
+     };
+
+     let settled = false;
+     const done = (fn, val) => { if (!settled) { settled = true; clearTimeout(hardTimer); fn(val); } };
+
+     // Hard wall-clock timeout — catches stalled response bodies that fool the socket idle check
+     const hardTimer = setTimeout(() => {
+       req.destroy();
+       done(reject, new Error('OpenAI Whisper API timeout (45s hard limit)'));
+     }, 45000);
+
+     const req = https.request(options, (res) => {
+       let data = '';
+       res.on('data', chunk => data += chunk);
+       res.on('end', () => {
+         try {
+           const result = JSON.parse(data);
+           if (result.text) {
+             done(resolve, result.text.trim());
+           } else {
+             done(reject, new Error(result.error?.message || 'No transcript in OpenAI response'));
+           }
+         } catch (e) {
+           done(reject, new Error(`Failed to parse OpenAI response: ${data}`));
+         }
+       });
+       res.on('error', err => done(reject, err));
+     });
+
+     req.on('error', err => done(reject, err));
+     req.write(body);
+     req.end();
+   });
+ }
+
+
+// Extract ALL assistant text blocks from the last conversation turn in a session JSONL.
+// Claude Code's result.result only captures the LAST text block, dropping any text
+// produced BEFORE tool calls in the same turn. This reads the JSONL to get everything.
+function extractFullResponseFromSession(sessionId) {
+  if (!sessionId) return null;
+  try {
+    const transcriptPath = findClaudeTranscriptPath(sessionId);
+    if (!transcriptPath) return null;
+    if (!fs.existsSync(transcriptPath)) return null;
+
+    const lines = fs.readFileSync(transcriptPath, 'utf8').trim().split('\n');
+
+    // Collect assistant text blocks from the LAST user->assistant exchange.
+    // Walk backwards to find the last REAL user message, then collect all
+    // assistant text blocks that follow it.
+    //
+    // Skip entries that are typed as "user" but aren't actual user input:
+    //  - task-notifications (origin.kind === "task-notification") — injected
+    //    mid-turn when a background Bash task completes. Treating these as
+    //    user messages truncated replies to the text after the notification,
+    //    losing the real response.
+    //  - compact summaries (isCompactSummary === true) — injected after context
+    //    compaction.
+    //  - tool-result entries (content is an array with tool_result objects) —
+    //    these aren't user input either.
+    function isRealUserMessage(entry) {
+      if (entry.type !== 'user') return false;
+      if (entry.origin && entry.origin.kind === 'task-notification') return false;
+      if (entry.isCompactSummary) return false;
+      const content = entry.message && entry.message.content;
+      if (Array.isArray(content)) return false; // tool_result or similar
+      return true;
+    }
+    let lastUserIdx = -1;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const entry = JSON.parse(lines[i]);
+        if (isRealUserMessage(entry)) { lastUserIdx = i; break; }
+      } catch {}
+    }
+    if (lastUserIdx === -1) return null;
+
+    const textBlocks = [];
+    for (let i = lastUserIdx + 1; i < lines.length; i++) {
+      try {
+        const entry = JSON.parse(lines[i]);
+        if (entry.type === 'assistant' && Array.isArray(entry.message?.content)) {
+          for (const c of entry.message.content) {
+            if (c.type === 'text' && typeof c.text === 'string' && c.text.trim()) {
+              textBlocks.push(c.text.trim());
+            }
+          }
+        }
+      } catch {}
+    }
+
+    if (textBlocks.length <= 1) return null; // No benefit over result.result
+    return textBlocks.join('\n\n');
+  } catch (err) {
+    log(`extractFullResponseFromSession error: ${err.message}`);
+    return null;
+  }
 }
 
 // ============================================================
@@ -258,8 +1170,12 @@ function runClaude(prompt, sessionId, options = {}) {
       args.push('--max-turns', String(options.maxTurns));
     }
 
-    if (options.thinking) {
-      args.push('--max-thinking-tokens', '10000');
+    if (options.effort) {
+      args.push('--effort', options.effort);
+    }
+
+    if (options.appendSystemPrompt) {
+      args.push('--append-system-prompt', options.appendSystemPrompt);
     }
 
     // Use lightweight cron workspace for cron jobs, full workspace for user messages
@@ -331,9 +1247,14 @@ function runClaude(prompt, sessionId, options = {}) {
           }
         }
 
+        // Try to get full response from session JSONL (captures text before tool calls)
+        const sid = result.session_id || null;
+        const fullText = sid ? extractFullResponseFromSession(sid) : null;
+        const responseText = fullText || result.result || result.message || '';
+
         resolve({
-          text: result.result || result.message || '',
-          sessionId: result.session_id || null,
+          text: responseText,
+          sessionId: sid,
           cost: result.total_cost_usd || result.cost_usd || 0,
           turns: result.num_turns || 0,
           duration: result.duration_ms || 0,
@@ -349,6 +1270,276 @@ function runClaude(prompt, sessionId, options = {}) {
       reject(new Error(`Failed to spawn claude: ${err.message}`));
     });
   });
+}
+
+// Codex thread rollover thresholds — auto-rotate before bloat-induced stalls.
+// Failure case (Apr 18 2026): 1.65MB / 771-entry rollout caused chatgpt.com to stall silently.
+const CODEX_ROLLOVER_BYTES = 250 * 1024;
+const CODEX_ROLLOVER_ENTRIES = 20;
+
+function findCodexRollout(threadId) {
+  if (!threadId) return null;
+  const root = path.join(HOME_DIR, '.codex', 'sessions');
+  if (!fs.existsSync(root)) return null;
+  try {
+    for (const y of fs.readdirSync(root)) {
+      const yp = path.join(root, y);
+      if (!fs.statSync(yp).isDirectory()) continue;
+      for (const m of fs.readdirSync(yp)) {
+        const mp = path.join(yp, m);
+        if (!fs.statSync(mp).isDirectory()) continue;
+        for (const d of fs.readdirSync(mp)) {
+          const dp = path.join(mp, d);
+          if (!fs.statSync(dp).isDirectory()) continue;
+          for (const f of fs.readdirSync(dp)) {
+            if (f.endsWith(`-${threadId}.jsonl`)) return path.join(dp, f);
+          }
+        }
+      }
+    }
+  } catch { /* ignore walk errors */ }
+  return null;
+}
+
+function shouldRolloverCodex(threadId) {
+  const filePath = findCodexRollout(threadId);
+  if (!filePath) return { rollover: true, reason: 'rollout file not found' };
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.size > CODEX_ROLLOVER_BYTES) {
+      return { rollover: true, reason: `size=${stat.size}B > ${CODEX_ROLLOVER_BYTES}B`, path: filePath };
+    }
+    const entries = fs.readFileSync(filePath, 'utf8').split('\n').filter(l => l.trim()).length;
+    if (entries > CODEX_ROLLOVER_ENTRIES) {
+      return { rollover: true, reason: `entries=${entries} > ${CODEX_ROLLOVER_ENTRIES}`, path: filePath };
+    }
+    return { rollover: false, size: stat.size, entries, path: filePath };
+  } catch (err) {
+    return { rollover: true, reason: `stat error: ${err.message}` };
+  }
+}
+
+// Reap orphan MCP processes (PPID=1) left behind when a prior codex subprocess was killed
+// without taking its MCP children with it. Cheap defense in case tree-kill ever misses.
+function reapOrphanMCPs() {
+  try {
+    const pids = execSync("pgrep -f 'mcp.*trello|playwright.*mcp|@modelcontextprotocol' 2>/dev/null || true", { encoding: 'utf8' })
+      .trim().split('\n').filter(Boolean);
+    if (pids.length > 5) {
+      log(`Reaping ${pids.length} orphan MCP processes from prior codex runs`);
+      execSync("pkill -f 'mcp.*trello|playwright.*mcp|@modelcontextprotocol' 2>/dev/null || true");
+    }
+  } catch { /* best effort */ }
+}
+
+// Codex subprocess runner. Returns the same shape as runClaude for drop-in dispatch.
+// Codex emits JSONL events on stdout; we collect the final agent_message text,
+// the thread_id, and usage.
+function runCodex(prompt, threadId, options = {}) {
+  return new Promise((resolve, reject) => {
+    const model = options.codexModel || CODEX_DEFAULT_MODEL;
+    // `codex exec resume` rejects --cd and --model (those are bound to the
+    // original session). Fresh `codex exec` accepts both. Build args per-mode.
+    const args = ['exec'];
+    const commonFlags = ['--json', '--skip-git-repo-check', '--dangerously-bypass-approvals-and-sandbox'];
+    const configFlags = [];
+    if (options.effort) {
+      // Map Claude effort levels to Codex equivalents. 'max' must become 'xhigh' —
+      // Codex rejects 'max' with "Error loading config.toml: unknown variant".
+      const codexEffort = CODEX_REASONING_EFFORT[options.effort] || options.effort;
+      // Belt-and-suspenders: if mapping somehow missed, never send 'max' to codex
+      const safeEffort = codexEffort === 'max' ? 'xhigh' : codexEffort;
+      configFlags.push('-c', `model_reasoning_effort=${JSON.stringify(safeEffort)}`);
+    }
+    if (options.codexVerbosity) {
+      configFlags.push('-c', `model_verbosity=${JSON.stringify(options.codexVerbosity)}`);
+    }
+
+    if (threadId) {
+      args.push('resume', ...commonFlags, ...configFlags, threadId, prompt);
+    } else {
+      args.push(...commonFlags, ...configFlags, '--cd', WORKSPACE, '--model', model, prompt);
+    }
+
+    log(`Spawning: codex ${args.slice(0, 2).join(' ')} [${threadId ? 'resume' : 'fresh'}] model=${model} effort=${options.effort || 'default'} verbosity=${options.codexVerbosity || 'default'}`);
+
+    // Defensive: clean up orphan MCPs from prior killed subprocesses before spawning
+    reapOrphanMCPs();
+
+    const cleanEnv = { ...process.env };
+    delete cleanEnv.CLAUDECODE;
+    delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
+    delete cleanEnv.MCP_CLAUDE;
+
+    const proc = spawn('codex', args, {
+      cwd: WORKSPACE,
+      env: cleanEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true, // own process group → tree-kill via negative PID cascades to MCP children
+    });
+
+    // Tree-kill helper: kill whole process group so MCP subprocesses don't orphan
+    const killTree = (signal) => {
+      try { process.kill(-proc.pid, signal); }
+      catch { try { proc.kill(signal); } catch { /* gone */ } }
+    };
+
+    activeSubprocess = proc;
+    const startTime = Date.now();
+
+    let stdout = '';
+    let stderr = '';
+    let lastDataAt = Date.now();
+
+    proc.stdout.on('data', (d) => { stdout += d.toString(); lastDataAt = Date.now(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); lastDataAt = Date.now(); });
+
+    const timeoutMs = (options.timeout || 300) * 1000;
+    const idleMs = (options.idleTimeout || 180) * 1000;
+    const timer = setTimeout(() => {
+      log(`Codex subprocess wall-clock timeout after ${timeoutMs}ms, killing tree...`);
+      killTree('SIGTERM');
+      setTimeout(() => killTree('SIGKILL'), 5000);
+    }, timeoutMs);
+    const idleTimer = setInterval(() => {
+      const idleFor = Date.now() - lastDataAt;
+      if (idleFor > idleMs) {
+        log(`Codex subprocess idle ${Math.round(idleFor/1000)}s (no stdout/stderr; limit ${idleMs/1000}s), killing tree...`);
+        clearInterval(idleTimer);
+        killTree('SIGTERM');
+        setTimeout(() => killTree('SIGKILL'), 5000);
+      }
+    }, 5000);
+
+    proc.on('close', (code) => {
+      activeSubprocess = null;
+      clearTimeout(timer);
+      clearInterval(idleTimer);
+
+      if (code !== 0 && !stdout.trim()) {
+        return reject(new Error(stderr.trim() || `codex exited with code ${code}`));
+      }
+
+      // Parse JSONL: one event per line
+      let outThreadId = null;
+      let inputTokens = 0;
+      let outputTokens = 0;
+      let cachedInputTokens = 0;
+      let turns = 0;
+      const textParts = [];
+      let errorMsg = null;
+
+      for (const line of stdout.split('\n')) {
+        const trimmed = line.trim();
+        if (!trimmed) continue;
+        try {
+          const ev = JSON.parse(trimmed);
+          switch (ev.type) {
+            case 'thread.started':
+              outThreadId = ev.thread_id || null;
+              break;
+            case 'turn.started':
+              turns++;
+              break;
+            case 'item.completed':
+              if (ev.item?.type === 'agent_message' && typeof ev.item.text === 'string') {
+                textParts.push(ev.item.text);
+              }
+              break;
+            case 'turn.completed':
+              if (ev.usage) {
+                // Use = not += — resume sessions emit cumulative per-turn history;
+                // last turn's usage reflects only the new response, not all prior context.
+                inputTokens = ev.usage.input_tokens || 0;
+                outputTokens = ev.usage.output_tokens || 0;
+                cachedInputTokens = ev.usage.cached_input_tokens || 0;
+              }
+              break;
+            case 'error':
+              errorMsg = ev.message || 'unknown codex error';
+              break;
+          }
+        } catch {
+          // Not JSON, skip
+        }
+      }
+
+      if (errorMsg && textParts.length === 0) {
+        return reject(new Error(`Codex error: ${errorMsg.slice(0, 400)}`));
+      }
+
+      resolve({
+        text: textParts.join('\n\n').trim(),
+        sessionId: outThreadId,
+        // Subscription-billed; real $ is $0 per message. Expose tokens for /stats.
+        cost: 0,
+        turns: turns,
+        duration: Date.now() - startTime,
+        usage: { inputTokens, outputTokens, cachedInputTokens },
+        isError: !!errorMsg,
+      });
+    });
+
+    proc.on('error', (err) => {
+      clearTimeout(timer);
+      clearInterval(idleTimer);
+      reject(new Error(`Failed to spawn codex: ${err.message}`));
+    });
+  });
+}
+
+// Dispatcher — picks the backend runner, builds backend-specific context,
+// and threads through session state.
+async function runBackend(backend, prompt, options, sessionKey) {
+  if (backend === 'codex') {
+    let threadId = state.codexSessions[sessionKey] || null;
+    let rolloverNote = null;
+
+    // Auto-rollover: rotate to fresh thread if existing rollout is bloated.
+    // Prevents the silent chatgpt.com stall observed Apr 18 2026 on a 1.65MB rollout.
+    if (threadId) {
+      const check = shouldRolloverCodex(threadId);
+      if (check.rollover) {
+        log(`Codex thread ${threadId} rollover triggered: ${check.reason}`);
+        delete state.codexSessions[sessionKey];
+        saveState();
+        threadId = null;
+        rolloverNote = `[System note: Prior Codex thread was auto-rolled over to prevent stall (${check.reason}). If you need conversation history beyond this message, read today's daily log in memory/ and search QMD via search_memory.]`;
+      } else {
+        log(`Codex thread ${threadId} ok: size=${check.size}B entries=${check.entries}`);
+      }
+    }
+
+    const contextParts = [];
+
+    // Standing context: only injected on a FRESH Codex thread.
+    // Once the thread exists, `codex exec resume` preserves conversation history
+    // server-side, so we don't need to re-send 50k tokens every message.
+    if (!threadId) {
+      const profile = detectContextProfile(prompt);
+      const standing = buildCodexContext(profile);
+      if (standing) {
+        contextParts.push(standing);
+        log(`Fresh Codex thread: injecting ${profile} context (${standing.length} chars)`);
+      }
+    }
+
+    // Pending cross-backend transfer — one-shot on switch, goes in regardless of thread state
+    if (options.transferContext) contextParts.push(options.transferContext);
+
+    // One-shot rollover note appended after standing context so the agent sees it on the fresh thread
+    if (rolloverNote) contextParts.push(rolloverNote);
+
+    const finalPrompt = contextParts.length > 0
+      ? `${contextParts.join('\n\n')}\n\n# USER MESSAGE\n\n${prompt}`
+      : prompt;
+
+    return runCodex(finalPrompt, threadId, options);
+  }
+
+  // Claude path
+  const sessionId = state.sessions[sessionKey] || null;
+  return runClaude(prompt, sessionId, options);
 }
 
 // ============================================================
@@ -433,7 +1624,9 @@ async function processCronQueue() {
 // ============================================================
 
 const MODEL_ALIASES = {
-  'opus': 'opus',
+  'opus': 'claude-opus-4-7',
+  'opus4.7': 'claude-opus-4-7',
+  'opus-4.7': 'claude-opus-4-7',
   'opus4.6': 'opus',
   'opus-4.6': 'opus',
   'sonnet': 'sonnet',
@@ -447,16 +1640,36 @@ const MODEL_ALIASES = {
 };
 
 const MODEL_DISPLAY = {
+  'claude-opus-4-7': 'Opus 4.7',
   'opus': 'Opus 4.6',
   'sonnet': 'Sonnet 4.6',
   'claude-sonnet-4-5-20241022': 'Sonnet 4.5',
   'haiku': 'Haiku 4.5',
 };
+const EFFORT_LEVELS = ['low', 'medium', 'high', 'xhigh', 'max'];
+const CODEX_VERBOSITY_LEVELS = ['low', 'medium', 'high'];
+const CODEX_REASONING_EFFORT = {
+  low: 'low',
+  medium: 'medium',
+  high: 'high',
+  xhigh: 'xhigh',
+  max: 'xhigh',
+};
 
 function getSettings(chatId) {
   if (!chatSettings[chatId]) {
-    chatSettings[chatId] = { model: null, thinking: false, lastResult: null };
+    chatSettings[chatId] = { model: null, codexModel: null, effort: 'xhigh', codexVerbosity: null, thinking: false, lastResult: null };
   }
+  if (chatSettings[chatId].codexModel === undefined) {
+    chatSettings[chatId].codexModel = null;
+  }
+  if (!chatSettings[chatId].effort) {
+    chatSettings[chatId].effort = chatSettings[chatId].thinking ? 'max' : 'xhigh';
+  }
+  if (chatSettings[chatId].codexVerbosity === undefined) {
+    chatSettings[chatId].codexVerbosity = null;
+  }
+  chatSettings[chatId].thinking = chatSettings[chatId].effort === 'max';
   return chatSettings[chatId];
 }
 
@@ -487,8 +1700,8 @@ async function handleSlashCommand(chatId, text) {
     }
 
     case '/opus':
-      settings.model = 'opus';
-      return 'Switched to Opus 4.6';
+      settings.model = 'claude-opus-4-7';
+      return 'Switched to Opus 4.7';
 
     case '/sonnet':
       settings.model = 'sonnet';
@@ -498,54 +1711,252 @@ async function handleSlashCommand(chatId, text) {
       settings.model = 'haiku';
       return 'Switched to Haiku 4.5';
 
+    case '/codex': {
+      // Sub-commands: /codex, /codex help, /codex <model-alias>
+      const sub = arg.toLowerCase();
+      if (sub === 'help' || sub === 'models') {
+        const currentId = settings.codexModel || CODEX_DEFAULT_MODEL;
+        const lines = Object.entries(CODEX_MODELS).map(([alias, m]) => {
+          const mark = m.id === currentId ? ' ← current' : '';
+          return `  /${alias} — ${m.display}${mark}`;
+        });
+        return [
+          'Codex (GPT) models:',
+          '',
+          ...lines,
+          '',
+          `Send /codex to toggle backend. Current backend: ${getBackend(chatId).toUpperCase()}.`,
+        ].join('\n');
+      }
+      // `/codex --full` → switch to Codex and prebuild raw transcript replay.
+      if (sub === '--full') {
+        const previousBackend = getBackend(chatId);
+        const sessionKey = String(chatId);
+        let transferContext = null;
+        if (previousBackend === 'claude') {
+          transferContext = buildClaudeTranscriptReplay(state.sessions[sessionKey], 20);
+          if (transferContext) log(`Prebuilt claude→codex full replay for ${sessionKey}: ${transferContext.length} chars`);
+        }
+        setBackend(chatId, 'codex', transferContext ? { context: transferContext, mode: 'full' } : undefined);
+        const currentId = settings.codexModel || CODEX_DEFAULT_MODEL;
+        return `Backend switched to CODEX (${currentId}). Full transcript replay is ready for your next message.`;
+      }
+      if (sub) {
+        // Allow `/codex 5.4-mini` as shortcut to switch model
+        const alias = sub.replace(/^gpt-?/, '');
+        if (CODEX_MODELS[alias]) {
+          settings.codexModel = CODEX_MODELS[alias].id;
+          return `Codex model set to ${CODEX_MODELS[alias].display}.`;
+        }
+        return `Unknown Codex model "${arg}". Try /codex help.`;
+      }
+
+      // Bare `/codex` → generate the handoff summary now, then switch.
+      const previousBackend = getBackend(chatId);
+      const sessionKey = String(chatId);
+      let transferContext = null;
+      let transferMode = null;
+      if (previousBackend === 'claude') {
+        await tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+        transferContext = await buildClaudeHandoffSummary(state.sessions[sessionKey]);
+        transferMode = 'handoff';
+        if (transferContext) {
+          log(`Prebuilt claude→codex handoff for ${sessionKey}: ${transferContext.length} chars`);
+        } else {
+          transferContext = buildClaudeTranscriptReplay(state.sessions[sessionKey], 20);
+          transferMode = 'replay-fallback';
+          if (transferContext) log(`Prebuilt claude→codex replay fallback for ${sessionKey}: ${transferContext.length} chars`);
+        }
+      }
+      setBackend(chatId, 'codex', transferContext ? { context: transferContext, mode: transferMode } : undefined);
+      const currentId = settings.codexModel || CODEX_DEFAULT_MODEL;
+      return transferContext
+        ? `Backend switched to CODEX (${currentId}). Handoff is ready.`
+        : `Backend switched to CODEX (${currentId}). No Claude handoff context was available.`;
+    }
+
+    case '/claude': {
+      const sub = arg.toLowerCase();
+      const previousBackend = getBackend(chatId);
+      const sessionKey = String(chatId);
+      let transferContext = null;
+      let transferMode = null;
+
+      if (sub && sub !== '--full') {
+        return `Unknown Claude option "${arg}". Use /claude or /claude --full.`;
+      }
+
+      if (previousBackend === 'codex') {
+        await tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
+        if (sub === '--full') {
+          transferContext = buildCodexTranscriptReplay(state.codexSessions[sessionKey], 20);
+          transferMode = 'full';
+          if (transferContext) log(`Prebuilt codex→claude full replay for ${sessionKey}: ${transferContext.length} chars`);
+        } else {
+          transferContext = await buildCodexHandoffSummary(state.codexSessions[sessionKey]);
+          transferMode = 'handoff';
+          if (transferContext) {
+            log(`Prebuilt codex→claude handoff for ${sessionKey}: ${transferContext.length} chars`);
+          } else {
+            transferContext = buildCodexTranscriptReplay(state.codexSessions[sessionKey], 20);
+            transferMode = 'replay-fallback';
+            if (transferContext) log(`Prebuilt codex→claude replay fallback for ${sessionKey}: ${transferContext.length} chars`);
+          }
+        }
+      }
+
+      setBackend(chatId, 'claude', transferContext ? { context: transferContext, mode: transferMode } : undefined);
+      return transferContext
+        ? 'Backend switched to CLAUDE. Handoff is ready.'
+        : 'Backend switched to CLAUDE. Resuming your prior Claude session if one exists.';
+    }
+
+    // Codex model shortcuts (mirror Claude's /opus /sonnet /haiku pattern)
+    case '/5.4':
+    case '/5.4-mini':
+    case '/5.3-codex':
+    case '/5.2':
+    case '/5.2-codex':
+    case '/5.1-codex-max':
+    case '/5.1-codex-mini': {
+      const alias = cmd.slice(1);
+      const m = CODEX_MODELS[alias];
+      if (!m) return `Unknown Codex model "${cmd}".`;
+      settings.codexModel = m.id;
+      return `Codex model set to ${m.display}. ${getBackend(chatId) === 'codex' ? '' : '(Run /codex to activate Codex backend.)'}`.trim();
+    }
+
+    case '/effort': {
+      const level = arg.toLowerCase();
+      if (!level) {
+        return `Current effort: ${settings.effort}\nUsage: /effort <${EFFORT_LEVELS.join('|')}>`;
+      }
+      if (!EFFORT_LEVELS.includes(level)) {
+        return `Unknown effort "${arg}". Use one of: ${EFFORT_LEVELS.join(', ')}`;
+      }
+      settings.effort = level;
+      settings.thinking = level === 'max';
+      saveState();
+      const codexEffort = CODEX_REASONING_EFFORT[level] || level;
+      return `Effort set to ${level}. Claude uses \`--effort=${level}\`; Codex uses \`model_reasoning_effort=${codexEffort}\`.`;
+    }
+
     case '/think':
     case '/thinking': {
-      if (arg === 'off') {
+      const level = arg.toLowerCase();
+      if (level === 'off') {
+        settings.effort = 'xhigh';
         settings.thinking = false;
-        return 'Extended thinking: OFF';
+        saveState();
+        return 'Extended thinking: OFF (effort xhigh)';
       }
-      settings.thinking = !settings.thinking;
-      return `Extended thinking: ${settings.thinking ? 'ON' : 'OFF'}`;
+      if (level === 'on' || !level) {
+        const next = settings.effort === 'max' && !level ? 'xhigh' : 'max';
+        settings.effort = next;
+        settings.thinking = next === 'max';
+        saveState();
+        return `Extended thinking: ${settings.thinking ? 'ON' : 'OFF'} (effort ${settings.effort})`;
+      }
+      if (EFFORT_LEVELS.includes(level)) {
+        settings.effort = level;
+        settings.thinking = level === 'max';
+        saveState();
+        return `Effort set to ${level}.`;
+      }
+      return `Usage: /think [on|off|${EFFORT_LEVELS.join('|')}]`;
+    }
+
+    case '/verbosity': {
+      const level = arg.toLowerCase();
+      if (!level) {
+        return `Current Codex verbosity: ${settings.codexVerbosity || 'default'}\nUsage: /verbosity <default|${CODEX_VERBOSITY_LEVELS.join('|')}>`;
+      }
+      if (level === 'default' || level === 'off') {
+        settings.codexVerbosity = null;
+        saveState();
+        return 'Codex verbosity reset to default.';
+      }
+      if (!CODEX_VERBOSITY_LEVELS.includes(level)) {
+        return `Unknown verbosity "${arg}". Use one of: default, ${CODEX_VERBOSITY_LEVELS.join(', ')}`;
+      }
+      settings.codexVerbosity = level;
+      saveState();
+      return `Codex verbosity set to ${level} via \`model_verbosity=${level}\`.`;
     }
 
     case '/reset':
     case '/new':
-      delete state.sessions[sessionKey];
+    case '/fresh': {
+      const backend = getBackend(chatId);
+      if (backend === 'codex') {
+        delete state.codexSessions[sessionKey];
+      } else {
+        delete state.sessions[sessionKey];
+      }
       delete state.exchangeCount[sessionKey];
       saveState();
-      return 'Session cleared. Next message starts a fresh conversation.';
+      return `${backend.toUpperCase()} session cleared. Next message starts fresh.`;
+    }
 
     case '/stats': {
       const last = settings.lastResult;
       if (!last) return 'No stats yet. Send a message first.';
-      return [
+      const lines = [
         `Last response stats:`,
+        `  Backend: ${(last.backend || 'claude').toUpperCase()}`,
         `  Model: ${MODEL_DISPLAY[last.model] || last.model}`,
         `  Duration: ${(last.duration / 1000).toFixed(1)}s`,
         `  Turns: ${last.turns}`,
-        `  Cost: $${last.cost}`,
-        `  Session: ${last.sessionId || 'none'}`,
-      ].join('\n');
+      ];
+      if (last.backend === 'codex' && last.usage) {
+        const inTok = last.usage.inputTokens || 0;
+        const cached = last.usage.cachedInputTokens || 0;
+        const outTok = last.usage.outputTokens || 0;
+        const uncached = Math.max(0, inTok - cached);
+        const cachedPct = inTok > 0 ? ((cached / inTok) * 100).toFixed(0) : '0';
+        lines.push(`  Tokens: in ${inTok} / out ${outTok}`);
+        lines.push(`  Cache: ${cached} cached (${cachedPct}%) / ${uncached} uncached`);
+        if (last.turns > 1) {
+          lines.push(`  ⚠️ Cumulative — Codex reports total thread tokens, not per-turn`);
+        }
+      } else {
+        lines.push(`  Cost: $${last.cost}`);
+      }
+      lines.push(`  Session: ${last.sessionId || 'none'}`);
+      return lines.join('\n');
     }
 
     case '/session': {
-      const sid = state.sessions[sessionKey];
+      const backend = getBackend(chatId);
+      const sid = backend === 'codex' ? state.codexSessions[sessionKey] : state.sessions[sessionKey];
       return sid
-        ? `Session ID: ${sid}\nUse /reset to start fresh.`
-        : 'No active session. Next message will start one.';
+        ? `${backend.toUpperCase()} session: ${sid}\nUse /reset to start fresh.`
+        : `No active ${backend.toUpperCase()} session. Next message will start one.`;
     }
 
     case '/status': {
       const bridgePid = fs.existsSync(PID_PATH) ? fs.readFileSync(PID_PATH, 'utf8').trim() : '?';
       const cronCount = cronJobs.length;
-      const current = settings.model || DEFAULT_MODEL;
-      const thinking = settings.thinking ? 'ON' : 'OFF';
-      const sid = state.sessions[sessionKey] ? 'Active' : 'None';
+      const backend = getBackend(chatId);
+      const currentModel = backend === 'codex'
+        ? (settings.codexModel || CODEX_DEFAULT_MODEL)
+        : (settings.model || DEFAULT_MODEL);
+      const modelDisplay = backend === 'codex'
+        ? currentModel
+        : (MODEL_DISPLAY[currentModel] || currentModel);
+      const thinking = settings.effort === 'max' ? 'ON' : 'OFF';
+      const verbosity = settings.codexVerbosity || 'default';
+      const sid = backend === 'codex'
+        ? (state.codexSessions[sessionKey] ? 'Active' : 'None')
+        : (state.sessions[sessionKey] ? 'Active' : 'None');
       return [
         'NativeClaw Status:',
         `  Bridge PID: ${bridgePid}`,
-        `  Model: ${MODEL_DISPLAY[current] || current}`,
+        `  Backend: ${backend.toUpperCase()}`,
+        `  Model: ${modelDisplay}`,
+        `  Effort: ${settings.effort}`,
         `  Thinking: ${thinking}`,
+        `  Codex verbosity: ${verbosity}`,
         `  Session: ${sid}`,
         `  Cron jobs: ${cronCount}`,
         `  MCP config: ${MCP_CONFIG ? 'loaded' : 'none'}`,
@@ -563,15 +1974,35 @@ async function handleSlashCommand(chatId, text) {
       return [
         'NativeClaw Commands:',
         '',
-        '/model [name] — Show or switch model',
-        '/opus — Switch to Opus 4.6',
-        '/sonnet — Switch to Sonnet 4.6',
-        '/model sonnet-4.5 — Switch to Sonnet 4.5',
-        '/haiku — Switch to Haiku 4.5',
-        '/think — Toggle extended thinking',
-        '/reset — Clear session, start fresh',
-        '/stats — Last response stats',
+        '— Backend —',
+        '/claude — Use Claude backend (default)',
+        '/claude --full — Use Claude with raw Codex replay',
+        '/codex — Use Codex (GPT) backend',
+        '/codex --full — Use Codex with raw Claude replay',
+        '/codex help — List GPT models',
+        '',
+        '— Claude models —',
+        '/opus — Opus 4.7',
+        '/opus4.6 — Opus 4.6 (legacy)',
+        '/sonnet — Sonnet 4.6',
+        '/haiku — Haiku 4.5',
+        '/model <name> — Any Claude model',
+        '',
+        '— Codex models —',
+        '/5.4 — GPT-5.4 (default)',
+        '/5.4-mini — GPT-5.4 Mini',
+        '/5.3-codex, /5.2, /5.2-codex, /5.1-codex-max, /5.1-codex-mini',
+        '',
+        '— Session —',
+        '/reset — Clear current backend\'s session',
+        '/fresh — Alias for /reset; clear current backend session',
         '/session — Show session info',
+        '/stats — Last response stats (cached %, cumulative warning)',
+        '/effort <low|medium|high|xhigh|max> — Set Claude/Codex thinking effort',
+        '/think — Alias/toggle for /effort max',
+        '/verbosity <default|low|medium|high> — Set Codex answer verbosity',
+        '',
+        '— System —',
         '/status — System status',
         '/stop — Kill current task and clear queue',
         '/restart — Restart the NativeClaw service',
@@ -612,8 +2043,7 @@ async function handleTelegramMessage(item) {
     tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
   }, 4000);
 
-  // Get existing session for this chat
-  let sessionId = state.sessions[sessionKey] || null;
+  const backend = getBackend(chatId);
 
   // Increment exchange counter for this session
   if (!state.exchangeCount[sessionKey]) state.exchangeCount[sessionKey] = 0;
@@ -626,7 +2056,6 @@ async function handleTelegramMessage(item) {
   }
 
   // Checkpoint enforcement: inject reminder after N exchanges without a checkpoint
-  // Fires at 8, 16, 24, etc. — not every message after 8
   if (state.exchangeCount[sessionKey] >= CHECKPOINT_THRESHOLD && state.exchangeCount[sessionKey] % CHECKPOINT_THRESHOLD === 0) {
     const today = new Date().toISOString().slice(0, 10);
     const dailyLog = path.join(MEMORY_DIR, `${today}.md`);
@@ -635,72 +2064,154 @@ async function handleTelegramMessage(item) {
       if (fs.existsSync(dailyLog)) {
         const logStat = fs.statSync(dailyLog);
         const minutesSinceWrite = (Date.now() - logStat.mtimeMs) / (1000 * 60);
-        if (minutesSinceWrite < 5) needsCheckpoint = false; // Recently written
+        if (minutesSinceWrite < 5) needsCheckpoint = false;
       }
     } catch {}
     if (needsCheckpoint) {
-      prompt = `[SYSTEM REMINDER: You have exchanged ${state.exchangeCount[sessionKey]} messages without writing a checkpoint. Write to memory/${today}.md NOW using the Edit or Write tool (NOT bash cat/echo — those may be blocked). Include: what you did, decisions made, open questions, next actions, feedback logged. Then reindex memory if available.]\n\n${prompt}`;
+      prompt = `${prompt}\n\n[CHECKPOINT NOW — ${state.exchangeCount[sessionKey]} messages since last write]`;
       log(`Checkpoint reminder injected after ${state.exchangeCount[sessionKey]} exchanges`);
     } else {
-      // Write succeeded recently — reset counter
       state.exchangeCount[sessionKey] = 0;
     }
     saveState();
   }
 
-  // Determine model (per-chat override or default)
-  const model = settings.model || DEFAULT_MODEL;
+  // Consume any pending cross-backend transfer (set by setBackend when user ran /codex or /claude)
+  const pending = state.pendingTransfer[sessionKey];
+  let transferContext = null;
+  if (pending && pending.to === backend) {
+    if (pending.context) {
+      transferContext = pending.context;
+      log(`Transfer ${pending.from}→${pending.to} (${pending.mode || 'prebuilt'}) for ${sessionKey}: ${transferContext.length} chars`);
+    } else if (pending.from === 'claude' && backend === 'codex') {
+      const claudeSid = state.sessions[sessionKey];
+      if (settings.transferMode === 'full') {
+        // /codex --full: raw transcript replay
+        transferContext = buildClaudeTranscriptReplay(claudeSid, 20);
+        delete settings.transferMode;
+        if (transferContext) log(`Transfer claude→codex (full) for ${sessionKey}: ${transferContext.length} chars`);
+      } else {
+        // Default: meta-prompt handoff summary via Sonnet
+        transferContext = await buildClaudeHandoffSummary(claudeSid);
+        if (transferContext) {
+          log(`Transfer claude→codex (handoff) for ${sessionKey}: ${transferContext.length} chars`);
+        } else {
+          // Fallback to raw replay if summary fails
+          transferContext = buildClaudeTranscriptReplay(claudeSid, 20);
+          if (transferContext) log(`Transfer claude→codex (replay fallback) for ${sessionKey}: ${transferContext.length} chars`);
+        }
+      }
+    } else if (pending.from === 'codex' && backend === 'claude') {
+      const codexTid = state.codexSessions[sessionKey];
+      transferContext = await buildCodexHandoffSummary(codexTid);
+      if (transferContext) {
+        log(`Transfer codex→claude (handoff) for ${sessionKey}: ${transferContext.length} chars`);
+      } else {
+        transferContext = buildCodexTranscriptReplay(codexTid, 20);
+        if (transferContext) log(`Transfer codex→claude (replay fallback) for ${sessionKey}: ${transferContext.length} chars`);
+      }
+    }
+    delete state.pendingTransfer[sessionKey];
+    saveState();
+  }
+
+  // Backend-specific options
+  const claudeModel = settings.model || DEFAULT_MODEL;
+  const codexModel = settings.codexModel || CODEX_DEFAULT_MODEL;
+  const effort = settings.effort || 'xhigh';
+  const codexVerbosity = settings.codexVerbosity || null;
+
+  // Claude: inject primer on fresh sessions AND/OR transfer context on codex→claude switch
+  let appendSystemPrompt = null;
+  if (backend === 'claude') {
+    const parts = [];
+    if (!state.sessions[sessionKey]) {
+      const primer = buildSessionPrimer();
+      if (primer) {
+        parts.push(primer);
+        log(`Fresh Claude session for ${sessionKey}: injecting primer (${primer.length} chars)`);
+      }
+    }
+    if (transferContext) parts.push(transferContext);
+    if (parts.length > 0) appendSystemPrompt = parts.join('\n\n');
+    // For Claude backend, transferContext is consumed via appendSystemPrompt only,
+    // not via runBackend's options.transferContext (which is codex-path only).
+    transferContext = null;
+  }
 
   try {
-    const result = await runClaude(prompt, sessionId, {
-      timeout: 14400,
-      model: model,
-      thinking: settings.thinking,
-    });
+    const result = await runBackend(backend, prompt, {
+      timeout: 7200,
+      model: claudeModel,
+      codexModel: codexModel,
+      effort: effort,
+      codexVerbosity: codexVerbosity,
+      appendSystemPrompt: appendSystemPrompt,
+      transferContext: transferContext,
+    }, sessionKey);
 
     clearInterval(typingInterval);
 
     // Save stats for /stats command
     settings.lastResult = {
-      model: model,
+      backend: backend,
+      model: backend === 'codex' ? codexModel : claudeModel,
       duration: result.duration || 0,
       turns: result.turns,
       cost: result.cost,
+      usage: result.usage,
       sessionId: result.sessionId,
     };
 
-    // Save session ID for continuity
+    // Persist session ID on the correct backend's slot
     if (result.sessionId) {
-      state.sessions[sessionKey] = result.sessionId;
+      if (backend === 'codex') {
+        state.codexSessions[sessionKey] = result.sessionId;
+      } else {
+        state.sessions[sessionKey] = result.sessionId;
+      }
       saveState();
     }
 
-    // Send response
     if (result.text) {
-      await sendMessage(chatId, result.text);
-      log(`Replied to ${name}: ${result.text.length} chars, ${result.turns} turns, $${result.cost}`);
+      const sendResult = await sendMessage(chatId, result.text);
+      const costStr = backend === 'codex'
+        ? `tokens in=${result.usage?.inputTokens || 0}/out=${result.usage?.outputTokens || 0}`
+        : `$${result.cost}`;
+      if (sendResult.failed > 0) {
+        log(`PARTIAL REPLY to ${name} [${backend}]: ${sendResult.sent}/${sendResult.total} chunks sent, ${sendResult.failed} FAILED. ${result.text.length} chars, ${result.turns} turns, ${costStr}`);
+      } else {
+        log(`Replied to ${name} [${backend}]: ${result.text.length} chars, ${result.turns} turns, ${costStr}`);
+      }
     } else {
       await sendMessage(chatId, '(No response generated)');
-      log(`Empty response for ${name}`);
+      log(`Empty response for ${name} [${backend}]`);
     }
 
-    // Clean up temp image file
     if (_imagePath) {
       try { fs.unlinkSync(_imagePath); } catch {}
     }
   } catch (err) {
     clearInterval(typingInterval);
-    log(`ERROR responding to ${name}: ${err.message}`);
-    await sendMessage(chatId, `Something went wrong: ${err.message.slice(0, 200)}`);
+    log(`ERROR responding to ${name} [${backend}]: ${err.message}`);
+    const errMsg = err.message.toLowerCase();
+    const isRateLimit = errMsg.includes('rate limit') || errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('overloaded');
+    const rateLimitHint = (isRateLimit && backend === 'claude')
+      ? '\n\nClaude is rate-limited. Run /codex to switch to the Codex backend.'
+      : '';
+    await sendMessage(chatId, `Something went wrong: ${err.message.slice(0, 200)}${rateLimitHint}`);
 
-    // If session is broken, clear it so next message starts fresh
-    if (err.message.includes('session') || err.message.includes('resume')) {
-      delete state.sessions[sessionKey];
+    // If session/thread is broken, clear the active backend's session so next message starts fresh
+    if (err.message.includes('session') || err.message.includes('resume') || err.message.includes('thread')) {
+      if (backend === 'codex') {
+        delete state.codexSessions[sessionKey];
+      } else {
+        delete state.sessions[sessionKey];
+      }
       saveState();
-      log(`Cleared broken session for ${sessionKey}`);
+      log(`Cleared broken ${backend} session for ${sessionKey}`);
     }
 
-    // Clean up temp image file on error too
     if (_imagePath) {
       try { fs.unlinkSync(_imagePath); } catch {}
     }
@@ -711,38 +2222,134 @@ async function handleTelegramMessage(item) {
 // CRON HANDLER
 // ============================================================
 
+function runCronCommand(command, options = {}) {
+  return new Promise((resolve, reject) => {
+    if (!command || typeof command !== 'string') {
+      return reject(new Error('cron command is missing'));
+    }
+
+    log(`Spawning cron command: ${command}`);
+
+    const cleanEnv = { ...process.env };
+    delete cleanEnv.CLAUDECODE;
+    delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
+    delete cleanEnv.MCP_CLAUDE;
+
+    const proc = spawn('/bin/bash', ['-lc', command], {
+      cwd: WORKSPACE,
+      env: cleanEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    activeSubprocess = proc;
+    const startTime = Date.now();
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (d) => { stdout += d.toString(); });
+    proc.stderr.on('data', (d) => { stderr += d.toString(); });
+
+    const timeoutMs = (options.timeout || 300) * 1000;
+    const timer = setTimeout(() => {
+      log(`Cron command timed out after ${timeoutMs}ms, killing...`);
+      proc.kill('SIGTERM');
+      setTimeout(() => proc.kill('SIGKILL'), 5000);
+    }, timeoutMs);
+
+    proc.on('close', (code) => {
+      activeSubprocess = null;
+      clearTimeout(timer);
+
+      const text = [stdout.trim(), stderr.trim()].filter(Boolean).join('\n');
+      if (code !== 0) {
+        return reject(new Error(text || `command exited with code ${code}`));
+      }
+
+      resolve({
+        text,
+        sessionId: null,
+        cost: 0,
+        turns: 0,
+        duration: Date.now() - startTime,
+        isError: false,
+      });
+    });
+
+    proc.on('error', (err) => {
+      activeSubprocess = null;
+      clearTimeout(timer);
+      reject(new Error(`Failed to spawn cron command: ${err.message}`));
+    });
+  });
+}
+
 async function handleCronJob(item) {
-  const { name, prompt, timeout, model } = item;
+  const { name, prompt, timeout, model, command } = item;
 
   log(`Cron firing: ${name}`);
   const startTime = Date.now();
 
+  // Crons don't belong to a chat, so we tie them to the primary chat's backend.
+  // If the user toggled /codex in their Telegram chat, crons run on Codex too.
+  const primaryChat = ALLOWED_CHAT_IDS[0];
+  const cronBackend = primaryChat ? getBackend(primaryChat) : 'claude';
+
   try {
-    const result = await runClaude(prompt, null, {
-      timeout: timeout || 300,
-      model: model || DEFAULT_MODEL,
-      maxTurns: 100,
-      isCron: true,
-    });
+    let result;
+    if (command) {
+      result = await runCronCommand(command, { timeout: timeout || 300 });
+    } else if (!prompt) {
+      throw new Error(`Cron "${name}" has neither prompt nor command`);
+    } else if (cronBackend === 'codex') {
+      // Codex cron jobs start fresh; keep the injected context lean and let
+      // the prompt/tooling read specific memory files only when needed.
+      const finalPrompt = `${buildCodexCronContext()}\n\n# CRON TASK\n\n${prompt}`;
+      // Crons always run fresh — no resume, pass null threadId.
+      const codexChatSettings = primaryChat ? getSettings(primaryChat) : {};
+      result = await runCodex(finalPrompt, null, {
+        timeout: timeout || 300,
+        codexModel: codexChatSettings.codexModel || CODEX_DEFAULT_MODEL,
+        effort: codexChatSettings.effort || 'xhigh',
+        codexVerbosity: codexChatSettings.codexVerbosity || null,
+      });
+    } else {
+      result = await runClaude(prompt, null, {
+        timeout: timeout || 300,
+        model: model || DEFAULT_MODEL,
+        effort: 'xhigh',
+        maxTurns: 100,
+        isCron: true,
+      });
+    }
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-    log(`Cron ${name} completed: ${duration}s, ${result.turns} turns, $${result.cost}`);
+    const costStr = command
+      ? 'command'
+      : cronBackend === 'codex'
+      ? `tokens in=${result.usage?.inputTokens || 0}/out=${result.usage?.outputTokens || 0}`
+      : `$${result.cost}`;
+    log(`Cron ${name} [${command ? 'command' : cronBackend}] completed: ${duration}s, ${result.turns} turns, ${costStr}`);
 
-    // After session-audit completes, mechanically clear the session
-    // Don't rely on the LLM to do this — it's unreliable
+    // After session-audit completes, mechanically clear the active backend's session.
+    // Don't rely on the LLM to do this — it's too unreliable.
     if (name === 'session-audit') {
       for (const key of Object.keys(state.sessions)) {
         if (state.sessions[key]) {
-          log(`Session-audit: clearing session ${state.sessions[key]} for chat ${key}`);
+          log(`Session-audit: clearing Claude session ${state.sessions[key]} for chat ${key}`);
           state.sessions[key] = '';
           state.exchangeCount[key] = 0;
+        }
+      }
+      for (const key of Object.keys(state.codexSessions)) {
+        if (state.codexSessions[key]) {
+          log(`Session-audit: clearing Codex thread ${state.codexSessions[key]} for chat ${key}`);
+          state.codexSessions[key] = '';
         }
       }
       saveState();
     }
 
     // Cron prompts handle their own Telegram delivery via telegram_direct.sh
-    // So we don't need to send the output here
   } catch (err) {
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
     log(`Cron ${name} FAILED after ${duration}s: ${err.message}`);
@@ -826,14 +2433,16 @@ function checkCrons() {
   for (const job of cronJobs) {
     if (!shouldFireCron(job.schedule, now)) continue;
 
-    const fireKey = `${job.name}:${minuteKey}`;
+    const jobName = job.name || job.id;
+    const fireKey = `${jobName}:${minuteKey}`;
     if (lastFired[fireKey]) continue;
     lastFired[fireKey] = true;
 
-    log(`Cron matched: ${job.name} (${job.schedule})`);
+    log(`Cron matched: ${jobName} (${job.schedule})`);
     enqueueCron({
-      name: job.name,
+      name: jobName,
       prompt: job.prompt,
+      command: job.command,
       timeout: job.timeout || 300,
       model: job.model,
     });
@@ -895,21 +2504,13 @@ async function pollTelegram() {
         continue;
       }
 
-      // Handle /restart — send confirmation then restart the service
+      // Handle /restart — send confirmation then exit with code 1 so launchd restarts us
       if (msg.text && msg.text.trim().toLowerCase() === '/restart') {
-        const restartCmd = config.restartCommand;
-        if (!restartCmd) {
-          await sendMessage(chatId, 'No restartCommand configured in config.json.');
-          continue;
-        }
         log('/restart received — restarting service...');
         await sendMessage(chatId, "Restarting... I'll be back in a few seconds.");
-        setTimeout(() => {
-          require('child_process').exec(restartCmd.replace(/~/g, process.env.HOME || process.env.USERPROFILE), (err) => {
-            if (err) log(`Restart error: ${err.message}`);
-          });
-        }, 500);
-        continue;
+        state.pendingRestartConfirm = { chatId, ts: Date.now() };
+        saveState();
+        process.exit(1);
       }
 
       // Handle text messages
@@ -1071,7 +2672,14 @@ async function pollTelegram() {
 
 function saveState() {
   try {
-    fs.writeFileSync(STATE_PATH, JSON.stringify(state, null, 2));
+    // Persist chatSettings alongside state (strip ephemeral lastResult)
+    const persistSettings = {};
+    for (const [cid, s] of Object.entries(chatSettings)) {
+      const { lastResult, ...rest } = s;
+      if (Object.keys(rest).length > 0) persistSettings[cid] = rest;
+    }
+    const toSave = { ...state, chatSettings: persistSettings };
+    fs.writeFileSync(STATE_PATH, JSON.stringify(toSave, null, 2));
   } catch (err) {
     log(`WARNING: Failed to save state: ${err.message}`);
   }
@@ -1112,6 +2720,23 @@ async function main() {
     process.exit(1);
   }
 
+  // Post-restart confirmation — let the user know the bridge is back up
+  if (state.pendingRestartConfirm && state.pendingRestartConfirm.chatId) {
+    const { chatId: rChatId, ts } = state.pendingRestartConfirm;
+    const downSec = ts ? Math.round((Date.now() - ts) / 1000) : null;
+    const msg = downSec !== null
+      ? `Back up. Down ${downSec}s.`
+      : 'Back up.';
+    try {
+      await sendMessage(rChatId, msg);
+      log(`Sent post-restart confirmation to ${rChatId} (down ${downSec}s)`);
+    } catch (err) {
+      log(`Failed to send post-restart confirmation: ${err.message}`);
+    }
+    delete state.pendingRestartConfirm;
+    saveState();
+  }
+
   // Load cron schedule
   loadCronSchedule();
 
@@ -1136,7 +2761,8 @@ function shutdown(signal) {
   saveState();
   // Clean up PID file
   try { fs.unlinkSync(PID_PATH); } catch {}
-  process.exit(0);
+  // Exit with code 1 so launchd KeepAlive restarts us
+  process.exit(1);
 }
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));

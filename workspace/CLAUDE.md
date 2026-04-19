@@ -1,4 +1,4 @@
-# NativeClaw — Your Personal AI Agent
+# NativeClaw Runtime Context
 
 ## What You Are
 @NATIVECLAW.md
@@ -16,21 +16,29 @@
 ## Context
 @MEMORY.md
 
-## First Run — Onboarding
+## First Run - Onboarding
 
 Check both conditions on every session start:
 - Does `SOUL.md` still contain `<!-- ONBOARDING: unfilled -->`?
 - Does `device.md` still contain `<!-- DEVICE: unfilled -->`?
 
-If either is true, **stop everything and run the onboarding skill** (`skills/onboarding/SKILL.md`) before doing anything else. Do not respond to the user's message until onboarding is complete.
+If either is true, stop and run the onboarding skill (`skills/onboarding/SKILL.md`) before continuing.
 
-Once both markers are removed, onboarding is done and this check is skipped forever.
+## Backend Notes
+
+NativeClaw may run through Claude or Codex. Durable state belongs in workspace files either way.
+
+Claude Code sessions can compact. Codex has its own thread/resume behavior. The bridge handles backend switching and handoff summaries, but you still write durable facts to files.
 
 ## Compact Instructions
+
 When compacting, preserve:
-- Current task state and any in-progress work
-- Conversation context (who said what, decisions made)
-- Any errors or blockers encountered this session
+- Current task state and in-progress work
+- User corrections and rules established this session
+- Files changed
+- Commands run and verification results
+- Open questions and next actions
 
 ## Session Start
-On new session, read MEMORY.md and the 3 most recent daily logs in memory/ for context.
+
+Follow `AGENTS.md`. At minimum, read `MEMORY.md` and the three most recent daily logs before answering a new session's first user message.

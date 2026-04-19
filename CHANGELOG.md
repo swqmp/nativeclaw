@@ -1,5 +1,25 @@
 # NativeClaw Changelog
 
+## v1.9.4 — Claude/Codex Backend Bridge
+
+### Bridge (bridge.js)
+- **Codex backend support:** `/codex` switches from Claude to Codex, `/claude` switches back. Backend switches clear stale target sessions and carry continuity through curated handoff summaries.
+- **Symmetric handoffs:** `/codex` and `/claude` precompute handoff summaries during the slash command. `/codex --full` and `/claude --full` keep raw transcript replay as escape hatches.
+- **Sonnet handoff summaries:** Handoffs use Sonnet and include a deterministic latest-exchange block so short answers, IDs, tokens, command output, and test phrases survive backend switches.
+- **Codex model shortcuts:** `/5.4`, `/5.4-mini`, `/5.3-codex`, `/5.2`, `/5.2-codex`, `/5.1-codex-max`, and `/5.1-codex-mini`.
+- **Unified effort control:** `/effort <low|medium|high|xhigh|max>` maps to Claude `--effort`; Codex receives `model_reasoning_effort`, with Telegram `max` mapped to Codex `xhigh`.
+- **Codex verbosity control:** `/verbosity <default|low|medium|high>` maps to Codex `model_verbosity`.
+- **Opus 4.7 default alias:** `/opus` now maps to Opus 4.7. `/opus4.6` and `/opus-4.6` remain as legacy escape hatches.
+- **Bridge-level crons:** Crons route to the active backend. Session audit clears both Claude and Codex sessions when it completes.
+- **Response truncation fix:** The bridge reads Claude session JSONL to concatenate all assistant text blocks from the final turn, preventing dropped text after tool calls.
+
+### Tooling
+- Added `bridge/eval-slash-commands.js` to catch command-surface regressions without hitting external APIs.
+- Setup now installs the eval harness and can store an optional OpenAI API key for voice transcription.
+
+### Templates & Docs
+- Updated runtime docs for Claude/Codex architecture, backend switching, effort/verbosity controls, Codex context profiles, and current Telegram commands.
+
 ## v1.6.1 — Session Rot Fix & Polish
 
 ### Bridge (bridge.js)

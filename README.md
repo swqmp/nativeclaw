@@ -1,33 +1,50 @@
 # NativeClaw
 
-A personal AI agent powered by Claude Code, running as a persistent background service on macOS, Linux, or Windows, accessible through Telegram.
+NativeClaw is a personal AI agent that runs as a managed background service on macOS, Linux, or Windows and talks to you through Telegram.
 
-NativeClaw gives you a 24/7 AI assistant that:
-- Responds to your Telegram messages using Claude Code
-- Runs scheduled tasks (morning briefs, end-of-day summaries, heartbeat checks)
-- Maintains persistent memory across conversations
-- Manages itself via macOS launchd, Linux systemd, or Windows Task Scheduler (auto-restarts, survives reboots)
-- Supports image analysis, voice messages, file attachments, model switching, extended thinking
+It started as a Claude Code bridge. Current NativeClaw can run either Claude or Codex as the active backend, keep persistent workspace memory, run scheduled jobs, handle common media inputs, and survive service restarts.
 
-## What's New in v1.6.0
+## What It Does
 
-- **Lightweight cron context** — Crons load ~80 lines instead of your full system prompt. Faster, cheaper, no identity confusion.
-- **Checkpoint enforcement** — Bridge automatically reminds the agent to write memory after 8 exchanges. No more memory loss from long sessions.
-- **Identity prefix pattern** — Cron prompts include agent identity, preventing "I'm a Claude Code UI" confusion.
-- **Persistent browser** — Shared Chromium via CDP so logins survive across messages.
-- **Eval framework** — Weekly self-evaluation with scored metrics.
-- **Hooks documentation** — Memory-check and feedback-detection hooks with file-based trigger lists.
+- Responds to Telegram messages through Claude Code or Codex CLI
+- Switches backends with `/claude` and `/codex`
+- Preserves backend-switch continuity with handoff summaries
+- Runs bridge-level scheduled jobs such as briefs, audits, queue recovery, and heartbeats
+- Keeps durable memory in workspace files instead of relying on chat history
+- Supports images, voice notes, audio files, and document attachments
+- Uses launchd, systemd, or Windows Task Scheduler so the bridge survives reboot/crash cycles
 
-See [CHANGELOG.md](CHANGELOG.md) for full details.
+## What's Current
+
+Current bridge version: `v1.9.4`.
+
+Highlights:
+- `/codex` and `/claude` backend switching
+- `/codex --full` and `/claude --full` raw replay escape hatches
+- `/effort <low|medium|high|xhigh|max>` for Claude/Codex reasoning depth
+- `/verbosity <default|low|medium|high>` for Codex response verbosity
+- `/opus` maps to Opus 4.7, with `/opus4.6` kept as a legacy alias
+- Session-audit cron clears both Claude and Codex sessions
+- Slash-command eval harness: `node ~/.claude/telegram-bridge/eval-slash-commands.js`
+
+See [CHANGELOG.md](CHANGELOG.md) for the detailed history.
 
 ## Requirements
 
-- **macOS, Linux, or Windows** (uses launchd on macOS, systemd on Linux, Task Scheduler on Windows)
-  - Windows requires [Git Bash / MSYS2](https://gitforwindows.org/) to run `setup.sh`
-- **Claude Max subscription** (provides Claude Code CLI access)
-- **Node.js** (v18+)
-- **Telegram account** + a bot from [@BotFather](https://t.me/BotFather)
-- **Whisper** (optional, for voice message transcription) — `pip install openai-whisper`
+- macOS, Linux, or Windows
+- Node.js 18+
+- Telegram account and bot token from [@BotFather](https://t.me/BotFather)
+- Claude Code CLI (`claude`) with an active Claude subscription
+- Codex CLI (`codex`) if you want the Codex backend
+- OpenAI API key if you want voice/audio transcription through Whisper API
+
+Windows users should run `setup.sh` in Git Bash or MSYS2, not Command Prompt or PowerShell.
+
+Before running PowerShell scripts on Windows, open PowerShell as Administrator and run:
+
+```powershell
+Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
+```
 
 ## Quick Start
 
@@ -37,172 +54,146 @@ cd nativeclaw
 bash setup.sh
 ```
 
-> **Windows users:** Run this in Git Bash or MSYS2, not Command Prompt or PowerShell.
-
-> [!WARNING]
-> **Windows — Run PowerShell as Administrator (required)**
-> 
-> Before running setup or any `.ps1` scripts, open PowerShell as Administrator and run:
-> ```powershell
-> Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
-> ```
-> This is a one-time step. Without it, Windows will block all PowerShell scripts and the bridge won't start.
-> 
-> To open PowerShell as Administrator: right-click the Start button → **Windows PowerShell (Admin)** or **Terminal (Admin)**.
-> You do NOT need admin for day-to-day use — only for this one-time setup step.
-
 The setup wizard will:
-1. Check prerequisites (Node.js, Claude CLI)
+1. Check Node.js and Claude CLI
 2. Walk you through Telegram bot setup
-3. Let you choose a default model
-4. Install all files to `~/.claude/`
-5. Save your auth token
-6. Install and optionally start the service (launchd on macOS, systemd on Linux, Task Scheduler on Windows)
-
-On first message to your bot, NativeClaw enters **onboarding mode** — it interviews you to set up its personality, learn about you, and configure itself as your personal agent.
+3. Let you choose the default Claude model
+4. Install bridge, scripts, workspace templates, and cron schedule
+5. Store optional OpenAI API key for voice transcription
+6. Install and optionally start the service
 
 ## Architecture
 
-```
-You (Telegram) → Bridge (Node.js) → Claude Code CLI (claude -p) → Response → Telegram
+```text
+User (Telegram) -> Bridge (Node.js) -> Active Backend -> Response -> Telegram
+                                      ├─ Claude Code CLI
+                                      └─ Codex CLI
                     ↓
-              Cron Scheduler → Scheduled tasks (morning brief, heartbeat, etc.)
+             Bridge Cron Scheduler -> active backend or command-only cron
 ```
 
-- **Bridge** (`bridge.js`) — Polls Telegram for messages, spawns `claude -p` subprocesses, sends responses back
-- **Service manager** — launchd (macOS), systemd (Linux), or Task Scheduler (Windows) keeps the bridge running 24/7, restarts on crash, weekly restart for hygiene
-- **Workspace** — Agent's brain: personality (SOUL.md), rules (AGENTS.md), memory (MEMORY.md), tools (.mcp.json)
+Important files after install:
 
-## File Structure
-
-```
+```text
 ~/.claude/
 ├── telegram-bridge/
-│   ├── bridge.js          # Core bridge (v1.6.0)
-│   ├── config.json        # Your bot token, chat ID, settings
-│   └── state.json         # Session + exchange counter state (auto-managed)
+│   ├── bridge.js
+│   ├── eval-slash-commands.js
+│   ├── config.json
+│   └── state.json
 ├── workspace/
-│   ├── CLAUDE.md          # Agent instructions + onboarding
-│   ├── SOUL.md            # Agent personality
-│   ├── AGENTS.md          # Agent rules (keep under 200 lines)
-│   ├── MEMORY.md          # Active business context
-│   ├── USER.md            # Info about you
-│   ├── TOOLS.md           # Tool reference
-│   ├── HEARTBEAT.md       # Heartbeat instructions
-│   ├── .mcp.json          # MCP server configs
-│   ├── memory/            # Daily logs
-│   ├── feedback/          # Output feedback logs
+│   ├── CLAUDE.md
+│   ├── NATIVECLAW.md
+│   ├── SOUL.md
+│   ├── AGENTS.md
+│   ├── MEMORY.md
+│   ├── USER.md
+│   ├── TOOLS.md
+│   ├── HEARTBEAT.md
+│   ├── .mcp.json
+│   ├── memory/
+│   ├── feedback/
 │   ├── cron/
-│   │   └── CONTEXT_LITE.md  # Condensed context for crons
-│   ├── cron-workspace/
-│   │   └── CLAUDE.md      # Lightweight cron system prompt
-│   └── system/
-│       └── EVAL_FRAMEWORK.md  # Weekly self-eval metrics
+│   └── cron-workspace/
 ├── scripts/
-│   ├── claude-restart.sh   # Lifecycle manager (macOS/Linux)
-│   ├── claude-restart.ps1  # Lifecycle manager (Windows)
-│   ├── telegram_direct.sh  # Direct Telegram messaging (macOS/Linux)
-│   ├── telegram_direct.ps1 # Direct Telegram messaging (Windows)
-│   └── agent-browser.sh   # Persistent Chromium for browser tasks
-├── cron-schedule.json     # Scheduled tasks
+├── cron-schedule.json
 └── logs/
-    └── telegram-bridge.log
-```
-
-## Commands
-
-### macOS (launchd)
-
-```bash
-# Start
-launchctl load ~/Library/LaunchAgents/com.nativeclaw.session.plist
-
-# Stop
-launchctl unload ~/Library/LaunchAgents/com.nativeclaw.session.plist
-
-# Restart
-launchctl unload ~/Library/LaunchAgents/com.nativeclaw.session.plist && launchctl load ~/Library/LaunchAgents/com.nativeclaw.session.plist
-```
-
-### Linux (systemd)
-
-```bash
-# Start
-systemctl --user start nativeclaw
-
-# Stop
-systemctl --user stop nativeclaw
-
-# Restart
-systemctl --user restart nativeclaw
-
-# Status
-systemctl --user status nativeclaw
-```
-
-### Windows (Task Scheduler)
-
-Run these in an admin terminal (Command Prompt or PowerShell):
-
-```cmd
-# Start
-schtasks /run /tn "NativeClaw"
-
-# Stop
-schtasks /end /tn "NativeClaw"
-
-# Delete (to reinstall)
-schtasks /delete /tn "NativeClaw" /f
-```
-
-### Logs
-
-```bash
-# macOS / Linux
-tail -f ~/.claude/logs/telegram-bridge.log
-
-# Windows
-type %USERPROFILE%\.claude\logs\telegram-bridge.log
 ```
 
 ## Telegram Commands
 
-| Command | Description |
+| Command | What It Does |
 |---|---|
-| `/opus` | Switch to Opus 4.6 |
-| `/sonnet` | Switch to Sonnet 4.6 |
-| `/haiku` | Switch to Haiku 4.5 |
-| `/think` | Toggle extended thinking |
-| `/stop` | Abort running task and clear queue |
-| `/reset` | Start fresh conversation |
-| `/stats` | Last response stats |
-| `/status` | System status |
-| `/help` | All commands |
+| `/claude` | Use Claude backend |
+| `/claude --full` | Use Claude with raw Codex transcript replay |
+| `/codex` | Use Codex backend |
+| `/codex --full` | Use Codex with raw Claude transcript replay |
+| `/codex help` | List Codex model shortcuts |
+| `/5.4`, `/5.4-mini`, `/5.3-codex`, `/5.2`, `/5.2-codex`, `/5.1-codex-max`, `/5.1-codex-mini` | Set Codex model |
+| `/opus` | Switch Claude model to Opus 4.7 |
+| `/opus4.6` | Switch Claude model to Opus 4.6 |
+| `/sonnet` | Switch Claude model to Sonnet 4.6 |
+| `/haiku` | Switch Claude model to Haiku 4.5 |
+| `/effort <low|medium|high|xhigh|max>` | Set Claude/Codex reasoning effort |
+| `/think` | Compatibility toggle for max effort |
+| `/verbosity <default|low|medium|high>` | Set Codex verbosity |
+| `/stop` | Abort the running task and clear queue |
+| `/reset` | Clear current backend session/thread |
+| `/fresh` | Alias for `/reset` |
+| `/stats` | Show last response stats |
+| `/session` | Show session/thread info |
+| `/status` | Show backend/model/session state |
+| `/restart` | Ask the service manager to restart the bridge |
+| `/help` | Show commands |
+
+## Service Commands
+
+macOS:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.nativeclaw.session.plist
+launchctl unload ~/Library/LaunchAgents/com.nativeclaw.session.plist
+launchctl kickstart -k gui/$(id -u)/com.nativeclaw.session
+tail -f ~/.claude/logs/telegram-bridge.log
+```
+
+Linux:
+
+```bash
+systemctl --user start nativeclaw
+systemctl --user stop nativeclaw
+systemctl --user restart nativeclaw
+journalctl --user -u nativeclaw -f
+```
+
+Windows:
+
+```cmd
+schtasks /run /tn "NativeClaw"
+schtasks /end /tn "NativeClaw"
+schtasks /delete /tn "NativeClaw" /f
+```
+
+## Codex Setup Notes
+
+The bridge can launch Codex without extra repo files if `codex` is on PATH. For MCP access, mirror your MCP servers into `~/.codex/config.toml`. NativeClaw's Codex preamble expects that config path.
+
+Recommended smoke test:
+
+```bash
+codex exec "Say OK" -c model_reasoning_effort='"xhigh"' -c model_verbosity='"low"'
+```
+
+Then run the bridge eval:
+
+```bash
+node ~/.claude/telegram-bridge/eval-slash-commands.js
+```
 
 ## Supported Media
 
 | Type | How It Works |
 |---|---|
-| **Text** | Sent directly to Claude |
-| **Images** | Downloaded, passed to Claude for visual analysis |
-| **Voice messages** | Transcribed locally with Whisper, sent as text to Claude |
-| **Audio files** | Same as voice — transcribed with Whisper |
-| **Files** (PDF, DOCX, XLSX, PPTX, TXT, CSV, JSON, Markdown) | Downloaded, passed to Claude for reading |
-
-Send a file with a caption to tell the agent what to do with it. No caption defaults to "Read and summarize."
+| Text | Sent directly to the active backend |
+| Images | Downloaded and passed for visual analysis |
+| Voice messages | Transcribed with OpenAI Whisper API, then sent as text |
+| Audio files | Same as voice messages |
+| Files | Downloaded and passed with the prompt/caption |
 
 ## Customization
 
-NativeClaw is designed to be personalized. Edit the workspace files to make the agent yours:
+NativeClaw is meant to be heavily personalized:
 
-- **SOUL.md** — Who is your agent? Name, personality, voice
-- **AGENTS.md** — How should it operate? Rules, autonomy level, error handling
-- **MEMORY.md** — What should it remember? Projects, clients, preferences
-- **cron-schedule.json** — What should it do automatically? Briefings, checks, reports
-- **.mcp.json** — What tools does it have? Email, calendar, project management
+- `SOUL.md` defines agent identity and voice
+- `AGENTS.md` defines hard rules and workflows
+- `MEMORY.md` stores durable context
+- `USER.md` stores durable user facts
+- `TOOLS.md` documents available tools and local setup
+- `cron-schedule.json` defines scheduled jobs
+- `.mcp.json` defines Claude MCP servers
 
-See [OPERATIONS.md](OPERATIONS.md) for the full operations guide.
+See [OPERATIONS.md](OPERATIONS.md) for maintenance details.
 
 ## License
 
-Private. Do not distribute.
+Private. Do not distribute unless you know this repo is intentionally being shared.

@@ -1,5 +1,5 @@
 {
-  "description": "NativeClaw cron schedule. The bridge reads this on startup and checks every 60 seconds.",
+  "description": "NativeClaw cron schedule. The bridge reloads this every 5 minutes and checks every 60 seconds.",
   "timezone": "America/New_York",
   "crons": [
     {
@@ -7,14 +7,14 @@
       "schedule": "30 7 * * *",
       "timeout": 300,
       "model": "sonnet",
-      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. Good morning. Check the user's calendar for today, check for any urgent emails, and send a morning briefing via bash $HOME/.claude/workspace/system/scripts/telegram_direct.sh \"[briefing text]\""
+      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. Good morning. Check the user's calendar for today, check for any urgent emails, and send a morning briefing via bash $HOME/.claude/scripts/telegram_direct.sh \"[briefing text]\""
     },
     {
       "name": "end-of-day-summary",
       "schedule": "0 20 * * *",
       "timeout": 300,
       "model": "sonnet",
-      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. End of day. Read today's daily log from memory/. Summarize what was accomplished, what's still open, and what's coming tomorrow. Send via bash $HOME/.claude/workspace/system/scripts/telegram_direct.sh \"[summary]\""
+      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. End of day. Read today's daily log from memory/. Summarize what was accomplished, what's still open, and what's coming tomorrow. Send via bash $HOME/.claude/scripts/telegram_direct.sh \"[summary]\""
     },
     {
       "name": "heartbeat",
@@ -35,14 +35,14 @@
       "schedule": "10 5 * * *",
       "timeout": 300,
       "model": "sonnet",
-      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. Daily session audit before reset. The bridge will clear the session automatically after this cron completes.\n\n1. Read the active session ID from ~/.claude/telegram-bridge/state.json.\n2. If no active session, respond HEARTBEAT_OK and stop.\n3. Read the session transcript at ~/.claude/projects/[workspace-path]/<session-id>.jsonl. Scan the last 200 lines.\n4. Check: any pipeline/client/status changes not reflected in MEMORY.md? If yes, update now.\n5. Check: any user corrections not logged in feedback/*.md? If yes, log them. Path: feedback/general.md (NOT feedback_general.md).\n6. Check: does today's daily log have a recent checkpoint? If not, write a final one.\n7. Do NOT send any Telegram message. Silent maintenance only."
+      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. Daily session audit before reset. The bridge will clear Claude and Codex sessions automatically after this cron completes.\n\n1. Read ~/.claude/telegram-bridge/state.json.\n2. Identify any active Claude session and Codex thread for the primary chat.\n3. If no active session/thread exists, respond HEARTBEAT_OK and stop.\n4. Scan recent transcript lines for durable updates that should be in MEMORY.md, USER.md, TOOLS.md, AGENTS.md, or feedback/*.md.\n5. If corrections are not logged, log them. Path: feedback/general.md, not feedback_general.md.\n6. If today's daily log lacks a recent checkpoint, write one.\n7. Do NOT send Telegram messages. Silent maintenance only."
     },
     {
       "name": "weekly-eval",
       "schedule": "0 21 * * 0",
       "timeout": 300,
       "model": "sonnet",
-      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. Weekly self-eval. Read system/EVAL_FRAMEWORK.md for metric definitions and scorecard format. Read all daily logs from the past 7 days. Score each metric. Save scorecard to memory/evals/YYYY-MM-DD-eval.md. Send via bash $HOME/.claude/workspace/system/scripts/telegram_direct.sh \"[scorecard]\""
+      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. Weekly self-eval. Read system/EVAL_FRAMEWORK.md for metric definitions and scorecard format. Read all daily logs from the past 7 days. Score each metric. Save scorecard to memory/evals/YYYY-MM-DD-eval.md. Send via bash $HOME/.claude/scripts/telegram_direct.sh \"[scorecard]\""
     }
   ]
 }

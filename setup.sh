@@ -44,6 +44,11 @@ fi
 
 echo "  Node.js: $(node --version)"
 echo "  Claude CLI: found"
+if command -v codex &> /dev/null; then
+    echo "  Codex CLI: found"
+else
+    echo "  Codex CLI: not found (optional; /codex backend will be unavailable until installed)"
+fi
 echo ""
 
 # -------------------------------------------------------
@@ -93,13 +98,13 @@ echo ""
 echo "[3/8] Default Model"
 echo ""
 echo "  1) Sonnet 4.6 (recommended — fast, capable)"
-echo "  2) Opus 4.6 (most capable, slower)"
+echo "  2) Opus 4.7 (most capable, slower)"
 echo "  3) Haiku 4.5 (fastest, less capable)"
 echo ""
 read -p "  Choose [1/2/3]: " MODEL_CHOICE
 
 case $MODEL_CHOICE in
-    2) MODEL="opus" ;;
+    2) MODEL="claude-opus-4-7" ;;
     3) MODEL="haiku" ;;
     *) MODEL="sonnet" ;;
 esac
@@ -130,6 +135,8 @@ echo "[5/8] Installing files..."
 
 # Bridge
 cp "$REPO_DIR/bridge/bridge.js" "$BRIDGE_DIR/bridge.js"
+cp "$REPO_DIR/bridge/eval-slash-commands.js" "$BRIDGE_DIR/eval-slash-commands.js"
+chmod +x "$BRIDGE_DIR/eval-slash-commands.js"
 
 # Scripts — platform-specific
 if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
@@ -138,8 +145,10 @@ if [[ "$OS" == MINGW* || "$OS" == MSYS* || "$OS" == CYGWIN* ]]; then
 else
     cp "$REPO_DIR/scripts/claude-restart.sh" "$SCRIPTS_DIR/claude-restart.sh"
     cp "$REPO_DIR/scripts/telegram_direct.sh" "$SCRIPTS_DIR/telegram_direct.sh"
+    cp "$REPO_DIR/scripts/agent-browser.sh" "$SCRIPTS_DIR/agent-browser.sh"
     chmod +x "$SCRIPTS_DIR/claude-restart.sh"
     chmod +x "$SCRIPTS_DIR/telegram_direct.sh"
+    chmod +x "$SCRIPTS_DIR/agent-browser.sh"
 fi
 
 # Workspace templates (only if they don't already exist — don't overwrite)
@@ -294,6 +303,10 @@ echo ""
 # Generate config
 # -------------------------------------------------------
 echo "[6/8] Generating config..."
+echo ""
+echo "  Voice transcription uses OpenAI Whisper API."
+echo "  Press Enter to skip voice transcription for now."
+read -p "  Enter your OpenAI API key (optional): " OPENAI_API_KEY
 
 if [ "$OS" = "Darwin" ]; then
     RESTART_CMD="nohup bash -c 'sleep 2 && launchctl unload ~/Library/LaunchAgents/com.nativeclaw.session.plist && launchctl load ~/Library/LaunchAgents/com.nativeclaw.session.plist' >/dev/null 2>&1 &"
@@ -311,6 +324,8 @@ cat > "$BRIDGE_DIR/config.json" << EOF
   "mcpConfig": "$WORKSPACE_DIR/.mcp.json",
   "cronSchedule": "$CLAUDE_DIR/cron-schedule.json",
   "model": "$MODEL",
+  "defaultBackend": "claude",
+  "openaiApiKey": "$OPENAI_API_KEY",
   "restartCommand": "$RESTART_CMD"
 }
 EOF
