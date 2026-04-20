@@ -122,6 +122,11 @@ mkdir -p "$SCRIPTS_DIR"
 mkdir -p "$WORKSPACE_DIR/memory"
 mkdir -p "$WORKSPACE_DIR/feedback"
 mkdir -p "$WORKSPACE_DIR/system/task-queue"
+mkdir -p "$WORKSPACE_DIR/system/mcp-health"
+mkdir -p "$WORKSPACE_DIR/system/mcp"
+mkdir -p "$WORKSPACE_DIR/system/scripts"
+mkdir -p "$WORKSPACE_DIR/skills"
+mkdir -p "$CLAUDE_DIR/hooks"
 mkdir -p "$LOG_DIR"
 mkdir -p "$CLAUDE_DIR/telegram-images"
 
@@ -169,19 +174,75 @@ else
     echo "  Skipped .mcp.json (already exists)"
 fi
 
-# Skills
-mkdir -p "$WORKSPACE_DIR/skills"
-if [ -d "$REPO_DIR/workspace/skills/skill-creator" ]; then
-    cp -R "$REPO_DIR/workspace/skills/skill-creator" "$WORKSPACE_DIR/skills/" 2>/dev/null
-    echo "  Installed skill: skill-creator"
+# Skills — ship the bundled set (user can delete any they don't want)
+if [ -d "$REPO_DIR/workspace/skills" ]; then
+    for skill_dir in "$REPO_DIR/workspace/skills"/*/; do
+        skill_name=$(basename "$skill_dir")
+        if [ ! -d "$WORKSPACE_DIR/skills/$skill_name" ]; then
+            cp -R "$skill_dir" "$WORKSPACE_DIR/skills/" 2>/dev/null
+            echo "  Installed skill: $skill_name"
+        fi
+    done
+    # SKILL_INDEX.md at top level
+    if [ -f "$REPO_DIR/workspace/skills/SKILL_INDEX.md" ] && [ ! -f "$WORKSPACE_DIR/skills/SKILL_INDEX.md" ]; then
+        cp "$REPO_DIR/workspace/skills/SKILL_INDEX.md" "$WORKSPACE_DIR/skills/SKILL_INDEX.md"
+    fi
 fi
-if [ -d "$REPO_DIR/workspace/skills/mcp-builder" ]; then
-    cp -R "$REPO_DIR/workspace/skills/mcp-builder" "$WORKSPACE_DIR/skills/" 2>/dev/null
-    echo "  Installed skill: mcp-builder"
+
+# Reliability + memory scripts (copy if missing, don't overwrite user edits)
+RELIABILITY_FILES=(
+    "system/scripts/snapshot-memory.sh"
+    "system/scripts/scan-secrets.sh"
+    "system/scripts/keychain-add.sh"
+    "system/scripts/keychain-add-linux.sh"
+    "system/scripts/mcp-status.sh"
+    "system/scripts/session-self-audit.js"
+    "system/scripts/video-extract.sh"
+    "system/mcp-health/mcp-wrapper.js"
+    "system/mcp-health/probe.js"
+    "system/mcp-health/mcp-criticality.json"
+    "system/task-queue/README.md"
+    "system/PLATFORM_FORMATTING.md"
+    "system/memory-hook-clients.txt"
+    "system/mcp/qmd/server.js"
+    "system/mcp/qmd/README.md"
+    ".secretsignore"
+)
+for rel in "${RELIABILITY_FILES[@]}"; do
+    src="$REPO_DIR/workspace/$rel"
+    dst="$WORKSPACE_DIR/$rel"
+    if [ -f "$src" ] && [ ! -f "$dst" ]; then
+        mkdir -p "$(dirname "$dst")"
+        cp "$src" "$dst"
+        # preserve exec bit for shell/node scripts
+        case "$rel" in
+            *.sh|*.js) chmod +x "$dst" ;;
+        esac
+        echo "  Installed $rel"
+    fi
+done
+
+# Feedback starter templates
+for fb in README.md general.md emails.md reports.md; do
+    if [ ! -f "$WORKSPACE_DIR/feedback/$fb" ] && [ -f "$REPO_DIR/workspace/feedback/$fb" ]; then
+        cp "$REPO_DIR/workspace/feedback/$fb" "$WORKSPACE_DIR/feedback/$fb"
+    fi
+done
+if [ ! -f "$WORKSPACE_DIR/memory/README.md" ] && [ -f "$REPO_DIR/workspace/memory/README.md" ]; then
+    cp "$REPO_DIR/workspace/memory/README.md" "$WORKSPACE_DIR/memory/README.md"
 fi
-if [ -d "$REPO_DIR/workspace/skills/onboarding" ]; then
-    cp -R "$REPO_DIR/workspace/skills/onboarding" "$WORKSPACE_DIR/skills/" 2>/dev/null
-    echo "  Installed skill: onboarding"
+
+# Hooks — copy to ~/.claude/hooks (not workspace, so they run globally)
+if [ -d "$REPO_DIR/hooks" ]; then
+    for hook in "$REPO_DIR/hooks"/*.sh; do
+        [ -f "$hook" ] || continue
+        hook_name=$(basename "$hook")
+        if [ ! -f "$CLAUDE_DIR/hooks/$hook_name" ]; then
+            cp "$hook" "$CLAUDE_DIR/hooks/$hook_name"
+            chmod +x "$CLAUDE_DIR/hooks/$hook_name"
+            echo "  Installed hook: $hook_name"
+        fi
+    done
 fi
 
 # Write device.md with correct OS-specific commands
@@ -382,6 +443,121 @@ print('  Nano Banana configured in settings.json')
 " "$SETTINGS_FILE" "$GOOGLE_AI_KEY"
 else
     echo "  Skipping Nano Banana (no key provided)."
+fi
+
+echo ""
+
+# -------------------------------------------------------
+# Optional: QMD semantic memory search
+# -------------------------------------------------------
+echo "[Optional] Memory Search (QMD)"
+echo ""
+echo "  QMD adds semantic search across all your memory files, daily logs,"
+echo "  and feedback — so your agent can recall past events and decisions."
+echo "  Requires a free Google AI API key (same one Nano Banana uses)."
+echo "  Get one at: https://aistudio.google.com/apikey"
+echo "  (Press Enter to skip — you can enable QMD later via the README)"
+echo ""
+read -p "  Enable QMD memory search? [y/N]: " ENABLE_QMD
+
+if [[ "$ENABLE_QMD" =~ ^[Yy]$ ]]; then
+    if [ -n "$GOOGLE_AI_KEY" ]; then
+        QMD_KEY="$GOOGLE_AI_KEY"
+        echo "  Reusing Google AI key from Nano Banana setup."
+    else
+        read -p "  Enter your Google AI API key: " QMD_KEY
+    fi
+
+    if [ -n "$QMD_KEY" ]; then
+        # Store in platform keychain (macOS security / Linux secret-tool)
+        KEYCHAIN_ACCOUNT="$(whoami)"
+        if [ "$OS" = "Darwin" ]; then
+            /usr/bin/security add-generic-password                 -a "$KEYCHAIN_ACCOUNT"                 -s "GEMINI_API_KEY"                 -w "$QMD_KEY"                 -U 2>/dev/null && echo "  Gemini key stored in macOS Keychain."
+        elif [ "$OS" = "Linux" ]; then
+            if command -v secret-tool &> /dev/null; then
+                echo -n "$QMD_KEY" | secret-tool store                     --label="NativeClaw Gemini API Key"                     service "GEMINI_API_KEY"                     account "$KEYCHAIN_ACCOUNT"                     2>/dev/null && echo "  Gemini key stored via libsecret."
+            else
+                echo "  secret-tool not found (install libsecret-tools / libsecret);"
+                echo "  skipping keychain store. Set GEMINI_API_KEY in your env manually."
+            fi
+        fi
+
+        # Flip qmd entry in .mcp.json from __qmd_disabled -> qmd
+        MCP_JSON="$WORKSPACE_DIR/.mcp.json"
+        if [ -f "$MCP_JSON" ]; then
+            python3 -c "
+import json, sys
+path = sys.argv[1]
+with open(path) as f:
+    data = json.load(f)
+if 'mcpServers' in data and '__qmd_disabled' in data['mcpServers']:
+    data['mcpServers']['qmd'] = data['mcpServers'].pop('__qmd_disabled')
+    data.pop('__note_qmd', None)
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+    print('  QMD enabled in .mcp.json')
+else:
+    print('  QMD entry already enabled (or template missing __qmd_disabled key)')
+" "$MCP_JSON"
+        fi
+    else
+        echo "  No key entered — skipping QMD setup."
+    fi
+else
+    echo "  Skipping QMD (can be enabled later — see workspace/system/mcp/qmd/README.md)."
+fi
+
+echo ""
+
+# -------------------------------------------------------
+# Install memory + feedback hooks into ~/.claude/settings.json
+# -------------------------------------------------------
+echo "[Optional] Prompt Hooks"
+echo ""
+echo "  Installs UserPromptSubmit hooks that remind the agent to search memory"
+echo "  when you mention names/dates, and to log corrections when you push back."
+echo "  Zero-cost, runs locally on every prompt."
+echo ""
+read -p "  Install prompt hooks? [Y/n]: " INSTALL_HOOKS
+
+if [[ ! "$INSTALL_HOOKS" =~ ^[Nn]$ ]]; then
+    SETTINGS_FILE="$CLAUDE_DIR/settings.json"
+    python3 -c "
+import json, sys, os
+path = sys.argv[1]
+home = sys.argv[2]
+try:
+    with open(path) as f:
+        data = json.load(f)
+except (FileNotFoundError, json.JSONDecodeError):
+    data = {}
+
+data.setdefault('hooks', {})
+data['hooks'].setdefault('UserPromptSubmit', [])
+
+mem_hook = f'{home}/.claude/hooks/memory-check.sh'
+fb_hook = f'{home}/.claude/hooks/feedback-check.sh'
+
+existing_cmds = {m.get('command') for entry in data['hooks']['UserPromptSubmit'] for m in entry.get('hooks', [])}
+
+added = []
+if mem_hook not in existing_cmds and os.path.exists(mem_hook):
+    data['hooks']['UserPromptSubmit'].append({
+        'hooks': [{'type': 'command', 'command': mem_hook}]
+    })
+    added.append('memory-check')
+if fb_hook not in existing_cmds and os.path.exists(fb_hook):
+    data['hooks']['UserPromptSubmit'].append({
+        'hooks': [{'type': 'command', 'command': fb_hook}]
+    })
+    added.append('feedback-check')
+
+with open(path, 'w') as f:
+    json.dump(data, f, indent=2)
+print('  Hooks wired:', ', '.join(added) if added else 'already configured')
+" "$SETTINGS_FILE" "$HOME"
+else
+    echo "  Skipping hook install."
 fi
 
 echo ""

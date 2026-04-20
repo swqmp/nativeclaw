@@ -146,14 +146,63 @@ Voice transcription failing:
 1. Confirm `openaiApiKey` exists in `config.json`.
 2. Check the actual OpenAI API error in the bridge log.
 
+## Agent Reliability Stack (v1.10+)
+
+### Memory + Feedback Loop
+
+- **Daily logs:** agent writes checkpoints to `workspace/memory/YYYY-MM-DD.md`. Required fields: What we did / Decisions / Open questions / Next actions / Feedback logged / MEMORY.md delta. See `workspace/AGENTS.md` for the canonical format.
+- **Durable context:** promote to `workspace/MEMORY.md` anything that will matter next week. Promotion triggers and a target-file table are in AGENTS.md.
+- **Correction log:** `workspace/feedback/<task-type>.md`. When the user corrects the agent mid-task, the agent logs it immediately. Before producing repeatable output (email, report, etc.) the agent reads the matching file first. **Path format is `feedback/general.md`, NOT `feedback_general.md`** — underscore-at-root writes go nowhere.
+- **Snapshots:** `bash workspace/system/scripts/snapshot-memory.sh` copies MEMORY.md to `memory/snapshots/` (keeps last 30). Wired as the `snapshot-memory` cron at 5:05 AM daily.
+
+### QMD Semantic Memory Search (optional)
+
+QMD gives the agent a `search_memory` MCP tool backed by Gemini Embedding 2 across every memory/feedback file.
+
+- Enable during `setup.sh` (prompts for Google AI key, stores in OS keychain).
+- To enable later:
+  1. `bash workspace/system/scripts/keychain-add.sh GEMINI_API_KEY` (macOS) or `keychain-add-linux.sh` (libsecret).
+  2. Edit `workspace/.mcp.json` — rename `__qmd_disabled` to `qmd`, drop `__note_qmd`.
+  3. Restart the bridge.
+- Reindex: `mcp__qmd__reindex_memory` from inside the agent, or run the direct runner at `workspace/system/scripts/qmd-reindex-direct.js` for command-only crons.
+
+### Keychain Rotation
+
+API keys should live in the OS keychain, NOT in `.mcp.json` or shell rc files.
+
+- macOS: `bash workspace/system/scripts/keychain-add.sh <KEY_NAME>`
+- Linux: `bash workspace/system/scripts/keychain-add-linux.sh <KEY_NAME>` (requires `libsecret-tools` / `libsecret`)
+- Reference in code via `process.env.<KEY_NAME>` — the MCP wrapper loads from keychain at boot.
+- Rotating: re-run the same add script; it updates in place.
+
+### MCP Health
+
+- **Probe:** `workspace/system/mcp-health/probe.js` runs every 15 min (cron: `mcp-probe`). Writes `probe-state.json`.
+- **Status triage:** `bash workspace/system/scripts/mcp-status.sh [--quiet]` — silent if all Critical MCPs healthy + probe fresh (<120 min); loud otherwise. Use `--quiet` in session-start checklists.
+- **Criticality map:** `workspace/system/mcp-health/mcp-criticality.json` classifies each MCP as `critical` / `important` / `optional`. Agent checks before claiming a tool is "broken."
+- **Wrapper:** `workspace/system/mcp-health/mcp-wrapper.js` is a reusable init-replay supervisor. Wrap flaky MCPs in `.mcp.json` by setting `command: node` and `args: [.../mcp-wrapper.js, <original-command>, ...]`.
+
+### Task Queue + Self-Audit
+
+- **Queue:** `workspace/system/task-queue/queue.json` stores tasks carried over from rate-limits/crashes. Recovered hourly by the `task-queue-recovery` cron. Format and status values in `task-queue/README.md`.
+- **Self-audit:** `workspace/system/scripts/session-self-audit.js` runs at 10am/2pm/6pm/10pm (cron: `session-self-audit`). Scans recent transcript lines for unkept commitments, unlogged corrections, stale checkpoints. Log-only — no user interruption.
+
+### Prompt Hooks
+
+Two `UserPromptSubmit` hooks ship in `hooks/` and get wired into `~/.claude/settings.json` by `setup.sh`:
+
+- `hooks/memory-check.sh` — injects "⚡ MEMORY CHECK" additionalContext when the user mentions a name from `workspace/system/memory-hook-clients.txt` or uses history phrasing ("when did", "last time", "do you remember", etc.). Forces the agent to call `search_memory` before answering from injected context.
+- `hooks/feedback-check.sh` — injects "⚠️ FEEDBACK DETECTED" when the user pushes back ("no", "don't", "stop doing that"). Forces the agent to log the correction before continuing.
+
+To enable client-name triggers, add one name per line to `workspace/system/memory-hook-clients.txt`.
+
+### Secrets Scan
+
+`workspace/system/scripts/scan-secrets.sh` sweeps the workspace for accidentally-committed API keys, passwords, and tokens. Cron: `secrets-scan` at 7:15 AM daily, log-only. Configure ignore patterns in `workspace/.secretsignore`.
+
 ## Hooks Pattern
 
-Claude Code hooks live in `~/.claude/settings.json`. Two useful patterns:
-
-- Memory check hook: injects "search memory first" reminders for historical questions.
-- Feedback hook: injects "log this correction" reminders when the user corrects the agent.
-
-Keep hooks small and file-based. They should enforce habits, not become another hidden app.
+Claude Code hooks live in `~/.claude/settings.json`. The two v1.10 hooks described above are wired automatically. Roll your own by dropping a `.sh` into `hooks/`, making it executable, and adding an entry under `hooks.UserPromptSubmit`. Keep them small and file-based.
 
 ## Persistent Browser
 

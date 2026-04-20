@@ -1,5 +1,53 @@
 # NativeClaw Changelog
 
+## v1.10.0 — Agent Reliability Stack
+
+First major release focused on making the agent reliable out-of-box, not just functional. Every piece here came from real-world patterns that caught hallucinations, context loss, or credential leaks.
+
+### New — Memory That Learns
+- **QMD semantic memory search (opt-in):** `workspace/system/mcp/qmd/server.js` — Gemini Embedding 2 over daily logs, MEMORY.md, and feedback files. Disabled by default; enable during `setup.sh` or by renaming `__qmd_disabled` to `qmd` in `.mcp.json`.
+- **Feedback loop starter:** `workspace/feedback/{general,emails,reports}.md` — the agent reads the matching file before producing repeatable output. Checkpoint discipline enforced in the new AGENTS.md (mandatory fields, promotion table).
+- **Memory snapshots:** `workspace/system/scripts/snapshot-memory.sh` keeps the last 30 MEMORY.md versions. Wired as `snapshot-memory` cron at 5:05 AM.
+
+### New — Reliability
+- **MCP wrapper supervisor:** `workspace/system/mcp-health/mcp-wrapper.js` — init replay, circuit breaker, auto-respawn. Fetches secrets from the platform keychain (macOS `security`, Linux `secret-tool`).
+- **MCP pre-flight probe:** `workspace/system/mcp-health/probe.js` — 15-minute health check (cron: `mcp-probe`). Writes `probe-state.json` consumed by session-start checklists.
+- **MCP triage:** `workspace/system/scripts/mcp-status.sh` — classifies outages via `mcp-criticality.json` before escalating.
+- **Keychain tooling:** `keychain-add.sh` (macOS) / `keychain-add-linux.sh` (libsecret). API keys leave `.mcp.json` and move to the OS keychain.
+- **Secrets scanner:** `workspace/system/scripts/scan-secrets.sh` — daily sweep for accidentally-committed keys (cron: `secrets-scan` at 7:15 AM).
+
+### New — Context Preservation
+- **Task queue:** `workspace/system/task-queue/queue.json` survives rate-limits and crashes. Recovered hourly by `task-queue-recovery` cron.
+- **Session self-audit:** `workspace/system/scripts/session-self-audit.js` runs 10am/2pm/6pm/10pm. Scans recent transcript for unkept commitments, unlogged corrections, stale checkpoints.
+- **Prompt hooks:** `hooks/memory-check.sh` + `hooks/feedback-check.sh` — UserPromptSubmit hooks that inject "search memory first" or "log this correction" reminders based on user phrasing.
+
+### New — Quality of Life
+- **Video extraction:** `workspace/system/scripts/video-extract.sh` — YouTube/Instagram/TikTok caption + Whisper transcription via yt-dlp. Paths parameterized via `$NATIVECLAW_WORKSPACE`.
+- **Platform formatting rules:** `workspace/system/PLATFORM_FORMATTING.md` — Discord/WhatsApp/group-chat guidance.
+- **Bundled skills:** 14 total — adds frontend-design, web-design-guidelines, webapp-testing, docx/pdf/xlsx/pptx, brainstorming, ab-test-setup, canvas-design, algorithmic-art. See new `workspace/skills/SKILL_INDEX.md`.
+
+### AGENTS.md — Full Rewrite
+- Non-negotiables section covers honesty, execution, git safety, memory discipline, feedback loop.
+- SESSION START 5-step checklist (backup / daily logs / task queue / MCP health / greet).
+- AFTER COMPACTION protocol.
+- Checkpoint format with 6 mandatory fields (What we did / Decisions / Open questions / Next actions / Feedback logged / MEMORY.md delta).
+- System file promotion table.
+
+### Setup Wizard
+- New steps: optional QMD enable (stores Gemini key in OS keychain), optional hook install into `~/.claude/settings.json`.
+- Installs all 14 bundled skills instead of just 3.
+- Copies reliability scripts, MCP health files, task queue, and platform formatting docs.
+
+### Cron Schedule
+- Added `mcp-probe` (*/15 min, command-only), `secrets-scan` (7:15 AM, command-only), `snapshot-memory` (5:05 AM, command-only), `session-self-audit` (10am/2pm/6pm/10pm, command-only). None burn an LLM turn.
+
+### Parameterization
+- All paths use `$NATIVECLAW_WORKSPACE` (falls back to `$HOME/.claude/workspace`).
+- Keychain account via `$NATIVECLAW_KEYCHAIN_ACCOUNT` (falls back to `$USER`).
+- Claude Code project dir derivable from workspace via `$NATIVECLAW_PROJECT_DIR`.
+
+---
+
 ## v1.9.4 — Claude/Codex Backend Bridge
 
 ### Bridge (bridge.js)
