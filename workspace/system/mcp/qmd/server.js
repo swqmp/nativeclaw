@@ -404,7 +404,7 @@ const TOOLS = [
       properties: {
         query: {
           type: 'string',
-          description: 'Natural language search query (e.g., "when did Merick pay", "BBB networking event contacts", "Cedar Stone testimonial")',
+          description: 'Natural language search query (e.g., "when did we decide X", "meeting notes with Alice", "pricing for service Y")',
         },
         top_k: {
           type: 'number',
