@@ -11,7 +11,15 @@ logs/
 
 # User data (populated during use)
 workspace/memory/*.md
+workspace/memory/snapshots/
 workspace/feedback/*.md
+
+# Keep starter templates tracked even though the rest is user data
+!workspace/memory/README.md
+!workspace/feedback/README.md
+!workspace/feedback/general.md
+!workspace/feedback/emails.md
+!workspace/feedback/reports.md
 
 # macOS
 .DS_Store
