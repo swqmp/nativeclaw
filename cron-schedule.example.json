@@ -57,6 +57,20 @@
       "timeout": 120,
       "command": "bash $NATIVECLAW_WORKSPACE/system/scripts/scan-secrets.sh > $HOME/.claude/logs/secrets-scan.log 2>&1",
       "comment": "Daily sweep for accidentally-committed secrets. Log-only, no LLM turn."
+    },
+    {
+      "name": "snapshot-memory",
+      "schedule": "5 5 * * *",
+      "timeout": 60,
+      "command": "bash $NATIVECLAW_WORKSPACE/system/scripts/snapshot-memory.sh > $HOME/.claude/logs/snapshot-memory.log 2>&1",
+      "comment": "Daily MEMORY.md snapshot before session audit. Keeps last 30. No LLM turn."
+    },
+    {
+      "name": "session-self-audit",
+      "schedule": "0 10,14,18,22 * * *",
+      "timeout": 60,
+      "command": "node $NATIVECLAW_WORKSPACE/system/scripts/session-self-audit.js > $HOME/.claude/logs/self-audit.log 2>&1",
+      "comment": "Scan recent transcript for unkept commitments, unlogged corrections, stale checkpoints. Log-only, no LLM turn."
     }
   ]
 }

@@ -1,0 +1,10 @@
+# People and company names the memory-check.sh hook should always trigger on.
+# One name per line. Case-insensitive. Matched via grep -iE.
+#
+# Leave this file alone and only generic history keywords will trigger.
+# Add names here to force a memory search whenever they appear in user messages.
+#
+# Example:
+# acme corp
+# jane doe
+# big-client

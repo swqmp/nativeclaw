@@ -1,0 +1,19 @@
+{
+  "_note": "Merge this into ~/.claude/settings.json. Replace PATH_TO_NATIVECLAW with the absolute path to your nativeclaw checkout (the dir containing this file).",
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash PATH_TO_NATIVECLAW/hooks/memory-check.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash PATH_TO_NATIVECLAW/hooks/feedback-check.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
