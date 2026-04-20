@@ -21,7 +21,7 @@
       "schedule": "*/30 * * * *",
       "timeout": 300,
       "model": "sonnet",
-      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. Heartbeat check. Read HEARTBEAT.md for instructions. Only alert the user if something needs attention. Quiet hours: 10 PM - 6 AM — skip during quiet hours."
+      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. Heartbeat check. Read HEARTBEAT.md for instructions. Only alert the user if something needs attention. Quiet hours: 10 PM - 6 AM \u2014 skip during quiet hours."
     },
     {
       "name": "task-queue-recovery",
@@ -43,6 +43,20 @@
       "timeout": 300,
       "model": "sonnet",
       "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. Weekly self-eval. Read system/EVAL_FRAMEWORK.md for metric definitions and scorecard format. Read all daily logs from the past 7 days. Score each metric. Save scorecard to memory/evals/YYYY-MM-DD-eval.md. Send via bash $HOME/.claude/scripts/telegram_direct.sh \"[scorecard]\""
+    },
+    {
+      "name": "mcp-probe",
+      "schedule": "*/15 * * * *",
+      "timeout": 120,
+      "command": "node $NATIVECLAW_WORKSPACE/system/mcp-health/probe.js > $HOME/.claude/logs/mcp-probe.log 2>&1",
+      "comment": "Pre-flight MCP init probe. Writes to $NATIVECLAW_WORKSPACE/system/mcp-health/probe-state.json. No LLM turn."
+    },
+    {
+      "name": "secrets-scan",
+      "schedule": "15 7 * * *",
+      "timeout": 120,
+      "command": "bash $NATIVECLAW_WORKSPACE/system/scripts/scan-secrets.sh > $HOME/.claude/logs/secrets-scan.log 2>&1",
+      "comment": "Daily sweep for accidentally-committed secrets. Log-only, no LLM turn."
     }
   ]
 }
