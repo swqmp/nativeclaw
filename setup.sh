@@ -179,7 +179,7 @@ if [ -d "$REPO_DIR/workspace/skills" ]; then
     for skill_dir in "$REPO_DIR/workspace/skills"/*/; do
         skill_name=$(basename "$skill_dir")
         if [ ! -d "$WORKSPACE_DIR/skills/$skill_name" ]; then
-            cp -R "$skill_dir" "$WORKSPACE_DIR/skills/" 2>/dev/null
+            cp -R "${skill_dir%/}" "$WORKSPACE_DIR/skills/" 2>/dev/null
             echo "  Installed skill: $skill_name"
         fi
     done
