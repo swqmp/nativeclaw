@@ -6,11 +6,8 @@
 # Requires: secret-tool (package: libsecret-tools on Debian/Ubuntu,
 # libsecret on Arch, gnome-keyring on Fedora).
 #
-# Paired with mcp-wrapper.js --keychain-env. On Linux, extend the wrapper
-# loadKeychainEnv to fetch via:
+# Paired with mcp-wrapper.js --keychain-env. On Linux, the wrapper fetches via:
 #   secret-tool lookup service <KEY_NAME> account "$NATIVECLAW_KEYCHAIN_ACCOUNT"
-# (The current wrapper defaults to macOS `security`. Linux support is a
-# small addition — see workspace/system/mcp-health/mcp-wrapper.js.)
 set -u
 
 if ! command -v secret-tool >/dev/null 2>&1; then

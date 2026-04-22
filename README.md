@@ -80,7 +80,7 @@ Beyond the core bridge, v1.10 ships an **agent reliability stack** so your agent
 
 **Reliability**
 - `system/mcp-health/mcp-wrapper.js` — init-replay supervisor with circuit breaker for flaky MCPs; fetches secrets from OS keychain
-- `system/mcp-health/probe.js` — every-15-min pre-flight check, surfaces stale/failing MCPs
+- `system/mcp-health/probe.js` — every-15-min pre-flight check, writes `last-probe.json`, surfaces stale/failing MCPs
 - `system/scripts/mcp-status.sh` — critical-vs-optional triage before escalating
 - `system/scripts/keychain-add.sh` (macOS) / `keychain-add-linux.sh` (libsecret) — store API keys outside `.mcp.json`
 - `system/scripts/scan-secrets.sh` — daily sweep for accidentally-committed secrets

@@ -26,6 +26,12 @@ const LOG_DIR = path.join(HOME_DIR, '.claude', 'logs');
 const LOG_PATH = path.join(LOG_DIR, 'telegram-bridge.log');
 const IMAGE_DIR = path.join(HOME_DIR, '.claude', 'telegram-images');
 
+function toClaudeProjectDir(workspacePath) {
+  const resolved = path.resolve(workspacePath);
+  const slug = resolved.replace(/[\\/.:]/g, '-');
+  return path.join(HOME_DIR, '.claude', 'projects', slug);
+}
+
 // Ensure log and image directories exist
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 if (!fs.existsSync(IMAGE_DIR)) fs.mkdirSync(IMAGE_DIR, { recursive: true });
@@ -1184,7 +1190,12 @@ function runClaude(prompt, sessionId, options = {}) {
     log(`Spawning: claude ${args.slice(0, 6).join(' ')}... (cwd: ${options.isCron ? 'cron' : 'main'})`);
 
     // Strip only the "nested session" detection vars, keep session auth token
-    const cleanEnv = { ...process.env };
+    const cleanEnv = {
+      ...process.env,
+      NATIVECLAW_WORKSPACE: process.env.NATIVECLAW_WORKSPACE || WORKSPACE,
+      NATIVECLAW_PROJECT_DIR: process.env.NATIVECLAW_PROJECT_DIR || toClaudeProjectDir(WORKSPACE),
+      NATIVECLAW_KEYCHAIN_ACCOUNT: process.env.NATIVECLAW_KEYCHAIN_ACCOUNT || process.env.USER || process.env.USERNAME || 'nativeclaw',
+    };
     delete cleanEnv.CLAUDECODE;
     delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
     delete cleanEnv.MCP_CLAUDE;

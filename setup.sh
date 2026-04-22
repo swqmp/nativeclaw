@@ -168,7 +168,7 @@ done
 
 # MCP config template
 if [ ! -f "$WORKSPACE_DIR/.mcp.json" ]; then
-    cp "$REPO_DIR/workspace/.mcp.json.example" "$WORKSPACE_DIR/.mcp.json"
+    sed "s|PATH_TO_WORKSPACE|$WORKSPACE_DIR|g" "$REPO_DIR/workspace/.mcp.json.example" > "$WORKSPACE_DIR/.mcp.json"
     echo "  Created .mcp.json from template"
 else
     echo "  Skipped .mcp.json (already exists)"
@@ -493,12 +493,22 @@ with open(path) as f:
 if 'mcpServers' in data and '__qmd_disabled' in data['mcpServers']:
     data['mcpServers']['qmd'] = data['mcpServers'].pop('__qmd_disabled')
     data.pop('__note_qmd', None)
+    data['mcpServers'].pop('__note_qmd', None)
+    def replace_workspace(value):
+        if isinstance(value, str):
+            return value.replace('PATH_TO_WORKSPACE', sys.argv[2])
+        if isinstance(value, list):
+            return [replace_workspace(v) for v in value]
+        if isinstance(value, dict):
+            return {k: replace_workspace(v) for k, v in value.items()}
+        return value
+    data['mcpServers']['qmd'] = replace_workspace(data['mcpServers']['qmd'])
     with open(path, 'w') as f:
         json.dump(data, f, indent=2)
     print('  QMD enabled in .mcp.json')
 else:
     print('  QMD entry already enabled (or template missing __qmd_disabled key)')
-" "$MCP_JSON"
+" "$MCP_JSON" "$WORKSPACE_DIR"
         fi
     else
         echo "  No key entered — skipping QMD setup."

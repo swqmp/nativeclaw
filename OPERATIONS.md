@@ -177,7 +177,7 @@ API keys should live in the OS keychain, NOT in `.mcp.json` or shell rc files.
 
 ### MCP Health
 
-- **Probe:** `workspace/system/mcp-health/probe.js` runs every 15 min (cron: `mcp-probe`). Writes `probe-state.json`.
+- **Probe:** `workspace/system/mcp-health/probe.js` runs every 15 min (cron: `mcp-probe`). Writes `last-probe.json`.
 - **Status triage:** `bash workspace/system/scripts/mcp-status.sh [--quiet]` — silent if all Critical MCPs healthy + probe fresh (<120 min); loud otherwise. Use `--quiet` in session-start checklists.
 - **Criticality map:** `workspace/system/mcp-health/mcp-criticality.json` classifies each MCP as `critical` / `important` / `optional`. Agent checks before claiming a tool is "broken."
 - **Wrapper:** `workspace/system/mcp-health/mcp-wrapper.js` is a reusable init-replay supervisor. Wrap flaky MCPs in `.mcp.json` by setting `command: node` and `args: [.../mcp-wrapper.js, <original-command>, ...]`.
