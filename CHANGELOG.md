@@ -8,7 +8,7 @@ First major release focused on making the agent reliable out-of-box, not just fu
 - **5 AM ET session-day anchor:** `getCurrentSessionDay()` treats hours 00:00–04:59 ET as the previous calendar day so live sessions survive the midnight boundary. The 5:10 AM `session-audit` cron is now safety-net only, not the primary kill.
 - **Two-tier backend handoff:** `/codex` and `/claude` first try a source-owned summary; if the source backend can't produce one (crashing/empty/unresponsive), the bridge falls back to injecting the **last 20 raw transcript exchanges**. If neither tier produces context, the bridge ships nothing instead of guessing — the resumed backend just greets normally. Old "breadcrumb pointer" path removed.
 - **Collapsed Codex `CONTEXT_PROFILES`:** `chat` and `work` profiles merged into a single `chat` profile that injects SOUL + USER + TOOLS + NATIVECLAW + device + MEMORY + last 3 daily logs, matching Claude's primer for parity. `cron` profile remains lean. `detectContextProfile()` removed.
-- **`SESSION_START_COMPLETED_TODAY` flag:** New global flag in `state.json` so the SESSION START checklist runs once per calendar day instead of on every fresh session/thread switch. Both Claude and Codex primers honor it.
+- **`SESSION_START_COMPLETED_TODAY` flag:** New global flag in `state.json` so the SESSION START checklist runs once per 5 AM session day instead of on every fresh session/thread switch. Both Claude and Codex primers honor it.
 - **Per-day Claude/Codex session tracking:** `state.sessionDates` and `state.codexSessionDates` bind sessions/threads to the day they were created. Switching `/claude` ↔ `/codex` resumes the target backend's same-day session/thread instead of force-cold-starting it. True cold start happens at daily session audit, on `/reset`, or on `clearStoredSession()`.
 - **Codex execution serialization:** Codex user turns and Codex crons no longer launch in parallel. User priority — fixes the empty-response bug seen during overlapping heartbeat/task-queue runs.
 - **Codex rollover relaxed:** Thresholds bumped to 1.5 MB / 250 entries, missing rollout files no longer force fresh threads. Daily reset remains the main bound; rollover is a true safety valve.
@@ -26,7 +26,7 @@ First major release focused on making the agent reliable out-of-box, not just fu
 
 ### New — Reliability
 - **MCP wrapper supervisor:** `workspace/system/mcp-health/mcp-wrapper.js` — init replay, circuit breaker, auto-respawn. Fetches secrets from the platform keychain (macOS `security`, Linux `secret-tool`).
-- **MCP pre-flight probe:** `workspace/system/mcp-health/probe.js` — 15-minute health check (cron: `mcp-probe`). Writes `probe-state.json` consumed by session-start checklists.
+- **MCP pre-flight probe:** `workspace/system/mcp-health/probe.js` — 15-minute health check (cron: `mcp-probe`). Writes `last-probe.json` consumed by session-start checklists.
 - **MCP triage:** `workspace/system/scripts/mcp-status.sh` — classifies outages via `mcp-criticality.json` before escalating.
 - **Keychain tooling:** `keychain-add.sh` (macOS) / `keychain-add-linux.sh` (libsecret). API keys leave `.mcp.json` and move to the OS keychain.
 - **Secrets scanner:** `workspace/system/scripts/scan-secrets.sh` — daily sweep for accidentally-committed keys (cron: `secrets-scan` at 7:15 AM).
@@ -66,7 +66,7 @@ First major release focused on making the agent reliable out-of-box, not just fu
 ## v1.9.4 — Claude/Codex Backend Bridge
 
 ### Bridge (bridge.js)
-- **Codex backend support:** `/codex` switches from Claude to Codex, `/claude` switches back. Backend switches clear stale target sessions and carry continuity through curated handoff summaries.
+- **Codex backend support:** `/codex` switches from Claude to Codex, `/claude` switches back. Backend switches resume same-day target sessions/threads when available and carry continuity through curated handoff summaries.
 - **Symmetric handoffs:** `/codex` and `/claude` precompute handoff summaries during the slash command. `/codex --full` and `/claude --full` keep raw transcript replay as escape hatches.
 - **Sonnet handoff summaries:** Handoffs use Sonnet and include a deterministic latest-exchange block so short answers, IDs, tokens, command output, and test phrases survive backend switches.
 - **Codex model shortcuts:** `/5.4`, `/5.4-mini`, `/5.3-codex`, `/5.2`, `/5.2-codex`, `/5.1-codex-max`, and `/5.1-codex-mini`.

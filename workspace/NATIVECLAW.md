@@ -28,9 +28,10 @@ Backend switches use curated handoff summaries:
 - `/codex` switches Claude -> Codex
 - `/claude` switches Codex -> Claude
 - `--full` variants use raw transcript replay
-- switches clear stale target sessions/threads
+- same-day target sessions/threads are resumed when available
+- stale target sessions/threads are ignored after the 5 AM session-day boundary
 
-Continuity comes from the handoff summary and durable workspace files, not from resuming old target threads.
+Continuity comes from the handoff summary, resumed same-day backend context, and durable workspace files.
 
 ## Telegram Commands
 

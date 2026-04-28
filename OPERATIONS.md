@@ -91,14 +91,14 @@ schtasks /delete /tn "NativeClaw" /f
 
 ## Backend Handoffs
 
-Switching backends clears the stale target session/thread. Continuity comes from a generated handoff block, not from resuming old accumulated context.
+Switching backends pauses the current backend and resumes the target backend's same-day session/thread when available. Continuity comes from both the generated handoff block and the resumed target context.
 
 - `/codex` creates a Claude-to-Codex summary with the latest exchange copied verbatim.
 - `/claude` creates a Codex-to-Claude summary with the latest exchange copied verbatim.
 - `--full` uses raw transcript replay instead of summary.
 - Session-audit cron clears both Claude and Codex sessions after it runs.
 
-This keeps handoffs useful without hauling an old target thread back into the context window.
+Stale sessions/threads are ignored after the 5 AM session-day boundary, so backend switching keeps same-day context without hauling old accumulated context indefinitely.
 
 ## Verification
 

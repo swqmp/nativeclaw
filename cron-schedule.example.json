@@ -28,7 +28,7 @@
       "schedule": "20 * * * *",
       "timeout": 300,
       "model": "sonnet",
-      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. TASK QUEUE RECOVERY. Read $HOME/.claude/workspace/system/task-queue/queue.json. If any tasks have status 'pending' or 'rate-limited': attempt them now. Update status in queue.json. retryCount >= 5 = 'failed'. Do NOT message the user."
+      "prompt": "You are [Agent Name], a NativeClaw AI agent on [device], communicating via Telegram. TASK QUEUE RECOVERY. Read $NATIVECLAW_WORKSPACE/system/task-queue/queue.json. If any tasks have status 'pending' or 'rate-limited': attempt them now. Update status in queue.json. retryCount >= 5 = 'failed'. Do NOT message the user."
     },
     {
       "name": "session-audit",
@@ -49,7 +49,7 @@
       "schedule": "*/15 * * * *",
       "timeout": 120,
       "command": "node $NATIVECLAW_WORKSPACE/system/mcp-health/probe.js > $HOME/.claude/logs/mcp-probe.log 2>&1",
-      "comment": "Pre-flight MCP init probe. Writes to $NATIVECLAW_WORKSPACE/system/mcp-health/probe-state.json. No LLM turn."
+      "comment": "Pre-flight MCP init probe. Writes to $NATIVECLAW_WORKSPACE/system/mcp-health/last-probe.json. No LLM turn."
     },
     {
       "name": "secrets-scan",

@@ -15,7 +15,7 @@ v1.10 is mostly additive, but **the bridge runtime did change in two ways** wort
 - **Session day anchored at 05:00 ET** (configurable via `config.sessionTimeZone` or `NATIVECLAW_SESSION_TIMEZONE`). Sessions survive the midnight boundary — the daily `session-audit` cron is now a safety-net rotation trigger, not the primary kill.
 - **Two-tier backend handoff** on `/claude` ↔ `/codex` switches: source-summary first, last-20-message raw transcript replay as fallback, no-op if neither tier produces context. The previous breadcrumb-pointer scheme is removed; if you had any custom code reading `breadcrumb` fields from `state.json`, drop it.
 - **Per-day session/thread tracking:** `state.sessionDates` and `state.codexSessionDates` are new fields. The bridge back-fills them automatically from existing `state.sessions` / `state.codexSessions` on first start — no migration needed.
-- **`SESSION_START_COMPLETED_TODAY` flag** prevents the SESSION START checklist from running on every fresh session of the day. If you observe the checklist running mid-day after a fresh thread, check `state.sessionStartRanToday`.
+- **`SESSION_START_COMPLETED_TODAY` flag** prevents the SESSION START checklist from running on every fresh session of the same 5 AM session day. If you observe the checklist running mid-day after a fresh thread, check `state.sessionStartRanToday`.
 - **Codex execution is serialized**: user turns and crons no longer race. If you had cron entries scheduled tightly against user activity, they will now queue instead of running concurrently.
 - **Codex `CONTEXT_PROFILES` collapsed** from `chat`/`work`/`cron` to `chat`/`cron`. If you had custom `detectContextProfile()` overrides, remove them — the bridge no longer calls that function.
 

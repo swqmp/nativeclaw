@@ -31,7 +31,8 @@ from datetime import datetime, timezone
 map_path, mcp_path, probe_path, quiet_flag = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 quiet = quiet_flag == "1"
 mapping = json.load(open(map_path))
-configured = set(json.load(open(mcp_path)).get("mcpServers", {}).keys())
+raw_configured = set(json.load(open(mcp_path)).get("mcpServers", {}).keys())
+configured = {name for name in raw_configured if not name.startswith("__")}
 servers = mapping["servers"]
 
 probe = None
@@ -63,7 +64,11 @@ for name, info in rows:
     detail = probe_entry.get("detail", "") if probe_entry else ""
     critical_failures.append((name, status, detail))
 
-missing_from_config = [n for n in servers if n not in configured]
+required_tiers = {"critical", "important"}
+missing_from_config = [
+    n for n, info in servers.items()
+    if info["tier"] in required_tiers and n not in configured
+]
 unmapped = [n for n in configured if n not in servers]
 
 probe_missing = probe is None

@@ -54,6 +54,8 @@ const MCP_CONFIG = config.mcpConfig;
 const CRON_SCHEDULE_PATH = config.cronSchedule;
 const DEFAULT_MODEL = config.model || 'sonnet';
 const SESSION_DAY_TIMEZONE = config.sessionTimeZone || process.env.NATIVECLAW_SESSION_TIMEZONE || 'America/New_York';
+const AGENT_LABEL = config.agentName || 'the NativeClaw agent';
+const USER_LABEL = config.userName || 'the user';
 
 // Per-chat settings (model overrides, effort, verbosity, etc.)
 let chatSettings = {};
@@ -196,12 +198,20 @@ function log(msg) {
   fs.appendFileSync(LOG_PATH, line);
 }
 
+function nativeClawEnv() {
+  return {
+    NATIVECLAW_WORKSPACE: process.env.NATIVECLAW_WORKSPACE || WORKSPACE,
+    NATIVECLAW_PROJECT_DIR: process.env.NATIVECLAW_PROJECT_DIR || toClaudeProjectDir(WORKSPACE),
+    NATIVECLAW_KEYCHAIN_ACCOUNT: process.env.NATIVECLAW_KEYCHAIN_ACCOUNT || process.env.USER || process.env.USERNAME || 'nativeclaw',
+  };
+}
+
 // ============================================================
 // SESSION PRIMER — inject recent daily logs on fresh sessions
 // ============================================================
 // When a session is cleared (by /reset or session-audit cron), the next
 // message spawns a fresh claude -p with no memory of prior days. AGENTS.md
-// tells Whet to read the last 3 daily logs on session start, but that's a
+// tells the agent to read the last 3 daily logs on session start, but that's a
 // rule, not a mechanism. This injects the logs via --append-system-prompt
 // so they're guaranteed to be loaded.
 
@@ -272,18 +282,18 @@ const CODEX_BASE_CONTEXT_FILES = [
 
 const CODEX_PREAMBLE = `# CODEX BACKEND — OPERATING CONSTRAINTS
 
-You are Whet, running through the OpenAI Codex CLI as an alternate backend.
-Jamiah switched to you from Claude. You share the same identity (SOUL.md),
-user context (USER.md), tool notes (TOOLS.md), runtime notes (NATIVECLAW.md),
-device reference (device.md), and business memory (MEMORY.md when needed).
+You are ${AGENT_LABEL}, running through the OpenAI Codex CLI as an alternate backend.
+${USER_LABEL} switched to you from Claude. Continue using the same workspace identity
+(SOUL.md), user context (USER.md), tool notes (TOOLS.md), runtime notes
+(NATIVECLAW.md), device reference (device.md), and durable memory (MEMORY.md).
 
 ## What you CAN do
-- Read and write files on this Mac
-- Run shell commands (bash, python, node, git, etc.)
+- Read and write files on this device
+- Run available shell commands (python, node, git, etc.)
 - Chat, brainstorm, answer questions
 - Edit code, build websites, run scripts
-- Access the internet via shell tools (curl, etc.)
-- MCP tools — config is mirrored in ~/.codex/config.toml (QMD, email, calendar, Drive, Trello, GHL, HQ, etc.)
+- Access the internet via configured tools or shell commands when available
+- MCP tools — config can be mirrored in ~/.codex/config.toml for this install
 - Bridge-level cron jobs, heartbeats, and session-audit can run while either
   Claude or Codex is active. The bridge owns scheduling.
 
@@ -293,22 +303,23 @@ device reference (device.md), and business memory (MEMORY.md when needed).
 - Claude-specific flags (--append-system-prompt, --mcp-config, etc.)
 
 ## Rules that still apply
-- Identity, personality, tone from SOUL.md — you ARE Whet
+- Identity, personality, tone from SOUL.md
 - Git rules from AGENTS.md — never commit/push/deploy without permission
 - Honesty rules — never fabricate, never say "done" without doing it
 - Memory writes — use file-editing tools or python to write to workspace files
-- Client/business context from MEMORY.md; live task/client/pipeline data from NJDev HQ
+- Durable context from MEMORY.md; live external data comes from the configured tools/APIs
 - Tool-Use Enforcement from AGENTS.md — MUST call tools before answering data questions
 
-## Memory Retrieval (CRITICAL)
-You have access to QMD search_memory MCP tool. It semantically searches all daily
-logs, MEMORY.md, and feedback files. When the user asks about ANY client, lead,
-past event, decision, price, agreement, or history — call search_memory FIRST,
-then answer. Do NOT guess from standing context alone. The standing context is a
-summary; search_memory has the full history.
+## Memory Retrieval
+If the QMD search_memory MCP tool is configured, use it for history questions.
+It semantically searches daily logs, MEMORY.md, and feedback files. When the user
+asks about a person, company, past event, decision, price, agreement, or history,
+call search_memory before answering. If QMD is not enabled, use the best
+available local/tool-backed source instead of guessing from standing context.
 
 When you see instructions referencing Claude-specific features like Claude
-Code slash commands, skip them silently. MCP tools ARE available to you — use them.
+Code slash commands, skip them silently. MCP tools that are configured for
+Codex are available to you, so use them when the task requires tool-backed data.
 `;
 
 function extractLatestCheckpoint(logContent) {
@@ -378,7 +389,7 @@ function buildCodexCronContext() {
   return [
     '# CODEX CRON CONTEXT',
     '',
-    'You are Whet, running a scheduled background cron through the Telegram bridge.',
+    `You are ${AGENT_LABEL}, running a scheduled background cron through the Telegram bridge.`,
     `Workspace: ${WORKSPACE}`,
     '',
     'Rules:',
@@ -601,10 +612,7 @@ async function buildCodexHandoffSummary(threadId, options = {}) {
 function extractClaudeTranscriptExchanges(sessionId, maxExchanges = 30) {
   if (!sessionId) return [];
   try {
-    const transcriptDir = path.join(
-      HOME_DIR, '.claude', 'projects',
-      '-Users-iamiahbartlett--claude-workspace'
-    );
+    const transcriptDir = toClaudeProjectDir(WORKSPACE);
     const transcriptPath = path.join(transcriptDir, `${sessionId}.jsonl`);
     if (!fs.existsSync(transcriptPath)) return [];
 
@@ -706,7 +714,7 @@ async function buildClaudeHandoffSummary(sessionId) {
         '--max-turns', '1',
       ];
 
-      const cleanEnv = { ...process.env };
+      const cleanEnv = { ...process.env, ...nativeClawEnv() };
       delete cleanEnv.CLAUDECODE;
       delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
       delete cleanEnv.MCP_CLAUDE;
@@ -1054,10 +1062,7 @@ async function transcribeVoice(audioPath) {
 function extractFullResponseFromSession(sessionId) {
   if (!sessionId) return null;
   try {
-    const transcriptDir = path.join(
-      HOME_DIR, '.claude', 'projects',
-      '-Users-iamiahbartlett--claude-workspace'
-    );
+    const transcriptDir = toClaudeProjectDir(WORKSPACE);
     const transcriptPath = path.join(transcriptDir, `${sessionId}.jsonl`);
     if (!fs.existsSync(transcriptPath)) return null;
 
@@ -1206,12 +1211,7 @@ function runClaude(prompt, sessionId, options = {}) {
     // Strip only the "nested session" detection vars, keep session auth token.
     // Inject NATIVECLAW_* so downstream wrappers (mcp-wrapper.js, keychain helpers,
     // memory tooling) resolve per-install paths without hardcoding.
-    const cleanEnv = {
-      ...process.env,
-      NATIVECLAW_WORKSPACE: process.env.NATIVECLAW_WORKSPACE || WORKSPACE,
-      NATIVECLAW_PROJECT_DIR: process.env.NATIVECLAW_PROJECT_DIR || toClaudeProjectDir(WORKSPACE),
-      NATIVECLAW_KEYCHAIN_ACCOUNT: process.env.NATIVECLAW_KEYCHAIN_ACCOUNT || process.env.USER || process.env.USERNAME || 'nativeclaw',
-    };
+    const cleanEnv = { ...process.env, ...nativeClawEnv() };
     delete cleanEnv.CLAUDECODE;
     delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
     delete cleanEnv.MCP_CLAUDE;
@@ -1397,7 +1397,7 @@ function runCodex(prompt, threadId, options = {}) {
     // Defensive: clean up orphan MCPs from prior killed subprocesses before spawning
     reapOrphanMCPs();
 
-    const cleanEnv = { ...process.env };
+    const cleanEnv = { ...process.env, ...nativeClawEnv() };
     delete cleanEnv.CLAUDECODE;
     delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
     delete cleanEnv.MCP_CLAUDE;
@@ -1537,7 +1537,7 @@ async function runBackend(backend, prompt, options, sessionKey) {
         clearStoredSession('codex', sessionKey, `rollover: ${check.reason}`);
         saveState();
         threadId = null;
-        rolloverNote = `[System note: Prior Codex thread was auto-rolled over to prevent stall (${check.reason}). If you need conversation history beyond this message, read today's daily log in memory/ and search QMD via search_memory.]`;
+        rolloverNote = `[System note: Prior Codex thread was auto-rolled over to prevent stall (${check.reason}). If you need conversation history beyond this message, read today's daily log in memory/. If QMD/search_memory is configured, search it for deeper history.]`;
       } else if (check.missing) {
         log(`Codex thread ${threadId} has no rollout file yet; keeping the same-day thread and skipping rollover`);
       } else {
@@ -2352,7 +2352,7 @@ function runCronCommand(command, options = {}) {
 
     log(`Spawning cron command: ${command}`);
 
-    const cleanEnv = { ...process.env };
+    const cleanEnv = { ...process.env, ...nativeClawEnv() };
     delete cleanEnv.CLAUDECODE;
     delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
     delete cleanEnv.MCP_CLAUDE;

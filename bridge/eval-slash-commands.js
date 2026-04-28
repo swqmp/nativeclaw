@@ -105,6 +105,32 @@ const checks = [
       return patterns.filter((pattern) => !pattern.test(source)).map((pattern) => `missing ${pattern}`);
     },
   },
+  {
+    name: 'bridge templates do not hardcode one installed agent identity',
+    run() {
+      const forbidden = [
+        /\bWhet\b/,
+        /\bJamiah\b/,
+        /\bNJDev\b/,
+        /NJ Developments/,
+        /-Users-iamiahbartlett--claude-workspace/,
+      ];
+      return forbidden.filter((pattern) => pattern.test(source)).map((pattern) => `found ${pattern}`);
+    },
+  },
+  {
+    name: 'subprocesses receive NativeClaw path environment',
+    run() {
+      const patterns = [
+        /function nativeClawEnv/,
+        /NATIVECLAW_WORKSPACE/,
+        /NATIVECLAW_PROJECT_DIR/,
+        /NATIVECLAW_KEYCHAIN_ACCOUNT/,
+        /runCronCommand[\s\S]+nativeClawEnv\(\)/,
+      ];
+      return patterns.filter((pattern) => !pattern.test(source)).map((pattern) => `missing ${pattern}`);
+    },
+  },
 ];
 
 let failed = 0;

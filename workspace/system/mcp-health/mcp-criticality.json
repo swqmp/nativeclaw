@@ -11,9 +11,9 @@
   },
   "servers": {
     "qmd": {
-      "tier": "critical",
+      "tier": "optional",
       "purpose": "semantic memory search over daily logs, MEMORY.md, feedback/",
-      "fallback": "Grep across the workspace \u2014 slower, no semantic matching"
+      "fallback": "Grep across the workspace \u2014 slower, no semantic matching. If you rely on QMD heavily, change this tier to critical after enabling it in .mcp.json."
     },
     "google-calendar": {
       "tier": "important",

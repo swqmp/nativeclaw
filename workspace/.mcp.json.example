@@ -1,5 +1,5 @@
 {
-  "__note_qmd": "Enable QMD semantic memory search. Requires GEMINI_API_KEY stored via `bash workspace/system/scripts/keychain-add.sh GEMINI_API_KEY`. Rename __qmd_disabled to qmd to activate.",
+  "__note_qmd": "Enable QMD semantic memory search. Requires GEMINI_API_KEY stored via `bash system/scripts/keychain-add.sh GEMINI_API_KEY` from the workspace root. Rename __qmd_disabled to qmd to activate.",
   "mcpServers": {
     "__qmd_disabled": {
       "command": "node",

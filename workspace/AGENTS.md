@@ -54,10 +54,10 @@ These override everything. Tuned for anti-hallucination and anti-slop.
 
 System files (SOUL, USER, MEMORY, TOOLS, NATIVECLAW, device, this file) are already injected via the bridge's context profiles — don't re-read them.
 
-1. **Backup:** `bash workspace/system/scripts/snapshot-memory.sh`
+1. **Backup:** `bash system/scripts/snapshot-memory.sh`
 2. **Daily logs:** Read the 3 most recent `memory/YYYY-MM-DD.md` files (not injected).
-3. **Task queue:** Check `workspace/system/task-queue/queue.json` for work carried over from rate-limited / crashed prior sessions.
-4. **MCP health:** `bash workspace/system/scripts/mcp-status.sh --quiet` — silent if all critical MCPs are healthy. Loud if a critical MCP is broken or the health probe is stale (>120 min). Surface any output in your greet.
+3. **Task queue:** Check `system/task-queue/queue.json` for work carried over from rate-limited / crashed prior sessions.
+4. **MCP health:** `bash system/scripts/mcp-status.sh --quiet` — silent if all critical MCPs are healthy. Loud if a critical MCP is broken or the health probe is stale (>120 min). Surface any output in your greet.
 5. **Greet with context:** reference the last session, mention any carryover work, ask what's on deck.
 
 **DO NOT skip. DO NOT respond to the user before completing all 5 steps.**
@@ -67,7 +67,7 @@ System files (SOUL, USER, MEMORY, TOOLS, NATIVECLAW, device, this file) are alre
 When you just got compacted, system files survive via the system prompt, but conversation state was summarized away. You MUST:
 
 1. Re-read `feedback/*.md` for any task type you're about to produce.
-2. Check `workspace/system/task-queue/queue.json` if you were mid-task.
+2. Check `system/task-queue/queue.json` if you were mid-task.
 3. Re-read today's `memory/YYYY-MM-DD.md` for session context.
 4. If you can't remember what task you were just working on, you've been compacted — follow this protocol before responding.
 
@@ -91,30 +91,30 @@ The `hooks/memory-check.sh` UserPromptSubmit hook injects a "⚡ MEMORY CHECK" r
 
 | File | Purpose |
 |------|---------|
-| `workspace/SOUL.md` | Identity, personality, voice |
-| `workspace/USER.md` | Who the user is — role, goals, constraints |
-| `workspace/MEMORY.md` | Durable business/project/life context |
-| `workspace/TOOLS.md` | Tool setup, credentials locations, MCP notes |
-| `workspace/AGENTS.md` | This file — hard rules |
-| `workspace/NATIVECLAW.md` | Runtime architecture (backends, cron, bridge) |
-| `workspace/device.md` | Device-specific restart commands |
-| `workspace/feedback/*.md` | Correction log by task type |
-| `workspace/memory/YYYY-MM-DD.md` | Daily checkpoints |
-| `workspace/HEARTBEAT.md` | Heartbeat cron instructions |
+| `SOUL.md` | Identity, personality, voice |
+| `USER.md` | Who the user is — role, goals, constraints |
+| `MEMORY.md` | Durable business/project/life context |
+| `TOOLS.md` | Tool setup, credentials locations, MCP notes |
+| `AGENTS.md` | This file — hard rules |
+| `NATIVECLAW.md` | Runtime architecture (backends, cron, bridge) |
+| `device.md` | Device-specific restart commands |
+| `feedback/*.md` | Correction log by task type |
+| `memory/YYYY-MM-DD.md` | Daily checkpoints |
+| `HEARTBEAT.md` | Heartbeat cron instructions |
 
 ---
 
 ## Operational Rules
 
 ### Sub-Agent Tracking
-When you spawn a sub-agent, write to `workspace/system/active-subagents.json`:
+When you spawn a sub-agent, write to `system/active-subagents.json`:
 ```json
 {"id": "<session_id>", "task": "<description>", "spawned": "<ISO>", "status": "running"}
 ```
 On completion, update status to `completed` or `failed` with a summary. The file IS the reference. Never say "I lost it."
 
 ### MCP Disconnect Decision
-When an MCP tool errors mid-task, check `workspace/system/mcp-health/mcp-criticality.json` (or run `bash workspace/system/scripts/mcp-status.sh`) before escalating.
+When an MCP tool errors mid-task, check `system/mcp-health/mcp-criticality.json` (or run `bash system/scripts/mcp-status.sh`) before escalating.
 - **Critical** MCPs: escalate to user for restart — workflow will fail or fabricate without them.
 - **Important** MCPs: try the documented fallback first, note the degradation, continue.
 - **Optional** MCPs: skip the feature, continue without restart ask.
@@ -127,7 +127,7 @@ First successful use of a new tool, API, database, or capability → write it to
 Before every checkpoint, ask: did I use anything new that's not in TOOLS.md? If yes, write it first.
 
 ### Video Links
-You cannot watch video directly. Extract caption + transcript via `bash workspace/system/scripts/video-extract.sh "<url>"`. Fallback: native browser snapshot → read page text.
+You cannot watch video directly. Extract caption + transcript via `bash system/scripts/video-extract.sh "<url>"`. Fallback: native browser snapshot → read page text.
 
 NEVER claim you "watched" a video or fabricate what it shows.
 
@@ -180,16 +180,16 @@ When the user establishes a rule:
 
 ## Overnight / AFK
 
-When the user goes AFK with pending work, follow `workspace/system/OVERNIGHT_PROTOCOL.md` (ships as a stub — fill in with your workflow).
+When the user goes AFK with pending work, follow `system/OVERNIGHT_PROTOCOL.md` (ships as a stub — fill in with your workflow).
 
 ## Skills
 
-On every new task, read `workspace/skills/SKILL_INDEX.md` and load matched skills (max 3). No match = no skill. Don't force-fit.
+On every new task, read `skills/SKILL_INDEX.md` and load matched skills (max 3). No match = no skill. Don't force-fit.
 
 ## Heartbeats
 
-Follow `workspace/HEARTBEAT.md` strictly.
+Follow `HEARTBEAT.md` strictly.
 
 ## Platform Formatting
 
-For Discord, WhatsApp, Telegram formatting rules, read `workspace/system/PLATFORM_FORMATTING.md`.
+For Discord, WhatsApp, Telegram formatting rules, read `system/PLATFORM_FORMATTING.md`.

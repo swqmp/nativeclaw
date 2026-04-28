@@ -15,9 +15,9 @@ Without QMD your agent has amnesia. Every time you reference a client, a past de
 
 1. Store your key in the system keychain (not inline in `.mcp.json`):
    ```bash
-   bash workspace/system/scripts/keychain-add.sh GEMINI_API_KEY
+   bash system/scripts/keychain-add.sh GEMINI_API_KEY
    ```
-2. Enable the qmd entry in `workspace/.mcp.json` (it ships commented out by default).
+2. Enable the qmd entry in `.mcp.json` (it ships commented out by default).
 3. Restart the agent. First boot takes ~30s to build the index.
 
 ## Tools exposed
@@ -28,7 +28,7 @@ Without QMD your agent has amnesia. Every time you reference a client, a past de
 
 ## Index location
 
-`workspace/system/mcp/qmd/index.json` — regenerated via `reindex_memory`. Grows with your daily logs; safe to delete, will rebuild on next search.
+`system/mcp/qmd/index.json` — regenerated via `reindex_memory`. Grows with your daily logs; safe to delete, will rebuild on next search.
 
 ## Hard rule (AGENTS.md enforces this)
 
