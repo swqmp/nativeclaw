@@ -1,14 +1,29 @@
 # Upgrading to v1.10 from v1.9.x
 
-v1.10 is additive — nothing in the bridge runtime changed. Your existing Telegram/Claude/Codex setup keeps working. This guide is about adopting the new agent reliability stack into an existing install.
+v1.10 is mostly additive, but **the bridge runtime did change in two ways** worth a quick look (session/backend behavior + file-type allowlist). Your existing Telegram/Claude/Codex setup keeps working with no config changes — but the new behavior is automatic, so a `git pull` + restart is enough.
 
 ## TL;DR
 
 1. `git pull` in your nativeclaw checkout.
-2. `bash setup.sh` again — the wizard is idempotent. It will only copy files that are missing and ask about new optional pieces (QMD, prompt hooks).
-3. Optional per-feature adoption below.
+2. Replace your installed `bridge.js` with the new one (or re-run `setup.sh` — wizard is idempotent and will only copy missing files / ask about new optional pieces).
+3. Restart the bridge.
+4. Optional per-feature adoption below.
 
-## What changed
+## What changed in the bridge runtime
+
+### Session & backend behavior
+- **Session day anchored at 05:00 ET** (configurable via `config.sessionTimeZone` or `NATIVECLAW_SESSION_TIMEZONE`). Sessions survive the midnight boundary — the daily `session-audit` cron is now a safety-net rotation trigger, not the primary kill.
+- **Two-tier backend handoff** on `/claude` ↔ `/codex` switches: source-summary first, last-20-message raw transcript replay as fallback, no-op if neither tier produces context. The previous breadcrumb-pointer scheme is removed; if you had any custom code reading `breadcrumb` fields from `state.json`, drop it.
+- **Per-day session/thread tracking:** `state.sessionDates` and `state.codexSessionDates` are new fields. The bridge back-fills them automatically from existing `state.sessions` / `state.codexSessions` on first start — no migration needed.
+- **`SESSION_START_COMPLETED_TODAY` flag** prevents the SESSION START checklist from running on every fresh session of the day. If you observe the checklist running mid-day after a fresh thread, check `state.sessionStartRanToday`.
+- **Codex execution is serialized**: user turns and crons no longer race. If you had cron entries scheduled tightly against user activity, they will now queue instead of running concurrently.
+- **Codex `CONTEXT_PROFILES` collapsed** from `chat`/`work`/`cron` to `chat`/`cron`. If you had custom `detectContextProfile()` overrides, remove them — the bridge no longer calls that function.
+
+### File attachments
+- **HEIC/HEIF (iPhone photos), RTF, ODT/ODS/ODP, EPUB, YAML/TOML, EML/MSG, TEX, IPYNB, `.log`, and `.ppt` (legacy Office)** now accepted by the document handler. No config change required.
+- Image extension fallback (`.jpg/.png/.webp/.heic/...`) catches the case where Telegram strips MIME on document-style sends.
+
+## What changed elsewhere (additive, opt-in)
 
 - New files under `workspace/system/` (mcp-health, scripts, mcp/qmd, task-queue), `workspace/skills/`, `workspace/feedback/`, `hooks/`
 - AGENTS.md got a full rewrite. `setup.sh` will **not** overwrite your existing AGENTS.md.

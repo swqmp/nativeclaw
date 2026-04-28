@@ -3,7 +3,7 @@
 // Telegram Bridge for Claude Code Native Setup
 // Custom built — no external dependencies, Node.js built-in modules only
 // Handles: Telegram message reception/response + cron job scheduling
-// Version: 1.9.4 — unified effort/verbosity controls
+// Version: 1.10.0 — agent reliability stack (memory, MCP health, context preservation, QoL)
 //
 // Architecture:
 //   Telegram polling → message queue → claude -p subprocess → response back to Telegram
@@ -53,6 +53,7 @@ const CRON_WORKSPACE = path.join(config.workspace, 'cron-workspace');
 const MCP_CONFIG = config.mcpConfig;
 const CRON_SCHEDULE_PATH = config.cronSchedule;
 const DEFAULT_MODEL = config.model || 'sonnet';
+const SESSION_DAY_TIMEZONE = config.sessionTimeZone || process.env.NATIVECLAW_SESSION_TIMEZONE || 'America/New_York';
 
 // Per-chat settings (model overrides, effort, verbosity, etc.)
 let chatSettings = {};
@@ -61,9 +62,12 @@ let chatSettings = {};
 let state = {
   updateOffset: 0,
   sessions: {},         // { chatId: string } — Claude session IDs (legacy flat shape, kept for compat)
+  sessionDates: {},     // { chatId: "YYYY-MM-DD" } — day bound for Claude sessions
   codexSessions: {},    // { chatId: string } — Codex thread IDs
+  codexSessionDates: {},// { chatId: "YYYY-MM-DD" } — day bound for Codex sessions
   backends: {},         // { chatId: "claude" | "codex" }
   pendingTransfer: {},  // { chatId: {from, to, context?} } — one-shot flag to inject cross-backend context on next message
+  sessionStartRanToday: '',  // YYYY-MM-DD — set once SESSION START ran today on either backend; implicitly cleared when day rolls (5 AM ET anchor)
   exchangeCount: {},
 };
 if (fs.existsSync(STATE_PATH)) {
@@ -72,9 +76,19 @@ if (fs.existsSync(STATE_PATH)) {
     state = { ...state, ...loaded };
     // Back-fill any missing fields from older state.json versions
     if (!state.exchangeCount) state.exchangeCount = {};
+    if (!state.sessionDates) state.sessionDates = {};
     if (!state.codexSessions) state.codexSessions = {};
+    if (!state.codexSessionDates) state.codexSessionDates = {};
     if (!state.backends) state.backends = {};
     if (!state.pendingTransfer) state.pendingTransfer = {};
+    if (typeof state.sessionStartRanToday !== 'string') state.sessionStartRanToday = '';
+    const today = getCurrentSessionDay();
+    for (const [cid, sid] of Object.entries(state.sessions)) {
+      if (sid && !state.sessionDates[cid]) state.sessionDates[cid] = today;
+    }
+    for (const [cid, tid] of Object.entries(state.codexSessions)) {
+      if (tid && !state.codexSessionDates[cid]) state.codexSessionDates[cid] = today;
+    }
     // Restore persisted chat settings (model choices survive restart)
     if (loaded.chatSettings) {
       for (const [cid, s] of Object.entries(loaded.chatSettings)) {
@@ -90,22 +104,74 @@ function getBackend(chatId) {
   return state.backends[String(chatId)] || config.defaultBackend || 'claude';
 }
 
+function getCurrentSessionDay(date = new Date()) {
+  // Session day anchored at 05:00 ET. Hours 00:00-04:59 ET count as the previous day
+  // so mid-conversation midnight does not force-kill a live session. The 5:10 AM
+  // session-audit cron is the safety-net rotation trigger.
+  const etHourParts = new Intl.DateTimeFormat('en-US', {
+    timeZone: SESSION_DAY_TIMEZONE,
+    hour: 'numeric',
+    hourCycle: 'h23',
+  }).formatToParts(date);
+  const etHour = parseInt((etHourParts.find((p) => p.type === 'hour') || { value: '0' }).value, 10);
+  const anchorDate = etHour < 5 ? new Date(date.getTime() - 24 * 60 * 60 * 1000) : date;
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: SESSION_DAY_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(anchorDate);
+  const values = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function getSessionStores(kind) {
+  if (kind === 'codex') {
+    return { ids: state.codexSessions, dates: state.codexSessionDates, label: 'Codex thread' };
+  }
+  return { ids: state.sessions, dates: state.sessionDates, label: 'Claude session' };
+}
+
+function clearStoredSession(kind, chatId, reason = '') {
+  const key = String(chatId);
+  const { ids, dates, label } = getSessionStores(kind);
+  const id = ids[key];
+  if (reason && id) {
+    log(`${label} ${id} cleared for ${key}: ${reason}`);
+  }
+  delete ids[key];
+  delete dates[key];
+}
+
+function getStoredSessionId(kind, chatId) {
+  const key = String(chatId);
+  const today = getCurrentSessionDay();
+  const { ids, dates, label } = getSessionStores(kind);
+  const id = ids[key];
+  if (!id) return null;
+  const sessionDay = dates[key];
+  if (sessionDay === today) return id;
+  log(`${label} ${id} for ${key} is stale (stored=${sessionDay || 'unknown'}, today=${today}); ignoring it`);
+  clearStoredSession(kind, chatId);
+  saveState();
+  return null;
+}
+
+function setStoredSessionId(kind, chatId, id) {
+  const key = String(chatId);
+  const { ids, dates } = getSessionStores(kind);
+  ids[key] = id;
+  dates[key] = getCurrentSessionDay();
+}
+
 function setBackend(chatId, backend, transfer = undefined) {
   const key = String(chatId);
   const prev = getBackend(chatId);
   state.backends[key] = backend;
   if (prev !== backend) {
-    // Backend switches should be clean handoffs, not resumes of old target
-    // backend threads. The transfer summary carries continuity; stale target
-    // sessions are what caused massive cumulative Codex token usage.
-    if (backend === 'codex') {
-      if (state.codexSessions[key]) log(`Switch ${prev}→${backend}: clearing stale Codex thread ${state.codexSessions[key]} for ${key}`);
-      delete state.codexSessions[key];
-    } else if (backend === 'claude') {
-      if (state.sessions[key]) log(`Switch ${prev}→${backend}: clearing stale Claude session ${state.sessions[key]} for ${key}`);
-      delete state.sessions[key];
-    }
-    delete state.exchangeCount[key];
+    // Daily backend sessions are paused/resumed across switches. Continuity
+    // still flows through a handoff, but the target backend keeps its own
+    // same-day session/thread unless the daily reset or explicit recovery clears it.
     // Queue a one-shot context transfer on the next message.
     // `transfer.context` can be precomputed by slash commands so the first
     // real message on the new backend does not pay the handoff latency.
@@ -135,15 +201,16 @@ function log(msg) {
 // ============================================================
 // When a session is cleared (by /reset or session-audit cron), the next
 // message spawns a fresh claude -p with no memory of prior days. AGENTS.md
-// tells the agent to read recent daily logs on session start, but that's a
+// tells Whet to read the last 3 daily logs on session start, but that's a
 // rule, not a mechanism. This injects the logs via --append-system-prompt
 // so they're guaranteed to be loaded.
 
-function buildSessionPrimer() {
+function buildSessionPrimer(options = {}) {
+  const sessionStartDone = Boolean(options.sessionStartDone);
   try {
     if (!fs.existsSync(MEMORY_DIR)) return null;
     const files = fs.readdirSync(MEMORY_DIR)
-      .filter(f => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
+      .filter((f) => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
       .sort()
       .reverse()
       .slice(0, 3);
@@ -164,6 +231,8 @@ function buildSessionPrimer() {
     return [
       '# RECENT CONTEXT (auto-injected on fresh session)',
       '',
+      `SESSION_START_COMPLETED_TODAY=${sessionStartDone ? 'true' : 'false'}`,
+      '',
       'Your session was cleared since the last conversation. Below are the 3 most recent daily logs so you have continuity. Read them before responding to the user\'s message.',
       '',
       sections.join('\n\n'),
@@ -179,7 +248,8 @@ function buildSessionPrimer() {
 // ============================================================
 
 const CODEX_MODELS = {
-  '5.4':             { id: 'gpt-5.4',             display: 'GPT-5.4 (frontier, default)' },
+  '5.5':             { id: 'gpt-5.5',             display: 'GPT-5.5 (frontier, default)' },
+  '5.4':             { id: 'gpt-5.4',             display: 'GPT-5.4' },
   '5.4-mini':        { id: 'gpt-5.4-mini',        display: 'GPT-5.4 Mini' },
   '5.3-codex':       { id: 'gpt-5.3-codex',       display: 'GPT-5.3 Codex' },
   '5.2':             { id: 'gpt-5.2',             display: 'GPT-5.2' },
@@ -187,7 +257,7 @@ const CODEX_MODELS = {
   '5.1-codex-max':   { id: 'gpt-5.1-codex-max',   display: 'GPT-5.1 Codex Max' },
   '5.1-codex-mini':  { id: 'gpt-5.1-codex-mini',  display: 'GPT-5.1 Codex Mini' },
 };
-const CODEX_DEFAULT_MODEL = 'gpt-5.4';
+const CODEX_DEFAULT_MODEL = 'gpt-5.5';
 const HANDOFF_SUMMARY_MODEL = 'sonnet';
 
 // Files to inject as standing context on fresh Codex threads.
@@ -202,18 +272,18 @@ const CODEX_BASE_CONTEXT_FILES = [
 
 const CODEX_PREAMBLE = `# CODEX BACKEND — OPERATING CONSTRAINTS
 
-You are a NativeClaw agent running through the OpenAI Codex CLI as an alternate backend.
-The user switched to you from Claude. You share the same identity (SOUL.md),
+You are Whet, running through the OpenAI Codex CLI as an alternate backend.
+Jamiah switched to you from Claude. You share the same identity (SOUL.md),
 user context (USER.md), tool notes (TOOLS.md), runtime notes (NATIVECLAW.md),
 device reference (device.md), and business memory (MEMORY.md when needed).
 
 ## What you CAN do
-- Read and write files on this device
+- Read and write files on this Mac
 - Run shell commands (bash, python, node, git, etc.)
 - Chat, brainstorm, answer questions
 - Edit code, build websites, run scripts
 - Access the internet via shell tools (curl, etc.)
-- MCP tools — config is mirrored in ~/.codex/config.toml when Codex tool access is configured
+- MCP tools — config is mirrored in ~/.codex/config.toml (QMD, email, calendar, Drive, Trello, GHL, HQ, etc.)
 - Bridge-level cron jobs, heartbeats, and session-audit can run while either
   Claude or Codex is active. The bridge owns scheduling.
 
@@ -223,11 +293,11 @@ device reference (device.md), and business memory (MEMORY.md when needed).
 - Claude-specific flags (--append-system-prompt, --mcp-config, etc.)
 
 ## Rules that still apply
-- Identity, personality, tone from SOUL.md
+- Identity, personality, tone from SOUL.md — you ARE Whet
 - Git rules from AGENTS.md — never commit/push/deploy without permission
 - Honesty rules — never fabricate, never say "done" without doing it
 - Memory writes — use file-editing tools or python to write to workspace files
-- Long-term context from MEMORY.md; live data should come from the configured source-of-truth tool
+- Client/business context from MEMORY.md; live task/client/pipeline data from NJDev HQ
 - Tool-Use Enforcement from AGENTS.md — MUST call tools before answering data questions
 
 ## Memory Retrieval (CRITICAL)
@@ -251,48 +321,19 @@ function extractLatestCheckpoint(logContent) {
 }
 
 // Context profiles control how much gets injected per interaction type.
-const CONTEXT_PROFILES = {
-  chat: {
-    files: CODEX_BASE_CONTEXT_FILES,
-    injectCheckpoint: true,
-    injectMemory: false,
-  },
-  work: {
-    files: [...CODEX_BASE_CONTEXT_FILES, 'MEMORY.md'],
-    injectCheckpoint: true,
-    injectMemory: false,
-  },
-  cron: {
-    files: [],
-    injectCheckpoint: false,
-    injectMemory: false,
-  },
-};
+// Codex standing context mirrors Claude's fresh-session primer for parity:
+// - All chat turns get SOUL + USER + TOOLS + MEMORY + NATIVECLAW + device.
+//   (AGENTS.md is auto-loaded by Codex from the workspace.)
+// - Fresh threads also get the last 3 full daily logs, matching Claude.
+// `work` and `chat` profiles collapsed into one. `cron` path uses buildCodexCronContext
+// directly and does not pass through this function.
+const CODEX_STANDING_FILES = [...CODEX_BASE_CONTEXT_FILES, 'MEMORY.md'];
 
-function detectContextProfile(prompt) {
-  const lower = (prompt || '').toLowerCase();
-  const workSignals = [
-    'build', 'fix', 'deploy', 'update', 'create', 'implement', 'add', 'remove',
-    'edit', 'write', 'code', 'debug', 'test', 'review', 'check', 'run',
-    'client', 'project', 'task', 'pipeline', 'website', 'site', 'page',
-    'api', 'endpoint', 'database', 'server', 'css', 'html', 'js',
-    'email', 'send', 'draft', 'schedule', 'call', 'meeting',
-    'trello', 'linear', 'hq', 'drive', 'sheet', 'doc',
-    'codex', 'claude', 'backend', 'bridge', 'config', 'agent',
-    'system', 'heartbeat', 'cron', 'nativeclaw', 'tools', 'memory',
-  ];
-  for (const signal of workSignals) {
-    if (lower.includes(signal)) return 'work';
-  }
-  return 'chat';
-}
-
-function buildCodexContext(profile) {
-  profile = profile || 'work';
-  const cfg = CONTEXT_PROFILES[profile] || CONTEXT_PROFILES.work;
+function buildCodexContext(options = {}) {
+  const sessionStartDone = Boolean(options.sessionStartDone);
   const sections = [];
 
-  for (const fname of cfg.files) {
+  for (const fname of CODEX_STANDING_FILES) {
     const fpath = path.join(WORKSPACE, fname);
     try {
       if (!fs.existsSync(fpath)) continue;
@@ -302,32 +343,30 @@ function buildCodexContext(profile) {
     } catch {}
   }
 
-  if (cfg.injectCheckpoint) {
-    try {
-      if (fs.existsSync(MEMORY_DIR)) {
-        const files = fs.readdirSync(MEMORY_DIR)
-          .filter(f => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
-          .sort()
-          .reverse();
-        for (const f of files.slice(0, 2)) {
-          try {
-            const content = fs.readFileSync(path.join(MEMORY_DIR, f), 'utf8').trim();
-            if (content.length < 100) continue;
-            const checkpoint = extractLatestCheckpoint(content);
-            if (checkpoint) {
-              sections.push(`=== memory/${f} (latest checkpoint) ===\n${checkpoint}`);
-              break;
-            }
-          } catch {}
-        }
+  // Inject last 3 full daily logs on fresh thread (matches Claude primer)
+  try {
+    if (fs.existsSync(MEMORY_DIR)) {
+      const files = fs.readdirSync(MEMORY_DIR)
+        .filter((f) => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
+        .sort()
+        .reverse()
+        .slice(0, 3);
+      for (const f of files) {
+        try {
+          const content = fs.readFileSync(path.join(MEMORY_DIR, f), 'utf8').trim();
+          if (content.length < 100) continue;
+          sections.push(`=== memory/${f} ===\n${content}`);
+        } catch {}
       }
-    } catch {}
-  }
+    }
+  } catch {}
 
   if (sections.length === 0) return '';
 
   return [
-    `# STANDING CONTEXT (profile: ${profile})`,
+    '# STANDING CONTEXT',
+    '',
+    `SESSION_START_COMPLETED_TODAY=${sessionStartDone ? 'true' : 'false'}`,
     '',
     sections.join('\n\n'),
     '',
@@ -339,7 +378,7 @@ function buildCodexCronContext() {
   return [
     '# CODEX CRON CONTEXT',
     '',
-    'You are a NativeClaw agent running a scheduled background cron through the Telegram bridge.',
+    'You are Whet, running a scheduled background cron through the Telegram bridge.',
     `Workspace: ${WORKSPACE}`,
     '',
     'Rules:',
@@ -488,7 +527,7 @@ function buildLatestExchangeBlock(exchanges, label) {
 
 // Generate a meta-prompt handoff summary from Codex back to Claude.
 // Returns a formatted handoff block, or null on failure (caller falls back to raw replay).
-async function buildCodexHandoffSummary(threadId) {
+async function buildCodexHandoffSummary(threadId, options = {}) {
   if (!threadId) return null;
   try {
     const exchanges = extractCodexTranscriptExchanges(threadId, 30);
@@ -522,62 +561,17 @@ async function buildCodexHandoffSummary(threadId) {
       'Output ONLY the handoff brief. No preamble.',
     ].join('\n');
 
-    log(`Generating Codex→Claude handoff summary for thread ${threadId}...`);
-
-    const summary = await new Promise((resolve) => {
-      const args = [
-        '-p', metaPrompt,
-        '--output-format', 'json',
-        '--dangerously-skip-permissions',
-        '--model', HANDOFF_SUMMARY_MODEL,
-        '--max-turns', '1',
-      ];
-
-      const cleanEnv = { ...process.env };
-      delete cleanEnv.CLAUDECODE;
-      delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
-      delete cleanEnv.MCP_CLAUDE;
-
-      const proc = spawn('claude', args, {
-        cwd: WORKSPACE,
-        env: cleanEnv,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-
-      let stdout = '';
-      proc.stdout.on('data', (d) => { stdout += d.toString(); });
-      proc.stderr.on('data', () => {}); // suppress stderr noise
-
-      const timer = setTimeout(() => {
-        proc.kill('SIGTERM');
-        log(`Codex→Claude handoff summary timed out for thread ${threadId}`);
-        resolve(null);
-      }, 45000);
-
-      proc.on('close', () => {
-        clearTimeout(timer);
-        try {
-          const lines = stdout.trim().split('\n');
-          for (let i = lines.length - 1; i >= 0; i--) {
-            try {
-              const parsed = JSON.parse(lines[i]);
-              if (parsed.type === 'result') {
-                resolve(parsed.result || parsed.message || null);
-                return;
-              }
-            } catch {}
-          }
-          resolve(stdout.trim() || null);
-        } catch {
-          resolve(null);
-        }
-      });
-
-      proc.on('error', () => {
-        clearTimeout(timer);
-        resolve(null);
-      });
-    });
+    log(`Generating Codex→Claude handoff summary with Codex for thread ${threadId}...`);
+    const summaryResult = await withCodexExecutionLock('user', `handoff:${threadId}`, () =>
+      runCodex(metaPrompt, null, {
+        timeout: 45,
+        idleTimeout: 45,
+        codexModel: options.codexModel || CODEX_DEFAULT_MODEL,
+        effort: options.effort || 'medium',
+        codexVerbosity: options.codexVerbosity || null,
+      })
+    );
+    const summary = summaryResult?.text || null;
 
     if (!summary) {
       log(`Codex→Claude handoff summary returned empty — falling back to transcript replay`);
@@ -602,33 +596,16 @@ async function buildCodexHandoffSummary(threadId) {
   }
 }
 
-function findClaudeTranscriptPath(sessionId) {
-  if (!sessionId) return null;
-  const projectsRoot = path.join(HOME_DIR, '.claude', 'projects');
-  try {
-    if (!fs.existsSync(projectsRoot)) return null;
-
-    const dirs = fs.readdirSync(projectsRoot, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => path.join(projectsRoot, entry.name));
-
-    for (const dir of dirs) {
-      const candidate = path.join(dir, `${sessionId}.jsonl`);
-      if (fs.existsSync(candidate)) return candidate;
-    }
-  } catch (err) {
-    log(`findClaudeTranscriptPath failed: ${err.message}`);
-  }
-  return null;
-}
-
 // Extract the last N user/assistant exchanges from a Claude session transcript.
 // Shared by buildClaudeTranscriptReplay and buildClaudeHandoffSummary.
 function extractClaudeTranscriptExchanges(sessionId, maxExchanges = 30) {
   if (!sessionId) return [];
   try {
-    const transcriptPath = findClaudeTranscriptPath(sessionId);
-    if (!transcriptPath) return [];
+    const transcriptDir = path.join(
+      HOME_DIR, '.claude', 'projects',
+      '-Users-iamiahbartlett--claude-workspace'
+    );
+    const transcriptPath = path.join(transcriptDir, `${sessionId}.jsonl`);
     if (!fs.existsSync(transcriptPath)) return [];
 
     const lines = fs.readFileSync(transcriptPath, 'utf8').trim().split('\n');
@@ -830,30 +807,18 @@ async function tg(method, params = {}) {
 }
 
 async function sendPhoto(chatId, imagePath, caption = '') {
+  const FormData = require('form-data');
   const https = require('https');
   return new Promise((resolve, reject) => {
-    const boundary = '----NativeClawBoundary' + Math.random().toString(36).slice(2);
-    const fileName = path.basename(imagePath);
-    const fileBuffer = fs.readFileSync(imagePath);
-    const parts = [
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`),
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="${fileName}"\r\nContent-Type: image/${path.extname(fileName).slice(1) || 'png'}\r\n\r\n`),
-      fileBuffer,
-      Buffer.from('\r\n'),
-    ];
-    if (caption) {
-      parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`));
-    }
-    parts.push(Buffer.from(`--${boundary}--\r\n`));
-    const body = Buffer.concat(parts);
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    form.append('photo', fs.createReadStream(imagePath));
+    if (caption) form.append('caption', caption);
     const options = {
       method: 'POST',
       host: 'api.telegram.org',
       path: `/bot${BOT_TOKEN}/sendPhoto`,
-      headers: {
-        'Content-Type': `multipart/form-data; boundary=${boundary}`,
-        'Content-Length': body.length,
-      },
+      headers: form.getHeaders(),
     };
     const req = https.request(options, res => {
       let body = '';
@@ -867,8 +832,7 @@ async function sendPhoto(chatId, imagePath, caption = '') {
       });
     });
     req.on('error', err => { log(`sendPhoto error: ${err.message}`); sendMessage(chatId, `[Image failed to send: ${err.message}]`); reject(err); });
-    req.write(body);
-    req.end();
+    form.pipe(req);
   });
 }
 
@@ -1090,8 +1054,11 @@ async function transcribeVoice(audioPath) {
 function extractFullResponseFromSession(sessionId) {
   if (!sessionId) return null;
   try {
-    const transcriptPath = findClaudeTranscriptPath(sessionId);
-    if (!transcriptPath) return null;
+    const transcriptDir = path.join(
+      HOME_DIR, '.claude', 'projects',
+      '-Users-iamiahbartlett--claude-workspace'
+    );
+    const transcriptPath = path.join(transcriptDir, `${sessionId}.jsonl`);
     if (!fs.existsSync(transcriptPath)) return null;
 
     const lines = fs.readFileSync(transcriptPath, 'utf8').trim().split('\n');
@@ -1154,6 +1121,53 @@ function extractFullResponseFromSession(sessionId) {
 
 // Track the currently running subprocess so /stop can kill it
 let activeSubprocess = null;
+let activeKillFn = null; // backend-specific kill: proc.kill for claude/cron, killTree for codex
+let codexExecutionOwner = null;
+let codexExecutionSeq = 0;
+const codexExecutionQueue = [];
+
+function codexLockPriority(priority) {
+  return priority === 'cron' ? 1 : 0;
+}
+
+function flushCodexExecutionQueue() {
+  if (codexExecutionOwner || codexExecutionQueue.length === 0) return;
+  codexExecutionQueue.sort((a, b) => {
+    const priorityDiff = codexLockPriority(a.priority) - codexLockPriority(b.priority);
+    return priorityDiff !== 0 ? priorityDiff : a.seq - b.seq;
+  });
+  const next = codexExecutionQueue.shift();
+  codexExecutionOwner = next;
+  log(`Codex execution lock acquired by ${next.label}`);
+  next.resolve(() => {
+    if (codexExecutionOwner === next) {
+      codexExecutionOwner = null;
+      log(`Codex execution lock released by ${next.label}`);
+      flushCodexExecutionQueue();
+    }
+  });
+}
+
+function acquireCodexExecutionLock(priority, label) {
+  return new Promise((resolve) => {
+    codexExecutionQueue.push({
+      priority,
+      label,
+      seq: codexExecutionSeq++,
+      resolve,
+    });
+    flushCodexExecutionQueue();
+  });
+}
+
+async function withCodexExecutionLock(priority, label, fn) {
+  const release = await acquireCodexExecutionLock(priority, label);
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
 
 function runClaude(prompt, sessionId, options = {}) {
   return new Promise((resolve, reject) => {
@@ -1189,7 +1203,9 @@ function runClaude(prompt, sessionId, options = {}) {
 
     log(`Spawning: claude ${args.slice(0, 6).join(' ')}... (cwd: ${options.isCron ? 'cron' : 'main'})`);
 
-    // Strip only the "nested session" detection vars, keep session auth token
+    // Strip only the "nested session" detection vars, keep session auth token.
+    // Inject NATIVECLAW_* so downstream wrappers (mcp-wrapper.js, keychain helpers,
+    // memory tooling) resolve per-install paths without hardcoding.
     const cleanEnv = {
       ...process.env,
       NATIVECLAW_WORKSPACE: process.env.NATIVECLAW_WORKSPACE || WORKSPACE,
@@ -1207,6 +1223,7 @@ function runClaude(prompt, sessionId, options = {}) {
     });
 
     activeSubprocess = proc;
+    activeKillFn = (sig) => proc.kill(sig);
 
     let stdout = '';
     let stderr = '';
@@ -1224,6 +1241,7 @@ function runClaude(prompt, sessionId, options = {}) {
 
     proc.on('close', (code) => {
       activeSubprocess = null;
+      activeKillFn = null;
       clearTimeout(timer);
 
       if (code !== 0 && !stdout.trim()) {
@@ -1283,10 +1301,11 @@ function runClaude(prompt, sessionId, options = {}) {
   });
 }
 
-// Codex thread rollover thresholds — auto-rotate before bloat-induced stalls.
-// Failure case (Apr 18 2026): 1.65MB / 771-entry rollout caused chatgpt.com to stall silently.
-const CODEX_ROLLOVER_BYTES = 250 * 1024;
-const CODEX_ROLLOVER_ENTRIES = 20;
+// Codex thread rollover thresholds — relaxed so a single daily thread survives
+// normal use. Safety valve only, not normal flow. Failure case (Apr 18 2026):
+// 1.65MB / 771-entry rollout caused Codex to stall silently.
+const CODEX_ROLLOVER_BYTES = 1536 * 1024;
+const CODEX_ROLLOVER_ENTRIES = 250;
 
 function findCodexRollout(threadId) {
   if (!threadId) return null;
@@ -1314,7 +1333,7 @@ function findCodexRollout(threadId) {
 
 function shouldRolloverCodex(threadId) {
   const filePath = findCodexRollout(threadId);
-  if (!filePath) return { rollover: true, reason: 'rollout file not found' };
+  if (!filePath) return { rollover: false, reason: 'rollout file not found', missing: true };
   try {
     const stat = fs.statSync(filePath);
     if (stat.size > CODEX_ROLLOVER_BYTES) {
@@ -1344,8 +1363,9 @@ function reapOrphanMCPs() {
 }
 
 // Codex subprocess runner. Returns the same shape as runClaude for drop-in dispatch.
-// Codex emits JSONL events on stdout; we collect the final agent_message text,
-// the thread_id, and usage.
+// Codex emits JSONL events on stdout. In Codex CLI JSON, commentary updates and
+// final answers both arrive as agent_message items with no phase marker, so only
+// the last agent_message should be forwarded to Telegram.
 function runCodex(prompt, threadId, options = {}) {
   return new Promise((resolve, reject) => {
     const model = options.codexModel || CODEX_DEFAULT_MODEL;
@@ -1396,6 +1416,7 @@ function runCodex(prompt, threadId, options = {}) {
     };
 
     activeSubprocess = proc;
+    activeKillFn = killTree;
     const startTime = Date.now();
 
     let stdout = '';
@@ -1424,6 +1445,7 @@ function runCodex(prompt, threadId, options = {}) {
 
     proc.on('close', (code) => {
       activeSubprocess = null;
+      activeKillFn = null;
       clearTimeout(timer);
       clearInterval(idleTimer);
 
@@ -1437,7 +1459,7 @@ function runCodex(prompt, threadId, options = {}) {
       let outputTokens = 0;
       let cachedInputTokens = 0;
       let turns = 0;
-      const textParts = [];
+      let latestAgentText = '';
       let errorMsg = null;
 
       for (const line of stdout.split('\n')) {
@@ -1454,7 +1476,7 @@ function runCodex(prompt, threadId, options = {}) {
               break;
             case 'item.completed':
               if (ev.item?.type === 'agent_message' && typeof ev.item.text === 'string') {
-                textParts.push(ev.item.text);
+                latestAgentText = ev.item.text;
               }
               break;
             case 'turn.completed':
@@ -1475,12 +1497,12 @@ function runCodex(prompt, threadId, options = {}) {
         }
       }
 
-      if (errorMsg && textParts.length === 0) {
+      if (errorMsg && !latestAgentText.trim()) {
         return reject(new Error(`Codex error: ${errorMsg.slice(0, 400)}`));
       }
 
       resolve({
-        text: textParts.join('\n\n').trim(),
+        text: latestAgentText.trim(),
         sessionId: outThreadId,
         // Subscription-billed; real $ is $0 per message. Expose tokens for /stats.
         cost: 0,
@@ -1503,53 +1525,83 @@ function runCodex(prompt, threadId, options = {}) {
 // and threads through session state.
 async function runBackend(backend, prompt, options, sessionKey) {
   if (backend === 'codex') {
-    let threadId = state.codexSessions[sessionKey] || null;
+    let threadId = getStoredSessionId('codex', sessionKey);
     let rolloverNote = null;
 
     // Auto-rollover: rotate to fresh thread if existing rollout is bloated.
-    // Prevents the silent chatgpt.com stall observed Apr 18 2026 on a 1.65MB rollout.
+    // Prevents the silent Codex stall observed Apr 18 2026 on a 1.65MB rollout.
     if (threadId) {
       const check = shouldRolloverCodex(threadId);
       if (check.rollover) {
         log(`Codex thread ${threadId} rollover triggered: ${check.reason}`);
-        delete state.codexSessions[sessionKey];
+        clearStoredSession('codex', sessionKey, `rollover: ${check.reason}`);
         saveState();
         threadId = null;
         rolloverNote = `[System note: Prior Codex thread was auto-rolled over to prevent stall (${check.reason}). If you need conversation history beyond this message, read today's daily log in memory/ and search QMD via search_memory.]`;
+      } else if (check.missing) {
+        log(`Codex thread ${threadId} has no rollout file yet; keeping the same-day thread and skipping rollover`);
       } else {
         log(`Codex thread ${threadId} ok: size=${check.size}B entries=${check.entries}`);
       }
     }
 
-    const contextParts = [];
+    const executeCodexTurn = async (activeThreadId, extraNotes = []) => {
+      const contextParts = [];
 
-    // Standing context: only injected on a FRESH Codex thread.
-    // Once the thread exists, `codex exec resume` preserves conversation history
-    // server-side, so we don't need to re-send 50k tokens every message.
-    if (!threadId) {
-      const profile = detectContextProfile(prompt);
-      const standing = buildCodexContext(profile);
-      if (standing) {
-        contextParts.push(standing);
-        log(`Fresh Codex thread: injecting ${profile} context (${standing.length} chars)`);
+      // Standing context: only injected on a FRESH Codex thread.
+      // Once the thread exists, `codex exec resume` preserves conversation history
+      // server-side, so we don't need to re-send 50k tokens every message.
+      if (!activeThreadId) {
+        const today = getCurrentSessionDay();
+        const sessionStartDone = state.sessionStartRanToday === today;
+        const standing = buildCodexContext({ sessionStartDone });
+        if (standing) {
+          contextParts.push(standing);
+          log(`Fresh Codex thread: injecting standing context (${standing.length} chars, sessionStartDone=${sessionStartDone})`);
+        }
+        if (!sessionStartDone) {
+          state.sessionStartRanToday = today;
+          saveState();
+        }
+      }
+
+      // Pending cross-backend transfer — one-shot on switch, goes in regardless of thread state
+      if (options.transferContext) contextParts.push(options.transferContext);
+
+      for (const note of extraNotes) {
+        if (note) contextParts.push(note);
+      }
+
+      const finalPrompt = contextParts.length > 0
+        ? `${contextParts.join('\n\n')}\n\n# USER MESSAGE\n\n${prompt}`
+        : prompt;
+
+      return withCodexExecutionLock(options.codexLockPriority || 'user', options.codexLockLabel || `telegram:${sessionKey}`, () =>
+        runCodex(finalPrompt, activeThreadId, options)
+      );
+    };
+
+    let result = await executeCodexTurn(threadId, rolloverNote ? [rolloverNote] : []);
+    if (!result.text) {
+      const retryReason = threadId
+        ? `same-day thread ${threadId} returned no agent response`
+        : 'fresh Codex turn returned no agent response';
+      log(`Codex empty response for ${sessionKey}: ${retryReason}`);
+      clearStoredSession('codex', sessionKey, retryReason);
+      saveState();
+      result = await executeCodexTurn(null, [
+        '[System note: The previous Codex attempt produced no agent response. Start clean, answer the user directly, and finish the turn normally.]',
+      ]);
+      if (!result.text) {
+        throw new Error('Codex returned no response after a fresh retry');
       }
     }
 
-    // Pending cross-backend transfer — one-shot on switch, goes in regardless of thread state
-    if (options.transferContext) contextParts.push(options.transferContext);
-
-    // One-shot rollover note appended after standing context so the agent sees it on the fresh thread
-    if (rolloverNote) contextParts.push(rolloverNote);
-
-    const finalPrompt = contextParts.length > 0
-      ? `${contextParts.join('\n\n')}\n\n# USER MESSAGE\n\n${prompt}`
-      : prompt;
-
-    return runCodex(finalPrompt, threadId, options);
+    return result;
   }
 
   // Claude path
-  const sessionId = state.sessions[sessionKey] || null;
+  const sessionId = getStoredSessionId('claude', sessionKey);
   return runClaude(prompt, sessionId, options);
 }
 
@@ -1587,6 +1639,10 @@ function enqueueCron(item) {
   processCronQueue();
 }
 
+function hasPendingTelegramWork() {
+  return processingTelegram || telegramQueue.length > 0 || Object.keys(chatDebounceTimers).length > 0;
+}
+
 async function processTelegramQueue() {
   if (processingTelegram || telegramQueue.length === 0) return;
   processingTelegram = true;
@@ -1619,6 +1675,14 @@ async function processCronQueue() {
   processingCron = true;
 
   while (cronQueue.length > 0) {
+    const nextItem = cronQueue[0];
+    const primaryChat = ALLOWED_CHAT_IDS[0];
+    const codexCronPending = !!(nextItem && !nextItem.command && primaryChat && getBackend(primaryChat) === 'codex');
+    if (codexCronPending && hasPendingTelegramWork()) {
+      await sleep(1000);
+      continue;
+    }
+
     const item = cronQueue.shift();
     try {
       await handleCronJob(item);
@@ -1745,12 +1809,12 @@ async function handleSlashCommand(chatId, text) {
         const sessionKey = String(chatId);
         let transferContext = null;
         if (previousBackend === 'claude') {
-          transferContext = buildClaudeTranscriptReplay(state.sessions[sessionKey], 20);
+          transferContext = buildClaudeTranscriptReplay(getStoredSessionId('claude', sessionKey), 20);
           if (transferContext) log(`Prebuilt claude→codex full replay for ${sessionKey}: ${transferContext.length} chars`);
         }
         setBackend(chatId, 'codex', transferContext ? { context: transferContext, mode: 'full' } : undefined);
         const currentId = settings.codexModel || CODEX_DEFAULT_MODEL;
-        return `Backend switched to CODEX (${currentId}). Full transcript replay is ready for your next message.`;
+        return `Backend switched to CODEX (${currentId}). Full transcript replay is ready, and today's Codex thread will resume if it already exists.`;
       }
       if (sub) {
         // Allow `/codex 5.4-mini` as shortcut to switch model
@@ -1769,21 +1833,24 @@ async function handleSlashCommand(chatId, text) {
       let transferMode = null;
       if (previousBackend === 'claude') {
         await tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
-        transferContext = await buildClaudeHandoffSummary(state.sessions[sessionKey]);
+        transferContext = await buildClaudeHandoffSummary(getStoredSessionId('claude', sessionKey));
         transferMode = 'handoff';
         if (transferContext) {
           log(`Prebuilt claude→codex handoff for ${sessionKey}: ${transferContext.length} chars`);
         } else {
-          transferContext = buildClaudeTranscriptReplay(state.sessions[sessionKey], 20);
+          transferContext = buildClaudeTranscriptReplay(getStoredSessionId('claude', sessionKey), 20);
           transferMode = 'replay-fallback';
           if (transferContext) log(`Prebuilt claude→codex replay fallback for ${sessionKey}: ${transferContext.length} chars`);
         }
       }
       setBackend(chatId, 'codex', transferContext ? { context: transferContext, mode: transferMode } : undefined);
       const currentId = settings.codexModel || CODEX_DEFAULT_MODEL;
+      const resumeNote = getStoredSessionId('codex', sessionKey)
+        ? "Today's Codex thread will resume on your next message."
+        : 'Next Codex message starts a fresh daily thread.';
       return transferContext
-        ? `Backend switched to CODEX (${currentId}). Handoff is ready.`
-        : `Backend switched to CODEX (${currentId}). No Claude handoff context was available.`;
+        ? `Backend switched to CODEX (${currentId}). Handoff is ready. ${resumeNote}`
+        : `Backend switched to CODEX (${currentId}). No Claude handoff context was available. ${resumeNote}`;
     }
 
     case '/claude': {
@@ -1800,16 +1867,20 @@ async function handleSlashCommand(chatId, text) {
       if (previousBackend === 'codex') {
         await tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
         if (sub === '--full') {
-          transferContext = buildCodexTranscriptReplay(state.codexSessions[sessionKey], 20);
+          transferContext = buildCodexTranscriptReplay(getStoredSessionId('codex', sessionKey), 20);
           transferMode = 'full';
           if (transferContext) log(`Prebuilt codex→claude full replay for ${sessionKey}: ${transferContext.length} chars`);
         } else {
-          transferContext = await buildCodexHandoffSummary(state.codexSessions[sessionKey]);
+          transferContext = await buildCodexHandoffSummary(getStoredSessionId('codex', sessionKey), {
+            codexModel: settings.codexModel || CODEX_DEFAULT_MODEL,
+            effort: settings.effort || 'medium',
+            codexVerbosity: settings.codexVerbosity || null,
+          });
           transferMode = 'handoff';
           if (transferContext) {
             log(`Prebuilt codex→claude handoff for ${sessionKey}: ${transferContext.length} chars`);
           } else {
-            transferContext = buildCodexTranscriptReplay(state.codexSessions[sessionKey], 20);
+            transferContext = buildCodexTranscriptReplay(getStoredSessionId('codex', sessionKey), 20);
             transferMode = 'replay-fallback';
             if (transferContext) log(`Prebuilt codex→claude replay fallback for ${sessionKey}: ${transferContext.length} chars`);
           }
@@ -1817,12 +1888,16 @@ async function handleSlashCommand(chatId, text) {
       }
 
       setBackend(chatId, 'claude', transferContext ? { context: transferContext, mode: transferMode } : undefined);
+      const resumeNote = getStoredSessionId('claude', sessionKey)
+        ? "Today's Claude session will resume on your next message."
+        : 'Next Claude message starts a fresh daily session.';
       return transferContext
-        ? 'Backend switched to CLAUDE. Handoff is ready.'
-        : 'Backend switched to CLAUDE. Resuming your prior Claude session if one exists.';
+        ? `Backend switched to CLAUDE. Handoff is ready. ${resumeNote}`
+        : `Backend switched to CLAUDE. ${resumeNote}`;
     }
 
     // Codex model shortcuts (mirror Claude's /opus /sonnet /haiku pattern)
+    case '/5.5':
     case '/5.4':
     case '/5.4-mini':
     case '/5.3-codex':
@@ -1835,6 +1910,31 @@ async function handleSlashCommand(chatId, text) {
       if (!m) return `Unknown Codex model "${cmd}".`;
       settings.codexModel = m.id;
       return `Codex model set to ${m.display}. ${getBackend(chatId) === 'codex' ? '' : '(Run /codex to activate Codex backend.)'}`.trim();
+    }
+
+    case '/catchup': {
+      // Force the current backend to read the OTHER backend's session on the next turn.
+      // Useful when a previous /codex or /claude switch lost its handoff (rate limit,
+      // crash, empty session) and the current backend is missing context.
+      const sessionKey = String(chatId);
+      const currentBackend = getBackend(chatId);
+      const otherBackend = currentBackend === 'claude' ? 'codex' : 'claude';
+      let context = null;
+      if (otherBackend === 'codex') {
+        context = await buildCodexHandoffSummary(getStoredSessionId('codex', sessionKey), {
+          codexModel: settings.codexModel || CODEX_DEFAULT_MODEL,
+          effort: settings.effort || 'medium',
+          codexVerbosity: settings.codexVerbosity || null,
+        });
+        if (!context) context = buildCodexTranscriptReplay(getStoredSessionId('codex', sessionKey), 20);
+      } else {
+        context = await buildClaudeHandoffSummary(getStoredSessionId('claude', sessionKey));
+        if (!context) context = buildClaudeTranscriptReplay(getStoredSessionId('claude', sessionKey), 20);
+      }
+      if (!context) return `No ${otherBackend} session found to catch up from. Source transcript is empty or unreadable.`;
+      state.pendingTransfer[sessionKey] = { from: otherBackend, to: currentBackend, context, mode: 'catchup' };
+      saveState();
+      return `Catchup queued. Your next message on ${currentBackend} will be prefixed with the ${otherBackend} session context (${context.length} chars).`;
     }
 
     case '/effort': {
@@ -1900,9 +2000,9 @@ async function handleSlashCommand(chatId, text) {
     case '/fresh': {
       const backend = getBackend(chatId);
       if (backend === 'codex') {
-        delete state.codexSessions[sessionKey];
+        clearStoredSession('codex', sessionKey, 'manual reset');
       } else {
-        delete state.sessions[sessionKey];
+        clearStoredSession('claude', sessionKey, 'manual reset');
       }
       delete state.exchangeCount[sessionKey];
       saveState();
@@ -1939,7 +2039,7 @@ async function handleSlashCommand(chatId, text) {
 
     case '/session': {
       const backend = getBackend(chatId);
-      const sid = backend === 'codex' ? state.codexSessions[sessionKey] : state.sessions[sessionKey];
+      const sid = backend === 'codex' ? getStoredSessionId('codex', sessionKey) : getStoredSessionId('claude', sessionKey);
       return sid
         ? `${backend.toUpperCase()} session: ${sid}\nUse /reset to start fresh.`
         : `No active ${backend.toUpperCase()} session. Next message will start one.`;
@@ -1958,8 +2058,8 @@ async function handleSlashCommand(chatId, text) {
       const thinking = settings.effort === 'max' ? 'ON' : 'OFF';
       const verbosity = settings.codexVerbosity || 'default';
       const sid = backend === 'codex'
-        ? (state.codexSessions[sessionKey] ? 'Active' : 'None')
-        : (state.sessions[sessionKey] ? 'Active' : 'None');
+        ? (getStoredSessionId('codex', sessionKey) ? 'Active' : 'None')
+        : (getStoredSessionId('claude', sessionKey) ? 'Active' : 'None');
       return [
         'NativeClaw Status:',
         `  Bridge PID: ${bridgePid}`,
@@ -1986,9 +2086,9 @@ async function handleSlashCommand(chatId, text) {
         'NativeClaw Commands:',
         '',
         '— Backend —',
-        '/claude — Use Claude backend (default)',
+        '/claude — Use Claude backend, resuming today\'s Claude session if it exists',
         '/claude --full — Use Claude with raw Codex replay',
-        '/codex — Use Codex (GPT) backend',
+        '/codex — Use Codex (GPT) backend, resuming today\'s Codex thread if it exists',
         '/codex --full — Use Codex with raw Claude replay',
         '/codex help — List GPT models',
         '',
@@ -2000,7 +2100,8 @@ async function handleSlashCommand(chatId, text) {
         '/model <name> — Any Claude model',
         '',
         '— Codex models —',
-        '/5.4 — GPT-5.4 (default)',
+        '/5.5 — GPT-5.5 (default)',
+        '/5.4 — GPT-5.4',
         '/5.4-mini — GPT-5.4 Mini',
         '/5.3-codex, /5.2, /5.2-codex, /5.1-codex-max, /5.1-codex-mini',
         '',
@@ -2008,6 +2109,7 @@ async function handleSlashCommand(chatId, text) {
         '/reset — Clear current backend\'s session',
         '/fresh — Alias for /reset; clear current backend session',
         '/session — Show session info',
+        '/catchup — Pull context from the OTHER backend into this one (use if a handoff was lost to rate-limit or crash)',
         '/stats — Last response stats (cached %, cumulative warning)',
         '/effort <low|medium|high|xhigh|max> — Set Claude/Codex thinking effort',
         '/think — Alias/toggle for /effort max',
@@ -2095,7 +2197,7 @@ async function handleTelegramMessage(item) {
       transferContext = pending.context;
       log(`Transfer ${pending.from}→${pending.to} (${pending.mode || 'prebuilt'}) for ${sessionKey}: ${transferContext.length} chars`);
     } else if (pending.from === 'claude' && backend === 'codex') {
-      const claudeSid = state.sessions[sessionKey];
+      const claudeSid = getStoredSessionId('claude', sessionKey);
       if (settings.transferMode === 'full') {
         // /codex --full: raw transcript replay
         transferContext = buildClaudeTranscriptReplay(claudeSid, 20);
@@ -2113,8 +2215,12 @@ async function handleTelegramMessage(item) {
         }
       }
     } else if (pending.from === 'codex' && backend === 'claude') {
-      const codexTid = state.codexSessions[sessionKey];
-      transferContext = await buildCodexHandoffSummary(codexTid);
+      const codexTid = getStoredSessionId('codex', sessionKey);
+      transferContext = await buildCodexHandoffSummary(codexTid, {
+        codexModel: settings.codexModel || CODEX_DEFAULT_MODEL,
+        effort: settings.effort || 'medium',
+        codexVerbosity: settings.codexVerbosity || null,
+      });
       if (transferContext) {
         log(`Transfer codex→claude (handoff) for ${sessionKey}: ${transferContext.length} chars`);
       } else {
@@ -2136,11 +2242,17 @@ async function handleTelegramMessage(item) {
   let appendSystemPrompt = null;
   if (backend === 'claude') {
     const parts = [];
-    if (!state.sessions[sessionKey]) {
-      const primer = buildSessionPrimer();
+    if (!getStoredSessionId('claude', sessionKey)) {
+      const today = getCurrentSessionDay();
+      const sessionStartDone = state.sessionStartRanToday === today;
+      const primer = buildSessionPrimer({ sessionStartDone });
       if (primer) {
         parts.push(primer);
-        log(`Fresh Claude session for ${sessionKey}: injecting primer (${primer.length} chars)`);
+        log(`Fresh Claude session for ${sessionKey}: injecting primer (${primer.length} chars, sessionStartDone=${sessionStartDone})`);
+      }
+      if (!sessionStartDone) {
+        state.sessionStartRanToday = today;
+        saveState();
       }
     }
     if (transferContext) parts.push(transferContext);
@@ -2174,17 +2286,17 @@ async function handleTelegramMessage(item) {
       sessionId: result.sessionId,
     };
 
-    // Persist session ID on the correct backend's slot
-    if (result.sessionId) {
-      if (backend === 'codex') {
-        state.codexSessions[sessionKey] = result.sessionId;
-      } else {
-        state.sessions[sessionKey] = result.sessionId;
-      }
-      saveState();
-    }
-
     if (result.text) {
+      // Persist session ID on the correct backend's slot only after we have
+      // a real assistant message for the user.
+      if (result.sessionId) {
+        if (backend === 'codex') {
+          setStoredSessionId('codex', sessionKey, result.sessionId);
+        } else {
+          setStoredSessionId('claude', sessionKey, result.sessionId);
+        }
+        saveState();
+      }
       const sendResult = await sendMessage(chatId, result.text);
       const costStr = backend === 'codex'
         ? `tokens in=${result.usage?.inputTokens || 0}/out=${result.usage?.outputTokens || 0}`
@@ -2195,8 +2307,7 @@ async function handleTelegramMessage(item) {
         log(`Replied to ${name} [${backend}]: ${result.text.length} chars, ${result.turns} turns, ${costStr}`);
       }
     } else {
-      await sendMessage(chatId, '(No response generated)');
-      log(`Empty response for ${name} [${backend}]`);
+      throw new Error(`${backend.toUpperCase()} returned no response`);
     }
 
     if (_imagePath) {
@@ -2213,11 +2324,11 @@ async function handleTelegramMessage(item) {
     await sendMessage(chatId, `Something went wrong: ${err.message.slice(0, 200)}${rateLimitHint}`);
 
     // If session/thread is broken, clear the active backend's session so next message starts fresh
-    if (err.message.includes('session') || err.message.includes('resume') || err.message.includes('thread')) {
+    if (err.message.includes('session') || err.message.includes('resume') || err.message.includes('thread') || err.message.includes('no response')) {
       if (backend === 'codex') {
-        delete state.codexSessions[sessionKey];
+        clearStoredSession('codex', sessionKey, err.message);
       } else {
-        delete state.sessions[sessionKey];
+        clearStoredSession('claude', sessionKey, err.message);
       }
       saveState();
       log(`Cleared broken ${backend} session for ${sessionKey}`);
@@ -2253,6 +2364,7 @@ function runCronCommand(command, options = {}) {
     });
 
     activeSubprocess = proc;
+    activeKillFn = (sig) => proc.kill(sig);
     const startTime = Date.now();
     let stdout = '';
     let stderr = '';
@@ -2269,6 +2381,7 @@ function runCronCommand(command, options = {}) {
 
     proc.on('close', (code) => {
       activeSubprocess = null;
+      activeKillFn = null;
       clearTimeout(timer);
 
       const text = [stdout.trim(), stderr.trim()].filter(Boolean).join('\n');
@@ -2288,6 +2401,7 @@ function runCronCommand(command, options = {}) {
 
     proc.on('error', (err) => {
       activeSubprocess = null;
+      activeKillFn = null;
       clearTimeout(timer);
       reject(new Error(`Failed to spawn cron command: ${err.message}`));
     });
@@ -2317,12 +2431,14 @@ async function handleCronJob(item) {
       const finalPrompt = `${buildCodexCronContext()}\n\n# CRON TASK\n\n${prompt}`;
       // Crons always run fresh — no resume, pass null threadId.
       const codexChatSettings = primaryChat ? getSettings(primaryChat) : {};
-      result = await runCodex(finalPrompt, null, {
-        timeout: timeout || 300,
-        codexModel: codexChatSettings.codexModel || CODEX_DEFAULT_MODEL,
-        effort: codexChatSettings.effort || 'xhigh',
-        codexVerbosity: codexChatSettings.codexVerbosity || null,
-      });
+      result = await withCodexExecutionLock('cron', `cron:${name}`, () =>
+        runCodex(finalPrompt, null, {
+          timeout: timeout || 300,
+          codexModel: codexChatSettings.codexModel || CODEX_DEFAULT_MODEL,
+          effort: codexChatSettings.effort || 'xhigh',
+          codexVerbosity: codexChatSettings.codexVerbosity || null,
+        })
+      );
     } else {
       result = await runClaude(prompt, null, {
         timeout: timeout || 300,
@@ -2347,14 +2463,14 @@ async function handleCronJob(item) {
       for (const key of Object.keys(state.sessions)) {
         if (state.sessions[key]) {
           log(`Session-audit: clearing Claude session ${state.sessions[key]} for chat ${key}`);
-          state.sessions[key] = '';
+          clearStoredSession('claude', key);
           state.exchangeCount[key] = 0;
         }
       }
       for (const key of Object.keys(state.codexSessions)) {
         if (state.codexSessions[key]) {
           log(`Session-audit: clearing Codex thread ${state.codexSessions[key]} for chat ${key}`);
-          state.codexSessions[key] = '';
+          clearStoredSession('codex', key);
         }
       }
       saveState();
@@ -2500,12 +2616,11 @@ async function pollTelegram() {
 
       // Handle /stop immediately — bypass queue, kill active subprocess
       if (msg.text && msg.text.trim().toLowerCase() === '/stop') {
-        if (activeSubprocess) {
+        if (activeSubprocess && activeKillFn) {
           log(`/stop received — killing active subprocess (PID ${activeSubprocess.pid})`);
-          activeSubprocess.kill('SIGTERM');
-          setTimeout(() => {
-            if (activeSubprocess) activeSubprocess.kill('SIGKILL');
-          }, 5000);
+          const killFn = activeKillFn; // capture before close event nulls it
+          killFn('SIGTERM');
+          setTimeout(() => killFn('SIGKILL'), 5000);
           // Clear the message queue so queued messages don't fire after stop
           telegramQueue.length = 0;
           await sendMessage(chatId, 'Stopped. Task killed and queue cleared.');
@@ -2611,24 +2726,54 @@ async function pollTelegram() {
         const caption = msg.caption || '';
 
         // Supported file types
-        const imageTypes = ['image/'];
+        const imageTypes = ['image/']; // image/jpeg, image/png, image/heic, image/heif, image/webp, etc.
+        const imageExtFallback = /\.(jpe?g|png|gif|webp|bmp|tiff?|heic|heif|svg)$/i;
         const fileTypes = [
+          // PDFs
           'application/pdf',
+          // Microsoft Office
           'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // docx
           'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // xlsx
           'application/vnd.openxmlformats-officedocument.presentationml.presentation', // pptx
           'application/msword', // doc
           'application/vnd.ms-excel', // xls
+          'application/vnd.ms-powerpoint', // ppt
+          // OpenDocument (LibreOffice)
+          'application/vnd.oasis.opendocument.text', // odt
+          'application/vnd.oasis.opendocument.spreadsheet', // ods
+          'application/vnd.oasis.opendocument.presentation', // odp
+          // Rich text + plain
+          'application/rtf',
+          'text/rtf',
           'text/plain',
           'text/csv',
           'text/markdown',
+          'text/x-markdown',
+          // Structured / config
           'application/json',
           'application/xml',
+          'text/xml',
           'text/html',
+          'application/x-yaml',
+          'application/yaml',
+          'text/yaml',
+          'text/x-yaml',
+          'application/toml',
+          // E-books
+          'application/epub+zip',
+          // Email
+          'message/rfc822',
+          'application/vnd.ms-outlook', // .msg
+          // LaTeX / academic
+          'application/x-tex',
+          'text/x-tex',
+          // Jupyter
+          'application/x-ipynb+json',
         ];
+        const fileExtFallback = /\.(pdf|docx?|xlsx?|pptx?|odt|ods|odp|rtf|txt|csv|tsv|md|markdown|json|xml|ya?ml|toml|html?|epub|eml|msg|tex|ipynb|log)$/i;
 
-        const isImage = imageTypes.some(t => mime.startsWith(t));
-        const isFile = fileTypes.some(t => mime === t) || fileName.match(/\.(pdf|docx?|xlsx?|pptx?|txt|csv|md|json|xml|html)$/i);
+        const isImage = imageTypes.some(t => mime.startsWith(t)) || imageExtFallback.test(fileName);
+        const isFile = fileTypes.some(t => mime === t) || fileExtFallback.test(fileName);
 
         if (isImage) {
           try {
@@ -2663,7 +2808,7 @@ async function pollTelegram() {
             await sendMessage(chatId, `Failed to download file: ${err.message}`);
           }
         } else {
-          await sendMessage(chatId, `${mime || 'Unknown'} file type not supported. Supported: images, PDF, DOCX, XLSX, PPTX, TXT, CSV, JSON, Markdown.`);
+          await sendMessage(chatId, `${mime || 'Unknown'} file type not supported. Supported: images (incl. HEIC), PDF, Office (docx/xlsx/pptx + legacy), OpenDocument (odt/ods/odp), RTF, plain text, CSV, Markdown, JSON, XML, YAML, TOML, HTML, EPUB, EML, LaTeX, Jupyter.`);
         }
       }
     }

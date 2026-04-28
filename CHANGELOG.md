@@ -4,6 +4,21 @@
 
 First major release focused on making the agent reliable out-of-box, not just functional. Every piece here came from real-world patterns that caught hallucinations, context loss, or credential leaks.
 
+### Bridge — Session & Backend Architecture
+- **5 AM ET session-day anchor:** `getCurrentSessionDay()` treats hours 00:00–04:59 ET as the previous calendar day so live sessions survive the midnight boundary. The 5:10 AM `session-audit` cron is now safety-net only, not the primary kill.
+- **Two-tier backend handoff:** `/codex` and `/claude` first try a source-owned summary; if the source backend can't produce one (crashing/empty/unresponsive), the bridge falls back to injecting the **last 20 raw transcript exchanges**. If neither tier produces context, the bridge ships nothing instead of guessing — the resumed backend just greets normally. Old "breadcrumb pointer" path removed.
+- **Collapsed Codex `CONTEXT_PROFILES`:** `chat` and `work` profiles merged into a single `chat` profile that injects SOUL + USER + TOOLS + NATIVECLAW + device + MEMORY + last 3 daily logs, matching Claude's primer for parity. `cron` profile remains lean. `detectContextProfile()` removed.
+- **`SESSION_START_COMPLETED_TODAY` flag:** New global flag in `state.json` so the SESSION START checklist runs once per calendar day instead of on every fresh session/thread switch. Both Claude and Codex primers honor it.
+- **Per-day Claude/Codex session tracking:** `state.sessionDates` and `state.codexSessionDates` bind sessions/threads to the day they were created. Switching `/claude` ↔ `/codex` resumes the target backend's same-day session/thread instead of force-cold-starting it. True cold start happens at daily session audit, on `/reset`, or on `clearStoredSession()`.
+- **Codex execution serialization:** Codex user turns and Codex crons no longer launch in parallel. User priority — fixes the empty-response bug seen during overlapping heartbeat/task-queue runs.
+- **Codex rollover relaxed:** Thresholds bumped to 1.5 MB / 250 entries, missing rollout files no longer force fresh threads. Daily reset remains the main bound; rollover is a true safety valve.
+- **Codex CLI emit handling:** Bridge filters `codex exec --json` replies to the last `agent_message` only — Codex emits commentary and final answers as the same event type with no phase marker, which was bundling startup chatter into Telegram replies.
+
+### Bridge — File Attachments
+- **Image extension fallback:** HEIC, HEIF, WebP, BMP, TIFF, SVG now accepted via filename extension when the document MIME is missing or generic (Telegram strips MIME for some iPhone uploads).
+- **Expanded document allowlist:** RTF, ODT/ODS/ODP (OpenDocument), EPUB, YAML/TOML, EML/MSG (email), TEX (LaTeX), IPYNB (Jupyter), `.log` files, and PPT (legacy Office) added to MIME and extension fallbacks. Existing PDF/DOCX/XLSX/PPTX/TXT/CSV/MD/JSON/XML/HTML preserved.
+- **Updated user-facing error message** lists the new coverage when an unsupported type is sent.
+
 ### New — Memory That Learns
 - **QMD semantic memory search (opt-in):** `workspace/system/mcp/qmd/server.js` — Gemini Embedding 2 over daily logs, MEMORY.md, and feedback files. Disabled by default; enable during `setup.sh` or by renaming `__qmd_disabled` to `qmd` in `.mcp.json`.
 - **Feedback loop starter:** `workspace/feedback/{general,emails,reports}.md` — the agent reads the matching file before producing repeatable output. Checkpoint discipline enforced in the new AGENTS.md (mandatory fields, promotion table).
