@@ -131,6 +131,24 @@ const checks = [
       return patterns.filter((pattern) => !pattern.test(source)).map((pattern) => `missing ${pattern}`);
     },
   },
+  {
+    name: 'Codex transcript extractor reads user-typed inputs from event_msg.user_message',
+    run() {
+      const patterns = [
+        /ev\.type === 'event_msg'/,
+        /payload\.type === 'user_message'/,
+        /payload\.message/,
+      ];
+      return patterns.filter((pattern) => !pattern.test(source)).map((pattern) => `missing ${pattern}`);
+    },
+  },
+  {
+    name: 'codex→claude replay-fallback path logs explicitly when it ships empty',
+    run() {
+      const matches = source.match(/replay fallback[^\n]*returned EMPTY/g) || [];
+      return matches.length >= 2 ? [] : [`expected at least 2 explicit empty-fallback log lines, found ${matches.length}`];
+    },
+  },
 ];
 
 let failed = 0;

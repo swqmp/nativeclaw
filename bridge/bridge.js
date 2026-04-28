@@ -447,41 +447,68 @@ function extractCodexTranscriptExchanges(threadId, maxExchanges = 30) {
   try {
     const lines = fs.readFileSync(rolloutPath, 'utf8').trim().split('\n');
     const exchanges = [];
+    const seen = new Set();  // dedup user_message events that also echo into response_item
 
     for (const line of lines) {
       try {
         const ev = JSON.parse(line);
-        // Codex logs conversation as response_item events with role + content[].
-        // User sends look like input_text, assistant sends look like output_text.
-        if (ev.type !== 'response_item') continue;
-        const p = ev.payload;
-        if (!p || p.type !== 'message') continue;
-        const role = p.role;
-        if (role !== 'user' && role !== 'assistant') continue;
-
+        // Codex CLI rollout format (verified Apr 2026):
+        //   - User-typed inputs:  ev.type === 'event_msg', ev.payload.type === 'user_message',
+        //                         ev.payload.message string contains the user prompt.
+        //   - Assistant outputs:  ev.type === 'response_item', ev.payload.type === 'message',
+        //                         ev.payload.role === 'assistant', payload.content[] holds
+        //                         input_text/output_text parts.
+        //   - Older Codex builds also echoed user prompts inside response_item; we still accept
+        //     those but the # STANDING CONTEXT / AGENTS.md filter strips the noisy primer dumps.
+        //   - Everything else (reasoning, function_call, token_count, turn_context, agent_message
+        //     duplicates of response_item, session_meta) is skipped.
+        let role = null;
         const texts = [];
-        if (Array.isArray(p.content)) {
-          for (const c of p.content) {
-            if (typeof c.text === 'string' && (c.type === 'input_text' || c.type === 'output_text')) {
-              const t = c.text.trim();
-              // Skip Codex/bridge injected context blocks; only preserve real user/assistant conversation.
-              if (
-                !t ||
-                t.startsWith('<permissions') ||
-                t.startsWith('<environment') ||
-                t.startsWith('<skills_instructions') ||
-                t.startsWith('# AGENTS.md instructions') ||
-                t.startsWith('# CODEX BACKEND') ||
-                t.startsWith('# HANDOFF BRIEF') ||
-                t.startsWith('# STANDING CONTEXT')
-              ) continue;
-              texts.push(t);
+
+        if (ev.type === 'event_msg' && ev.payload && ev.payload.type === 'user_message') {
+          role = 'user';
+          if (typeof ev.payload.message === 'string') {
+            texts.push(ev.payload.message);
+          }
+        } else if (ev.type === 'response_item') {
+          const p = ev.payload;
+          if (!p || p.type !== 'message') continue;
+          if (p.role !== 'user' && p.role !== 'assistant') continue;
+          role = p.role;
+          if (Array.isArray(p.content)) {
+            for (const c of p.content) {
+              if (typeof c.text === 'string' && (c.type === 'input_text' || c.type === 'output_text')) {
+                texts.push(c.text);
+              }
             }
           }
+        } else {
+          continue;
         }
-        if (texts.length === 0) continue;
-        const joined = texts.join('\n').trim();
+
+        const filtered = [];
+        for (let t of texts) {
+          t = t.trim();
+          if (
+            !t ||
+            t.startsWith('<permissions') ||
+            t.startsWith('<environment') ||
+            t.startsWith('<skills_instructions') ||
+            t.startsWith('# AGENTS.md instructions') ||
+            t.startsWith('# CODEX BACKEND') ||
+            t.startsWith('# CODEX CRON CONTEXT') ||
+            t.startsWith('# CODEX CONVERSATION TO SUMMARIZE') ||
+            t.startsWith('# HANDOFF BRIEF') ||
+            t.startsWith('# STANDING CONTEXT')
+          ) continue;
+          filtered.push(t);
+        }
+        if (filtered.length === 0) continue;
+        const joined = filtered.join('\n').trim();
         if (!joined) continue;
+        const dedupKey = `${role}:${joined.slice(0, 200)}`;
+        if (seen.has(dedupKey)) continue;
+        seen.add(dedupKey);
         exchanges.push({ role, text: joined.slice(0, 4000) });
       } catch {}
     }
@@ -1882,7 +1909,11 @@ async function handleSlashCommand(chatId, text) {
           } else {
             transferContext = buildCodexTranscriptReplay(getStoredSessionId('codex', sessionKey), 20);
             transferMode = 'replay-fallback';
-            if (transferContext) log(`Prebuilt codex→claude replay fallback for ${sessionKey}: ${transferContext.length} chars`);
+            if (transferContext) {
+              log(`Prebuilt codex→claude replay fallback for ${sessionKey}: ${transferContext.length} chars`);
+            } else {
+              log(`Prebuilt codex→claude replay fallback returned EMPTY for ${sessionKey} — handoff will ship no context (rollout missing/unreadable or extractor matched zero events)`);
+            }
           }
         }
       }
@@ -2225,7 +2256,11 @@ async function handleTelegramMessage(item) {
         log(`Transfer codex→claude (handoff) for ${sessionKey}: ${transferContext.length} chars`);
       } else {
         transferContext = buildCodexTranscriptReplay(codexTid, 20);
-        if (transferContext) log(`Transfer codex→claude (replay fallback) for ${sessionKey}: ${transferContext.length} chars`);
+        if (transferContext) {
+          log(`Transfer codex→claude (replay fallback) for ${sessionKey}: ${transferContext.length} chars`);
+        } else {
+          log(`Transfer codex→claude (replay fallback) returned EMPTY for ${sessionKey} — handoff will ship no context (rollout missing/unreadable or extractor matched zero events)`);
+        }
       }
     }
     delete state.pendingTransfer[sessionKey];
