@@ -143,10 +143,53 @@ const checks = [
     },
   },
   {
-    name: 'codex→claude replay-fallback path logs explicitly when it ships empty',
+    name: 'buildGapTranscript replaces summary+replay path and applies hard cap',
     run() {
-      const matches = source.match(/replay fallback[^\n]*returned EMPTY/g) || [];
-      return matches.length >= 2 ? [] : [`expected at least 2 explicit empty-fallback log lines, found ${matches.length}`];
+      const patterns = [
+        /function buildGapTranscript\(sourceBackend, sessionKey, sinceISO\)/,
+        /const GAP_CAP_CHARS = \d+/,
+        /while \(totalChars > GAP_CAP_CHARS && exchanges\.length > 1\)/,
+        /# GAP TRANSCRIPT/,
+        /# END GAP TRANSCRIPT/,
+        /formatGapTimestamp\(/,
+      ];
+      return patterns.filter((p) => !p.test(source)).map((p) => `missing ${p}`);
+    },
+  },
+  {
+    name: 'gap-boundary state (arrivedAt) is back-filled and updated by helpers',
+    run() {
+      const patterns = [
+        /arrivedAt: \{\},/,
+        /state\.arrivedAt\s*=\s*\{\}/,
+        /function getBackendArrival\(chatId, backend\)/,
+        /function markBackendArrival\(chatId, backend, when\)/,
+        /function clearBackendArrival\(chatId, backend\)/,
+        /clearBackendArrival\(chatId, kind\)/,
+      ];
+      return patterns.filter((p) => !p.test(source)).map((p) => `missing ${p}`);
+    },
+  },
+  {
+    name: 'slash /codex and /claude mark backend arrival after switch',
+    run() {
+      const patterns = [
+        /markBackendArrival\(sessionKey, 'codex'\)/,
+        /markBackendArrival\(sessionKey, 'claude'\)/,
+      ];
+      return patterns.filter((p) => !p.test(source)).map((p) => `missing ${p}`);
+    },
+  },
+  {
+    name: 'gap injection callers log explicitly when transcript is empty',
+    run() {
+      const patterns = [
+        /No claude→codex (full )?gap to inject/,
+        /No codex→claude (full )?gap to inject/,
+        /Transfer claude→codex gap empty/,
+        /Transfer codex→claude gap empty/,
+      ];
+      return patterns.filter((p) => !p.test(source)).map((p) => `missing ${p}`);
     },
   },
 ];

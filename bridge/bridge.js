@@ -70,6 +70,7 @@ let state = {
   backends: {},         // { chatId: "claude" | "codex" }
   pendingTransfer: {},  // { chatId: {from, to, context?} } — one-shot flag to inject cross-backend context on next message
   sessionStartRanToday: '',  // YYYY-MM-DD — set once SESSION START ran today on either backend; implicitly cleared when day rolls (5 AM ET anchor)
+  arrivedAt: {},        // { chatId: { claude: ISO, codex: ISO } } — when the user most recently arrived at each backend; gap-transcript boundary
   exchangeCount: {},
 };
 if (fs.existsSync(STATE_PATH)) {
@@ -84,6 +85,7 @@ if (fs.existsSync(STATE_PATH)) {
     if (!state.backends) state.backends = {};
     if (!state.pendingTransfer) state.pendingTransfer = {};
     if (typeof state.sessionStartRanToday !== 'string') state.sessionStartRanToday = '';
+    if (!state.arrivedAt || typeof state.arrivedAt !== 'object') state.arrivedAt = {};
     const today = getCurrentSessionDay();
     for (const [cid, sid] of Object.entries(state.sessions)) {
       if (sid && !state.sessionDates[cid]) state.sessionDates[cid] = today;
@@ -143,6 +145,7 @@ function clearStoredSession(kind, chatId, reason = '') {
   }
   delete ids[key];
   delete dates[key];
+  clearBackendArrival(chatId, kind);
 }
 
 function getStoredSessionId(kind, chatId) {
@@ -164,6 +167,48 @@ function setStoredSessionId(kind, chatId, id) {
   const { ids, dates } = getSessionStores(kind);
   ids[key] = id;
   dates[key] = getCurrentSessionDay();
+  // First time this backend sees activity today? Mark arrival so future gap-transcript
+  // calculations have a boundary. /claude and /codex slash handlers will overwrite this
+  // with a fresh now() after gap injection if the user is explicitly switching.
+  if (!state.arrivedAt[key]) state.arrivedAt[key] = {};
+  if (!state.arrivedAt[key][kind]) state.arrivedAt[key][kind] = new Date().toISOString();
+}
+
+function getBackendArrival(chatId, backend) {
+  const key = String(chatId);
+  return (state.arrivedAt[key] && state.arrivedAt[key][backend]) || null;
+}
+
+function markBackendArrival(chatId, backend, when) {
+  const key = String(chatId);
+  if (!state.arrivedAt[key]) state.arrivedAt[key] = {};
+  state.arrivedAt[key][backend] = when || new Date().toISOString();
+}
+
+function clearBackendArrival(chatId, backend) {
+  const key = String(chatId);
+  if (!state.arrivedAt[key]) return;
+  delete state.arrivedAt[key][backend];
+  if (Object.keys(state.arrivedAt[key]).length === 0) delete state.arrivedAt[key];
+}
+
+function formatGapTimestamp(iso) {
+  if (!iso) return '?';
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    return new Intl.DateTimeFormat('en-US', {
+      timeZone: SESSION_DAY_TIMEZONE,
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+      timeZoneName: 'short',
+    }).format(d);
+  } catch {
+    return iso;
+  }
 }
 
 function setBackend(chatId, backend, transfer = undefined) {
@@ -269,6 +314,7 @@ const CODEX_MODELS = {
 };
 const CODEX_DEFAULT_MODEL = 'gpt-5.5';
 const HANDOFF_SUMMARY_MODEL = 'sonnet';
+const GAP_CAP_CHARS = 50000; // Hard cap on injected backend-switch gap transcript size; oldest events drop first if exceeded.
 
 // Files to inject as standing context on fresh Codex threads.
 // AGENTS.md is excluded because Codex auto-loads it from the workspace.
@@ -441,9 +487,10 @@ function findCodexRolloutPath(threadId) {
 
 // Extract the last N user/assistant exchanges from a Codex session rollout.
 // Shared by buildCodexTranscriptReplay and buildCodexHandoffSummary.
-function extractCodexTranscriptExchanges(threadId, maxExchanges = 30) {
+function extractCodexTranscriptExchanges(threadId, maxExchanges = 30, sinceISO = null) {
   const rolloutPath = findCodexRolloutPath(threadId);
   if (!rolloutPath) return [];
+  const sinceMs = sinceISO ? Date.parse(sinceISO) : null;
   try {
     const lines = fs.readFileSync(rolloutPath, 'utf8').trim().split('\n');
     const exchanges = [];
@@ -506,10 +553,12 @@ function extractCodexTranscriptExchanges(threadId, maxExchanges = 30) {
         if (filtered.length === 0) continue;
         const joined = filtered.join('\n').trim();
         if (!joined) continue;
+        const ts = (typeof ev.timestamp === 'string') ? ev.timestamp : null;
+        if (sinceMs && ts && Date.parse(ts) < sinceMs) continue;
         const dedupKey = `${role}:${joined.slice(0, 200)}`;
         if (seen.has(dedupKey)) continue;
         seen.add(dedupKey);
-        exchanges.push({ role, text: joined.slice(0, 4000) });
+        exchanges.push({ role, text: joined.slice(0, 4000), timestamp: ts });
       } catch {}
     }
 
@@ -560,6 +609,53 @@ function buildLatestExchangeBlock(exchanges, label) {
   if (latestUser) lines.push(`[USER]: ${latestUser}`, '');
   if (latestAssistant) lines.push(`[ASSISTANT]: ${latestAssistant}`, '');
   lines.push(`# END LATEST ${label} EXCHANGE`);
+  return lines.join('\n');
+}
+
+// Build a gap transcript: filtered + timestamped tail of the source backend's
+// session/thread since the user last arrived at it. Replaces the old summary+replay
+// dual path. Returns formatted block or '' if no events / no session.
+function buildGapTranscript(sourceBackend, sessionKey, sinceISO) {
+  const sessionId = sourceBackend === 'codex'
+    ? getStoredSessionId('codex', sessionKey)
+    : getStoredSessionId('claude', sessionKey);
+  if (!sessionId) return '';
+
+  const exchanges = sourceBackend === 'codex'
+    ? extractCodexTranscriptExchanges(sessionId, 9999, sinceISO)
+    : extractClaudeTranscriptExchanges(sessionId, 9999, sinceISO);
+  if (exchanges.length === 0) return '';
+
+  // Hard cap (oldest drops first) so a heavy session doesn't blow up Claude/Codex
+  // context windows on switch.
+  let totalChars = exchanges.reduce((sum, e) => sum + (e.text || '').length + 60, 0);
+  let truncated = 0;
+  while (totalChars > GAP_CAP_CHARS && exchanges.length > 1) {
+    const dropped = exchanges.shift();
+    totalChars -= (dropped.text || '').length + 60;
+    truncated++;
+  }
+
+  const sourceLabel = sourceBackend === 'codex' ? 'Codex' : 'Claude';
+  const targetLabel = sourceBackend === 'codex' ? 'Claude' : 'Codex';
+
+  const lines = [
+    `# GAP TRANSCRIPT (from ${sourceLabel} session, while you were on the other backend)`,
+    '',
+    `The user just switched from ${sourceLabel} back to you (${targetLabel}). Below is the conversation that happened on ${sourceLabel} during the gap, with timestamps. Continue naturally — do not re-greet, do not re-summarize. Pick up where things left off.`,
+    '',
+  ];
+  if (truncated > 0) {
+    lines.push(`[${truncated} earlier message(s) truncated to fit ${GAP_CAP_CHARS}-char cap]`);
+    lines.push('');
+  }
+  for (const e of exchanges) {
+    const tag = (e.role || '?').toUpperCase();
+    const time = formatGapTimestamp(e.timestamp);
+    lines.push(`[${time} \u2014 ${tag}]: ${e.text}`);
+    lines.push('');
+  }
+  lines.push('# END GAP TRANSCRIPT');
   return lines.join('\n');
 }
 
@@ -636,8 +732,9 @@ async function buildCodexHandoffSummary(threadId, options = {}) {
 
 // Extract the last N user/assistant exchanges from a Claude session transcript.
 // Shared by buildClaudeTranscriptReplay and buildClaudeHandoffSummary.
-function extractClaudeTranscriptExchanges(sessionId, maxExchanges = 30) {
+function extractClaudeTranscriptExchanges(sessionId, maxExchanges = 30, sinceISO = null) {
   if (!sessionId) return [];
+  const sinceMs = sinceISO ? Date.parse(sinceISO) : null;
   try {
     const transcriptDir = toClaudeProjectDir(WORKSPACE);
     const transcriptPath = path.join(transcriptDir, `${sessionId}.jsonl`);
@@ -649,19 +746,21 @@ function extractClaudeTranscriptExchanges(sessionId, maxExchanges = 30) {
     for (const line of lines) {
       try {
         const entry = JSON.parse(line);
+        const ts = (typeof entry.timestamp === 'string') ? entry.timestamp : null;
+        if (sinceMs && ts && Date.parse(ts) < sinceMs) continue;
         if (entry.type === 'user' && entry.message?.content) {
           const content = Array.isArray(entry.message.content)
             ? entry.message.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
             : entry.message.content;
           if (typeof content === 'string' && content.trim() && !content.startsWith('<')) {
-            exchanges.push({ role: 'user', text: content.trim().slice(0, 4000) });
+            exchanges.push({ role: 'user', text: content.trim().slice(0, 4000), timestamp: ts });
           }
         } else if (entry.type === 'assistant' && entry.message?.content) {
           const content = Array.isArray(entry.message.content)
             ? entry.message.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
             : entry.message.content;
           if (typeof content === 'string' && content.trim()) {
-            exchanges.push({ role: 'assistant', text: content.trim().slice(0, 4000) });
+            exchanges.push({ role: 'assistant', text: content.trim().slice(0, 4000), timestamp: ts });
           }
         }
       } catch {}
@@ -1830,16 +1929,21 @@ async function handleSlashCommand(chatId, text) {
           `Send /codex to toggle backend. Current backend: ${getBackend(chatId).toUpperCase()}.`,
         ].join('\n');
       }
-      // `/codex --full` → switch to Codex and prebuild raw transcript replay.
+      // `/codex --full` → switch to Codex with full session gap (no time filter).
       if (sub === '--full') {
         const previousBackend = getBackend(chatId);
         const sessionKey = String(chatId);
         let transferContext = null;
         if (previousBackend === 'claude') {
-          transferContext = buildClaudeTranscriptReplay(getStoredSessionId('claude', sessionKey), 20);
-          if (transferContext) log(`Prebuilt claude→codex full replay for ${sessionKey}: ${transferContext.length} chars`);
+          transferContext = buildGapTranscript('claude', sessionKey, null);
+          if (transferContext) {
+            log(`Prebuilt claude→codex full gap for ${sessionKey}: ${transferContext.length} chars`);
+          } else {
+            log(`No claude→codex full gap to inject for ${sessionKey} (no Claude session or no extractable events)`);
+          }
         }
         setBackend(chatId, 'codex', transferContext ? { context: transferContext, mode: 'full' } : undefined);
+        markBackendArrival(sessionKey, 'codex');
         const currentId = settings.codexModel || CODEX_DEFAULT_MODEL;
         return `Backend switched to CODEX (${currentId}). Full transcript replay is ready, and today's Codex thread will resume if it already exists.`;
       }
@@ -1853,31 +1957,30 @@ async function handleSlashCommand(chatId, text) {
         return `Unknown Codex model "${arg}". Try /codex help.`;
       }
 
-      // Bare `/codex` → generate the handoff summary now, then switch.
+      // Bare `/codex` → switch to Codex with gap transcript from Claude since user last arrived there.
       const previousBackend = getBackend(chatId);
       const sessionKey = String(chatId);
       let transferContext = null;
       let transferMode = null;
       if (previousBackend === 'claude') {
-        await tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
-        transferContext = await buildClaudeHandoffSummary(getStoredSessionId('claude', sessionKey));
-        transferMode = 'handoff';
+        const since = getBackendArrival(sessionKey, 'claude');
+        transferContext = buildGapTranscript('claude', sessionKey, since);
+        transferMode = 'gap';
         if (transferContext) {
-          log(`Prebuilt claude→codex handoff for ${sessionKey}: ${transferContext.length} chars`);
+          log(`Prebuilt claude→codex gap for ${sessionKey}: ${transferContext.length} chars (since=${since || 'beginning-of-session'})`);
         } else {
-          transferContext = buildClaudeTranscriptReplay(getStoredSessionId('claude', sessionKey), 20);
-          transferMode = 'replay-fallback';
-          if (transferContext) log(`Prebuilt claude→codex replay fallback for ${sessionKey}: ${transferContext.length} chars`);
+          log(`No claude→codex gap to inject for ${sessionKey} (since=${since || 'beginning-of-session'}; no events in window or no Claude session)`);
         }
       }
       setBackend(chatId, 'codex', transferContext ? { context: transferContext, mode: transferMode } : undefined);
+      markBackendArrival(sessionKey, 'codex');
       const currentId = settings.codexModel || CODEX_DEFAULT_MODEL;
       const resumeNote = getStoredSessionId('codex', sessionKey)
         ? "Today's Codex thread will resume on your next message."
         : 'Next Codex message starts a fresh daily thread.';
       return transferContext
-        ? `Backend switched to CODEX (${currentId}). Handoff is ready. ${resumeNote}`
-        : `Backend switched to CODEX (${currentId}). No Claude handoff context was available. ${resumeNote}`;
+        ? `Backend switched to CODEX (${currentId}). Gap transcript is ready. ${resumeNote}`
+        : `Backend switched to CODEX (${currentId}). No Claude gap context to inject. ${resumeNote}`;
     }
 
     case '/claude': {
@@ -1892,38 +1995,33 @@ async function handleSlashCommand(chatId, text) {
       }
 
       if (previousBackend === 'codex') {
-        await tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
         if (sub === '--full') {
-          transferContext = buildCodexTranscriptReplay(getStoredSessionId('codex', sessionKey), 20);
+          transferContext = buildGapTranscript('codex', sessionKey, null);
           transferMode = 'full';
-          if (transferContext) log(`Prebuilt codex→claude full replay for ${sessionKey}: ${transferContext.length} chars`);
-        } else {
-          transferContext = await buildCodexHandoffSummary(getStoredSessionId('codex', sessionKey), {
-            codexModel: settings.codexModel || CODEX_DEFAULT_MODEL,
-            effort: settings.effort || 'medium',
-            codexVerbosity: settings.codexVerbosity || null,
-          });
-          transferMode = 'handoff';
           if (transferContext) {
-            log(`Prebuilt codex→claude handoff for ${sessionKey}: ${transferContext.length} chars`);
+            log(`Prebuilt codex→claude full gap for ${sessionKey}: ${transferContext.length} chars`);
           } else {
-            transferContext = buildCodexTranscriptReplay(getStoredSessionId('codex', sessionKey), 20);
-            transferMode = 'replay-fallback';
-            if (transferContext) {
-              log(`Prebuilt codex→claude replay fallback for ${sessionKey}: ${transferContext.length} chars`);
-            } else {
-              log(`Prebuilt codex→claude replay fallback returned EMPTY for ${sessionKey} — handoff will ship no context (rollout missing/unreadable or extractor matched zero events)`);
-            }
+            log(`No codex→claude full gap to inject for ${sessionKey} (no Codex thread or no extractable events)`);
+          }
+        } else {
+          const since = getBackendArrival(sessionKey, 'codex');
+          transferContext = buildGapTranscript('codex', sessionKey, since);
+          transferMode = 'gap';
+          if (transferContext) {
+            log(`Prebuilt codex→claude gap for ${sessionKey}: ${transferContext.length} chars (since=${since || 'beginning-of-thread'})`);
+          } else {
+            log(`No codex→claude gap to inject for ${sessionKey} (since=${since || 'beginning-of-thread'}; no events in window or no Codex thread)`);
           }
         }
       }
 
       setBackend(chatId, 'claude', transferContext ? { context: transferContext, mode: transferMode } : undefined);
+      markBackendArrival(sessionKey, 'claude');
       const resumeNote = getStoredSessionId('claude', sessionKey)
         ? "Today's Claude session will resume on your next message."
         : 'Next Claude message starts a fresh daily session.';
       return transferContext
-        ? `Backend switched to CLAUDE. Handoff is ready. ${resumeNote}`
+        ? `Backend switched to CLAUDE. Gap transcript is ready. ${resumeNote}`
         : `Backend switched to CLAUDE. ${resumeNote}`;
     }
 
@@ -1951,17 +2049,8 @@ async function handleSlashCommand(chatId, text) {
       const currentBackend = getBackend(chatId);
       const otherBackend = currentBackend === 'claude' ? 'codex' : 'claude';
       let context = null;
-      if (otherBackend === 'codex') {
-        context = await buildCodexHandoffSummary(getStoredSessionId('codex', sessionKey), {
-          codexModel: settings.codexModel || CODEX_DEFAULT_MODEL,
-          effort: settings.effort || 'medium',
-          codexVerbosity: settings.codexVerbosity || null,
-        });
-        if (!context) context = buildCodexTranscriptReplay(getStoredSessionId('codex', sessionKey), 20);
-      } else {
-        context = await buildClaudeHandoffSummary(getStoredSessionId('claude', sessionKey));
-        if (!context) context = buildClaudeTranscriptReplay(getStoredSessionId('claude', sessionKey), 20);
-      }
+      const since = getBackendArrival(sessionKey, otherBackend);
+      context = buildGapTranscript(otherBackend, sessionKey, since);
       if (!context) return `No ${otherBackend} session found to catch up from. Source transcript is empty or unreadable.`;
       state.pendingTransfer[sessionKey] = { from: otherBackend, to: currentBackend, context, mode: 'catchup' };
       saveState();
@@ -2228,39 +2317,22 @@ async function handleTelegramMessage(item) {
       transferContext = pending.context;
       log(`Transfer ${pending.from}→${pending.to} (${pending.mode || 'prebuilt'}) for ${sessionKey}: ${transferContext.length} chars`);
     } else if (pending.from === 'claude' && backend === 'codex') {
-      const claudeSid = getStoredSessionId('claude', sessionKey);
-      if (settings.transferMode === 'full') {
-        // /codex --full: raw transcript replay
-        transferContext = buildClaudeTranscriptReplay(claudeSid, 20);
-        delete settings.transferMode;
-        if (transferContext) log(`Transfer claude→codex (full) for ${sessionKey}: ${transferContext.length} chars`);
+      const sinceClaude = getBackendArrival(sessionKey, 'claude');
+      const useFullSession = settings.transferMode === 'full';
+      transferContext = buildGapTranscript('claude', sessionKey, useFullSession ? null : sinceClaude);
+      if (useFullSession) delete settings.transferMode;
+      if (transferContext) {
+        log(`Transfer claude→codex gap for ${sessionKey}: ${transferContext.length} chars (mode=${useFullSession ? 'full' : 'gap'})`);
       } else {
-        // Default: meta-prompt handoff summary via Sonnet
-        transferContext = await buildClaudeHandoffSummary(claudeSid);
-        if (transferContext) {
-          log(`Transfer claude→codex (handoff) for ${sessionKey}: ${transferContext.length} chars`);
-        } else {
-          // Fallback to raw replay if summary fails
-          transferContext = buildClaudeTranscriptReplay(claudeSid, 20);
-          if (transferContext) log(`Transfer claude→codex (replay fallback) for ${sessionKey}: ${transferContext.length} chars`);
-        }
+        log(`Transfer claude→codex gap empty for ${sessionKey} (no Claude session or no events in window)`);
       }
     } else if (pending.from === 'codex' && backend === 'claude') {
-      const codexTid = getStoredSessionId('codex', sessionKey);
-      transferContext = await buildCodexHandoffSummary(codexTid, {
-        codexModel: settings.codexModel || CODEX_DEFAULT_MODEL,
-        effort: settings.effort || 'medium',
-        codexVerbosity: settings.codexVerbosity || null,
-      });
+      const sinceCodex = getBackendArrival(sessionKey, 'codex');
+      transferContext = buildGapTranscript('codex', sessionKey, sinceCodex);
       if (transferContext) {
-        log(`Transfer codex→claude (handoff) for ${sessionKey}: ${transferContext.length} chars`);
+        log(`Transfer codex→claude gap for ${sessionKey}: ${transferContext.length} chars`);
       } else {
-        transferContext = buildCodexTranscriptReplay(codexTid, 20);
-        if (transferContext) {
-          log(`Transfer codex→claude (replay fallback) for ${sessionKey}: ${transferContext.length} chars`);
-        } else {
-          log(`Transfer codex→claude (replay fallback) returned EMPTY for ${sessionKey} — handoff will ship no context (rollout missing/unreadable or extractor matched zero events)`);
-        }
+        log(`Transfer codex→claude gap empty for ${sessionKey} (no Codex thread or no events in window)`);
       }
     }
     delete state.pendingTransfer[sessionKey];
