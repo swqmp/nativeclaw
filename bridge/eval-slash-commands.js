@@ -181,6 +181,21 @@ const checks = [
       return patterns.filter((p) => !p.test(source)).map((p) => `missing ${p}`);
     },
   },
+  {
+    name: 'first-run onboarding is Telegram-first and config-gated',
+    run() {
+      const patterns = [
+        /firstRun: \{\},/,
+        /config\.firstRunOnboarding !== false/,
+        /function buildFirstRunWelcome\(\)/,
+        /function buildFirstRunPromptContext\(\)/,
+        /USER\.md/,
+        /MEMORY\.md/,
+        /TOOLS\.md/,
+      ];
+      return patterns.filter((p) => !p.test(source)).map((p) => `missing ${p}`);
+    },
+  },
 ];
 
 let failed = 0;

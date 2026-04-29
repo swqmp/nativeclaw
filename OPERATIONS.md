@@ -71,9 +71,9 @@ schtasks /delete /tn "NativeClaw" /f
 | Command | What It Does |
 |---|---|
 | `/claude` | Use Claude backend |
-| `/claude --full` | Claude with raw Codex replay |
+| `/claude --full` | Claude with forced Codex gap transcript injection |
 | `/codex` | Use Codex backend |
-| `/codex --full` | Codex with raw Claude replay |
+| `/codex --full` | Codex with forced Claude gap transcript injection |
 | `/codex help` | List Codex model aliases |
 | `/effort <low|medium|high|xhigh|max>` | Set reasoning effort |
 | `/verbosity <default|low|medium|high>` | Set Codex verbosity |
@@ -89,13 +89,25 @@ schtasks /delete /tn "NativeClaw" /f
 | `/status` | Backend/model/session status |
 | `/restart` | Ask the service manager to restart the bridge |
 
-## Backend Handoffs
+## First-Run Onboarding
 
-Switching backends pauses the current backend and resumes the target backend's same-day session/thread when available. Continuity comes from both the generated handoff block and the resumed target context.
+On the first non-command Telegram message for a chat, the bridge sends a short welcome explaining that Telegram is the control surface and that the user can introduce themselves, their goals, and desired tool connections. The same first user message still goes to the active backend with first-run context so the agent can help save durable facts into `USER.md`, `MEMORY.md`, and `TOOLS.md`.
 
-- `/codex` creates a Claude-to-Codex summary with the latest exchange copied verbatim.
-- `/claude` creates a Codex-to-Claude summary with the latest exchange copied verbatim.
-- `--full` uses raw transcript replay instead of summary.
+Disable this by setting:
+
+```json
+"firstRunOnboarding": false
+```
+
+## Backend Switching
+
+Switching backends pauses the current backend and resumes the target backend's same-day session/thread when available. Continuity comes from the target backend's resumed context plus a raw gap transcript from the backend you just left.
+
+- `/codex` injects the most recent Claude gap since you last arrived at Claude.
+- `/claude` injects the most recent Codex gap since you last arrived at Codex.
+- Gap transcript includes user-typed inputs and assistant text outputs only.
+- Gap transcript uses simple timestamp framing and is capped at 50k characters, dropping oldest entries first.
+- `--full` forces raw gap transcript injection from the available session/thread.
 - Session-audit cron clears both Claude and Codex sessions after it runs.
 
 Stale sessions/threads are ignored after the 5 AM session-day boundary, so backend switching keeps same-day context without hauling old accumulated context indefinitely.

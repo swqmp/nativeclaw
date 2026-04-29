@@ -24,23 +24,23 @@ User (Telegram) -> Bridge (Node.js) -> Active Backend -> Response -> Telegram
 
 Claude and Codex share the same workspace memory files.
 
-Backend switches use curated handoff summaries:
-- `/codex` switches Claude -> Codex
-- `/claude` switches Codex -> Claude
-- `--full` variants use raw transcript replay
+Backend switches use raw gap transcript injection:
+- `/codex` switches Claude -> Codex and injects the most recent Claude gap
+- `/claude` switches Codex -> Claude and injects the most recent Codex gap
+- `--full` variants force gap transcript injection from the available session/thread
 - same-day target sessions/threads are resumed when available
 - stale target sessions/threads are ignored after the 5 AM session-day boundary
 
-Continuity comes from the handoff summary, resumed same-day backend context, and durable workspace files.
+Gap transcripts include user-typed inputs and assistant text outputs only, with timestamps and a 50k-character cap. Continuity comes from the gap transcript, resumed same-day backend context, and durable workspace files.
 
 ## Telegram Commands
 
 | Command | What It Does |
 |---|---|
 | `/claude` | Use Claude backend |
-| `/claude --full` | Use Claude with raw Codex replay |
+| `/claude --full` | Use Claude with forced Codex gap transcript injection |
 | `/codex` | Use Codex backend |
-| `/codex --full` | Use Codex with raw Claude replay |
+| `/codex --full` | Use Codex with forced Claude gap transcript injection |
 | `/codex help` | List Codex model shortcuts |
 | `/5.4`, `/5.4-mini`, `/5.3-codex`, `/5.2`, `/5.2-codex`, `/5.1-codex-max`, `/5.1-codex-mini` | Set Codex model |
 | `/opus` | Opus 4.7 |

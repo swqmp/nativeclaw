@@ -8,7 +8,7 @@ It started as a Claude Code bridge. Current NativeClaw can run either Claude or 
 
 - Responds to Telegram messages through Claude Code or Codex CLI
 - Switches backends with `/claude` and `/codex`
-- Preserves backend-switch continuity with handoff summaries
+- Preserves backend-switch continuity with raw gap transcripts
 - Runs bridge-level scheduled jobs such as briefs, audits, queue recovery, and heartbeats
 - Keeps durable memory in workspace files instead of relying on chat history
 - Supports images, voice notes, audio files, and document attachments
@@ -20,8 +20,8 @@ Current bridge version: `v1.10.0`.
 
 Highlights:
 - **Agent reliability stack** (new in v1.10): QMD semantic memory search, feedback-loop discipline, platform keychain for API keys, MCP probe + wrapper, task queue, session self-audit, memory-reminder hooks
-- `/codex` and `/claude` backend switching with Sonnet handoff summaries
-- `/codex --full` and `/claude --full` raw replay escape hatches
+- `/codex` and `/claude` backend switching with timestamped gap transcripts
+- `/codex --full` and `/claude --full` force full available gap replay
 - `/effort <low|medium|high|xhigh|max>` for Claude/Codex reasoning depth
 - `/verbosity <default|low|medium|high>` for Codex response verbosity
 - `/opus` maps to Opus 4.7, with `/opus4.6` kept as a legacy alias
@@ -37,8 +37,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the detailed history.
 - macOS, Linux, or Windows
 - Node.js 18+
 - Telegram account and bot token from [@BotFather](https://t.me/BotFather)
-- Claude Code CLI (`claude`) with an active Claude subscription
-- Codex CLI (`codex`) if you want the Codex backend
+- Claude Code CLI (`claude`) with an active Claude subscription, Codex CLI (`codex`), or both
 - OpenAI API key if you want voice/audio transcription through Whisper API
 
 Windows users should run `setup.sh` in Git Bash or MSYS2, not Command Prompt or PowerShell.
@@ -58,15 +57,16 @@ bash setup.sh
 ```
 
 The setup wizard will:
-1. Check Node.js and Claude CLI
+1. Check Node.js and available backend CLIs
 2. Walk you through Telegram bot setup
-3. Let you choose the default Claude model
-4. Install bridge, scripts, workspace templates, skills, hooks, and cron schedule
-5. Store optional OpenAI API key for voice transcription
-6. Offer optional Nano Banana image generation (Google Gemini)
-7. Offer optional QMD semantic memory search (Google Gemini; key stored in your OS keychain)
-8. Offer to wire memory-check + feedback-check prompt hooks into `~/.claude/settings.json`
-9. Install and optionally start the service
+3. Ask what your agent should be called and what it should call you
+4. Let you choose Claude-only, Codex-only, or Claude + Codex
+5. Install bridge, scripts, workspace templates, skills, hooks, and cron schedule
+6. Store optional OpenAI API key for voice transcription
+7. Offer optional Nano Banana image generation (Google Gemini)
+8. Offer optional QMD semantic memory search (Google Gemini; key stored in your OS keychain)
+9. Offer to wire memory-check + feedback-check prompt hooks into `~/.claude/settings.json`
+10. Install and optionally start the service
 
 ## What You Get Out of the Box
 
@@ -96,6 +96,26 @@ Beyond the core bridge, v1.10 ships an **agent reliability stack** so your agent
 - `skills/` — 14 bundled skills (design, document handling, testing, brainstorming) plus `SKILL_INDEX.md`
 
 All optional pieces (QMD, hooks, image gen) can be skipped during setup and enabled later. See [OPERATIONS.md](OPERATIONS.md).
+
+## First-Run Experience
+
+NativeClaw is designed so setup is the only terminal-heavy part. After the bridge starts, the normal user experience is Telegram-first:
+
+1. Message your bot in Telegram.
+2. On the first non-command message, NativeClaw sends a short welcome that explains what to say next.
+3. Run `/status` to confirm the bridge is alive.
+4. Tell the agent who you are and what you want help with.
+5. Let the agent write durable context into `USER.md`, `MEMORY.md`, and `TOOLS.md`.
+6. Use `/claude` and `/codex` only if you installed both backends and want to switch models.
+
+Set `"firstRunOnboarding": false` in `config.json` if you want to skip the Telegram welcome.
+
+Plain-English concepts:
+- **Telegram bot:** the private chat surface where you talk to your agent.
+- **Bot token:** the secret Telegram gives NativeClaw so it can receive and send bot messages.
+- **Backend:** the model CLI that answers messages. Claude and Codex are both supported; either can be the only backend.
+- **MCP:** a tool connector. MCP servers let the agent talk to apps and data sources such as calendars, files, GitHub, or custom APIs.
+- **QMD:** optional semantic memory search. It embeds memory files with Google's Gemini embedding API so the agent can search past decisions by meaning, not just exact keywords.
 
 ## Architecture
 
@@ -140,9 +160,9 @@ Important files after install:
 | Command | What It Does |
 |---|---|
 | `/claude` | Use Claude backend |
-| `/claude --full` | Use Claude with raw Codex transcript replay |
+| `/claude --full` | Use Claude and force raw Codex gap transcript injection |
 | `/codex` | Use Codex backend |
-| `/codex --full` | Use Codex with raw Claude transcript replay |
+| `/codex --full` | Use Codex and force raw Claude gap transcript injection |
 | `/codex help` | List Codex model shortcuts |
 | `/5.4`, `/5.4-mini`, `/5.3-codex`, `/5.2`, `/5.2-codex`, `/5.1-codex-max`, `/5.1-codex-mini` | Set Codex model |
 | `/opus` | Switch Claude model to Opus 4.7 |

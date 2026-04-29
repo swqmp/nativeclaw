@@ -6,7 +6,7 @@ First major release focused on making the agent reliable out-of-box, not just fu
 
 ### Bridge — Session & Backend Architecture
 - **5 AM ET session-day anchor:** `getCurrentSessionDay()` treats hours 00:00–04:59 ET as the previous calendar day so live sessions survive the midnight boundary. The 5:10 AM `session-audit` cron is now safety-net only, not the primary kill.
-- **Two-tier backend handoff:** `/codex` and `/claude` first try a source-owned summary; if the source backend can't produce one (crashing/empty/unresponsive), the bridge falls back to injecting the **last 20 raw transcript exchanges**. If neither tier produces context, the bridge ships nothing instead of guessing — the resumed backend just greets normally. Old "breadcrumb pointer" path removed.
+- **Gap transcript backend switching:** `/codex` and `/claude` resume the target backend's same-day session/thread and inject the other backend's most recent user/assistant text gap with timestamp framing. No LLM summary call is made on switch. Gap blocks cap at 50k characters and drop oldest entries first. Old breadcrumb pointer and LLM handoff-summary paths removed.
 - **Collapsed Codex `CONTEXT_PROFILES`:** `chat` and `work` profiles merged into a single `chat` profile that injects SOUL + USER + TOOLS + NATIVECLAW + device + MEMORY + last 3 daily logs, matching Claude's primer for parity. `cron` profile remains lean. `detectContextProfile()` removed.
 - **`SESSION_START_COMPLETED_TODAY` flag:** New global flag in `state.json` so the SESSION START checklist runs once per 5 AM session day instead of on every fresh session/thread switch. Both Claude and Codex primers honor it.
 - **Per-day Claude/Codex session tracking:** `state.sessionDates` and `state.codexSessionDates` bind sessions/threads to the day they were created. Switching `/claude` ↔ `/codex` resumes the target backend's same-day session/thread instead of force-cold-starting it. True cold start happens at daily session audit, on `/reset`, or on `clearStoredSession()`.
@@ -49,6 +49,7 @@ First major release focused on making the agent reliable out-of-box, not just fu
 - System file promotion table.
 
 ### Setup Wizard
+- New backend setup flow: asks for agent name and user name, then supports Claude-only, Codex-only, or Claude + Codex installs.
 - New steps: optional QMD enable (stores Gemini key in OS keychain), optional hook install into `~/.claude/settings.json`.
 - Installs all 14 bundled skills instead of just 3.
 - Copies reliability scripts, MCP health files, task queue, and platform formatting docs.

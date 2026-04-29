@@ -8,6 +8,9 @@
   "cronSchedule": "$HOME/.claude/cron-schedule.json",
   "model": "sonnet",
   "defaultBackend": "claude",
+  "agentName": "NativeClaw",
+  "userName": "you",
+  "firstRunOnboarding": true,
   "restartCommand": "",
   "openaiApiKey": "YOUR_OPENAI_API_KEY_OPTIONAL_FOR_VOICE"
 }

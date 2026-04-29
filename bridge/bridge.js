@@ -71,6 +71,7 @@ let state = {
   pendingTransfer: {},  // { chatId: {from, to, context?} } — one-shot flag to inject cross-backend context on next message
   sessionStartRanToday: '',  // YYYY-MM-DD — set once SESSION START ran today on either backend; implicitly cleared when day rolls (5 AM ET anchor)
   arrivedAt: {},        // { chatId: { claude: ISO, codex: ISO } } — when the user most recently arrived at each backend; gap-transcript boundary
+  firstRun: {},         // { chatId: { greetedAt: ISO } } — Telegram-first onboarding already shown
   exchangeCount: {},
 };
 if (fs.existsSync(STATE_PATH)) {
@@ -86,6 +87,7 @@ if (fs.existsSync(STATE_PATH)) {
     if (!state.pendingTransfer) state.pendingTransfer = {};
     if (typeof state.sessionStartRanToday !== 'string') state.sessionStartRanToday = '';
     if (!state.arrivedAt || typeof state.arrivedAt !== 'object') state.arrivedAt = {};
+    if (!state.firstRun || typeof state.firstRun !== 'object') state.firstRun = {};
     const today = getCurrentSessionDay();
     for (const [cid, sid] of Object.entries(state.sessions)) {
       if (sid && !state.sessionDates[cid]) state.sessionDates[cid] = today;
@@ -106,6 +108,30 @@ if (fs.existsSync(STATE_PATH)) {
 
 function getBackend(chatId) {
   return state.backends[String(chatId)] || config.defaultBackend || 'claude';
+}
+
+function buildFirstRunWelcome() {
+  return [
+    `${AGENT_LABEL} is connected.`,
+    '',
+    'This chat is the main control surface. Tell me who you are, what you want help with, and what apps or tools you eventually want connected.',
+    '',
+    'I can help turn that into durable workspace memory: USER.md for you, MEMORY.md for ongoing context, and TOOLS.md for local tool setup.',
+    '',
+    'Useful commands: /status checks the bridge, /help lists commands, and /claude or /codex switch backends if both are installed.',
+  ].join('\n');
+}
+
+function buildFirstRunPromptContext() {
+  return [
+    '# FIRST-RUN ONBOARDING CONTEXT',
+    '',
+    'This is the user\'s first non-command Telegram message after setup.',
+    'Help them establish durable context. If they introduce themselves, offer to save stable facts to USER.md, MEMORY.md, and TOOLS.md as appropriate.',
+    'Keep the response concise and practical.',
+    '',
+    '# END FIRST-RUN ONBOARDING CONTEXT',
+  ].join('\n');
 }
 
 function getCurrentSessionDay(date = new Date()) {
@@ -2017,6 +2043,15 @@ async function handleTelegramMessage(item) {
     // null = unknown command or /search, pass through to Claude
   }
 
+  let firstRunPromptContext = '';
+  if (config.firstRunOnboarding !== false && !text.startsWith('/') && !state.firstRun[sessionKey]) {
+    state.firstRun[sessionKey] = { greetedAt: new Date().toISOString() };
+    saveState();
+    await sendMessage(chatId, buildFirstRunWelcome());
+    firstRunPromptContext = buildFirstRunPromptContext();
+    log(`First-run onboarding shown for ${sessionKey}`);
+  }
+
   // Typing indicator — repeat every 4s since Telegram's indicator expires after 5s
   tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
   const typingInterval = setInterval(() => {
@@ -2031,6 +2066,9 @@ async function handleTelegramMessage(item) {
 
   // Build prompt — for /search, wrap with QMD instruction
   let prompt = text;
+  if (firstRunPromptContext) {
+    prompt = `${firstRunPromptContext}\n\n# USER MESSAGE\n\n${prompt}`;
+  }
   if (text.startsWith('/search ')) {
     prompt = `Search memory using the QMD search_memory tool for: ${text.slice(8)}. Return the results.`;
   }

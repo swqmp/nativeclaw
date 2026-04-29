@@ -1,6 +1,6 @@
 # Upgrading to v1.10 from v1.9.x
 
-v1.10 is mostly additive, but **the bridge runtime did change in two ways** worth a quick look (session/backend behavior + file-type allowlist). Your existing Telegram/Claude/Codex setup keeps working with no config changes — but the new behavior is automatic, so a `git pull` + restart is enough.
+v1.10 is mostly additive, but **the bridge runtime did change in two ways** worth a quick look (session/backend behavior + file-type allowlist). Your existing Telegram/Claude/Codex setup keeps working after `git pull` + restart. Add `agentName` and `userName` to `config.json` if you want the generic bridge prompts to use your agent/user names.
 
 ## TL;DR
 
@@ -13,11 +13,23 @@ v1.10 is mostly additive, but **the bridge runtime did change in two ways** wort
 
 ### Session & backend behavior
 - **Session day anchored at 05:00 ET** (configurable via `config.sessionTimeZone` or `NATIVECLAW_SESSION_TIMEZONE`). Sessions survive the midnight boundary — the daily `session-audit` cron is now a safety-net rotation trigger, not the primary kill.
-- **Two-tier backend handoff** on `/claude` ↔ `/codex` switches: source-summary first, last-20-message raw transcript replay as fallback, no-op if neither tier produces context. The previous breadcrumb-pointer scheme is removed; if you had any custom code reading `breadcrumb` fields from `state.json`, drop it.
+- **Gap transcript backend switching** on `/claude` ↔ `/codex`: the bridge resumes the target backend's same-day session/thread, then injects the other backend's most recent user/assistant text gap with simple timestamp framing. No LLM summary call is made during the switch. Gap transcript blocks are capped at 50k characters and drop oldest entries first.
+- **Arrival-boundary state:** `state.arrivedAt[chatId][backend]` tracks when the user most recently arrived at each backend. The previous breadcrumb-pointer and LLM handoff-summary paths are removed. If you had custom code reading `breadcrumb` fields from `state.json`, drop it.
 - **Per-day session/thread tracking:** `state.sessionDates` and `state.codexSessionDates` are new fields. The bridge back-fills them automatically from existing `state.sessions` / `state.codexSessions` on first start — no migration needed.
 - **`SESSION_START_COMPLETED_TODAY` flag** prevents the SESSION START checklist from running on every fresh session of the same 5 AM session day. If you observe the checklist running mid-day after a fresh thread, check `state.sessionStartRanToday`.
 - **Codex execution is serialized**: user turns and crons no longer race. If you had cron entries scheduled tightly against user activity, they will now queue instead of running concurrently.
 - **Codex `CONTEXT_PROFILES` collapsed** from `chat`/`work`/`cron` to `chat`/`cron`. If you had custom `detectContextProfile()` overrides, remove them — the bridge no longer calls that function.
+
+### Setup and config
+- `setup.sh` now supports Claude-only, Codex-only, or Claude + Codex installs. Claude CLI is no longer required if you choose Codex-only.
+- `setup.sh` asks for your agent name and user name, then writes `agentName` and `userName` to `~/.claude/telegram-bridge/config.json`.
+- Existing installs can add the same fields manually:
+  ```json
+  "agentName": "Whet",
+  "userName": "Jamiah",
+  "firstRunOnboarding": true
+  ```
+- `firstRunOnboarding` controls the Telegram-first welcome shown on the first non-command message. Set it to `false` to disable.
 
 ### File attachments
 - **HEIC/HEIF (iPhone photos), RTF, ODT/ODS/ODP, EPUB, YAML/TOML, EML/MSG, TEX, IPYNB, `.log`, and `.ppt` (legacy Office)** now accepted by the document handler. No config change required.

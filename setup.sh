@@ -11,6 +11,10 @@ WORKSPACE_DIR="$CLAUDE_DIR/workspace"
 LOG_DIR="$CLAUDE_DIR/logs"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 
+json_escape() {
+    python3 -c 'import json, sys; print(json.dumps(sys.argv[1])[1:-1])' "$1"
+}
+
 echo ""
 echo "============================================"
 echo "  NativeClaw Setup"
@@ -22,6 +26,11 @@ echo ""
 # Check prerequisites
 # -------------------------------------------------------
 echo "[1/8] Checking prerequisites..."
+echo ""
+echo "  NativeClaw needs Node.js for the bridge runtime and at least one model"
+echo "  backend CLI. Claude and Codex are both supported; you can run either"
+echo "  one alone, or install both and switch between them from Telegram."
+echo ""
 
 OS="$(uname -s)"
 
@@ -35,19 +44,29 @@ if ! command -v node &> /dev/null; then
     exit 1
 fi
 
-if ! command -v claude &> /dev/null; then
-    echo "ERROR: Claude Code CLI is not installed."
-    echo "Install it: npm install -g @anthropic-ai/claude-code"
-    echo "Then run: claude auth login"
-    exit 1
-fi
-
 echo "  Node.js: $(node --version)"
-echo "  Claude CLI: found"
+
+HAS_CLAUDE=0
+HAS_CODEX=0
+if command -v claude &> /dev/null; then
+    HAS_CLAUDE=1
+    echo "  Claude CLI: found"
+else
+    echo "  Claude CLI: not found"
+fi
 if command -v codex &> /dev/null; then
+    HAS_CODEX=1
     echo "  Codex CLI: found"
 else
-    echo "  Codex CLI: not found (optional; /codex backend will be unavailable until installed)"
+    echo "  Codex CLI: not found"
+fi
+
+if [ "$HAS_CLAUDE" -eq 0 ] && [ "$HAS_CODEX" -eq 0 ]; then
+    echo ""
+    echo "ERROR: Install at least one backend CLI before setup."
+    echo "  Claude: npm install -g @anthropic-ai/claude-code && claude auth login"
+    echo "  Codex:  install the OpenAI Codex CLI and authenticate it"
+    exit 1
 fi
 echo ""
 
@@ -55,6 +74,10 @@ echo ""
 # Telegram bot setup
 # -------------------------------------------------------
 echo "[2/8] Telegram Bot Setup"
+echo ""
+echo "  Telegram is where you'll message your NativeClaw agent."
+echo "  The bot token lets the bridge receive your Telegram messages and"
+echo "  send replies back through your private bot."
 echo ""
 echo "  You need a Telegram bot. If you don't have one:"
 echo "  1. Open Telegram and message @BotFather"
@@ -93,23 +116,101 @@ echo "  Chat ID: $CHAT_ID"
 echo ""
 
 # -------------------------------------------------------
-# Choose default model
+# Agent identity + backend choice
 # -------------------------------------------------------
-echo "[3/8] Default Model"
+echo "[3/8] Agent Identity & Backend"
 echo ""
-echo "  1) Sonnet 4.6 (recommended — fast, capable)"
-echo "  2) Opus 4.7 (most capable, slower)"
-echo "  3) Haiku 4.5 (fastest, less capable)"
+echo "  Your agent name appears in its prompts and self-description."
+echo "  Example: Whet, Nova, Claw, or anything else you want."
 echo ""
-read -p "  Choose [1/2/3]: " MODEL_CHOICE
+read -p "  What should your NativeClaw agent be called? [NativeClaw]: " AGENT_NAME
+AGENT_NAME="${AGENT_NAME:-NativeClaw}"
+read -p "  What should $AGENT_NAME call you? [you]: " USER_NAME
+USER_NAME="${USER_NAME:-you}"
+echo ""
+echo "  Backend = the model CLI NativeClaw uses to answer Telegram messages."
+echo "  Claude is Anthropic's Claude Code CLI. Codex is OpenAI's Codex CLI."
+echo "  If you install both, you can switch anytime with /claude and /codex."
+echo ""
+echo "  Available backends on this machine:"
+[ "$HAS_CLAUDE" -eq 1 ] && echo "    - Claude: available" || echo "    - Claude: not installed"
+[ "$HAS_CODEX" -eq 1 ] && echo "    - Codex: available" || echo "    - Codex: not installed"
+echo ""
+echo "  1) Claude only"
+echo "  2) Codex only"
+echo "  3) Claude + Codex (recommended if both are installed)"
+echo ""
+if [ "$HAS_CLAUDE" -eq 1 ] && [ "$HAS_CODEX" -eq 1 ]; then
+    DEFAULT_BACKEND_CHOICE=3
+elif [ "$HAS_CLAUDE" -eq 1 ]; then
+    DEFAULT_BACKEND_CHOICE=1
+else
+    DEFAULT_BACKEND_CHOICE=2
+fi
 
-case $MODEL_CHOICE in
-    2) MODEL="claude-opus-4-7" ;;
-    3) MODEL="haiku" ;;
-    *) MODEL="sonnet" ;;
-esac
+while true; do
+    read -p "  Choose backend setup [$DEFAULT_BACKEND_CHOICE]: " BACKEND_CHOICE
+    BACKEND_CHOICE="${BACKEND_CHOICE:-$DEFAULT_BACKEND_CHOICE}"
+    case $BACKEND_CHOICE in
+        1)
+            if [ "$HAS_CLAUDE" -eq 0 ]; then
+                echo "  Claude CLI is not installed. Pick another option or install Claude first."
+                continue
+            fi
+            ENABLE_CLAUDE=1
+            ENABLE_CODEX=0
+            DEFAULT_BACKEND="claude"
+            break
+            ;;
+        2)
+            if [ "$HAS_CODEX" -eq 0 ]; then
+                echo "  Codex CLI is not installed. Pick another option or install Codex first."
+                continue
+            fi
+            ENABLE_CLAUDE=0
+            ENABLE_CODEX=1
+            DEFAULT_BACKEND="codex"
+            break
+            ;;
+        3)
+            if [ "$HAS_CLAUDE" -eq 0 ] || [ "$HAS_CODEX" -eq 0 ]; then
+                echo "  Claude + Codex requires both CLIs. Pick an installed backend or install the missing CLI first."
+                continue
+            fi
+            ENABLE_CLAUDE=1
+            ENABLE_CODEX=1
+            DEFAULT_BACKEND="claude"
+            break
+            ;;
+        *)
+            echo "  Choose 1, 2, or 3."
+            ;;
+    esac
+done
 
-echo "  Selected: $MODEL"
+MODEL="sonnet"
+if [ "$ENABLE_CLAUDE" -eq 1 ]; then
+    echo ""
+    echo "  Default Claude model:"
+    echo "  1) Sonnet 4.6 (recommended — fast, capable)"
+    echo "  2) Opus 4.7 (most capable, slower)"
+    echo "  3) Haiku 4.5 (fastest, less capable)"
+    echo ""
+    read -p "  Choose [1/2/3]: " MODEL_CHOICE
+
+    case $MODEL_CHOICE in
+        2) MODEL="claude-opus-4-7" ;;
+        3) MODEL="haiku" ;;
+        *) MODEL="sonnet" ;;
+    esac
+fi
+
+echo ""
+echo "  Agent: $AGENT_NAME"
+echo "  User: $USER_NAME"
+echo "  Default backend: $DEFAULT_BACKEND"
+[ "$ENABLE_CLAUDE" -eq 1 ] && echo "  Claude model: $MODEL"
+[ "$ENABLE_CODEX" -eq 1 ] && echo "  Codex model: GPT-5.5 by default; change later with /5.4, /5.4-mini, etc."
 echo ""
 
 # -------------------------------------------------------
@@ -168,6 +269,9 @@ done
 
 # MCP config template
 if [ ! -f "$WORKSPACE_DIR/.mcp.json" ]; then
+    echo "  MCP servers are app/tool connectors for your agent."
+    echo "  Creating .mcp.json so you can connect calendars, files, APIs,"
+    echo "  and other tools when you're ready."
     sed "s|PATH_TO_WORKSPACE|$WORKSPACE_DIR|g" "$REPO_DIR/workspace/.mcp.json.example" > "$WORKSPACE_DIR/.mcp.json"
     echo "  Created .mcp.json from template"
 else
@@ -366,6 +470,8 @@ echo ""
 echo "[6/8] Generating config..."
 echo ""
 echo "  Voice transcription uses OpenAI Whisper API."
+echo "  This is only needed if you want Telegram voice notes/audio files"
+echo "  transcribed before they are sent to your agent."
 echo "  Press Enter to skip voice transcription for now."
 read -p "  Enter your OpenAI API key (optional): " OPENAI_API_KEY
 
@@ -377,17 +483,32 @@ else
     RESTART_CMD="nohup bash -c 'sleep 2 && schtasks /end /tn NativeClaw && schtasks /run /tn NativeClaw' >/dev/null 2>&1 &"
 fi
 
+BOT_TOKEN_JSON=$(json_escape "$BOT_TOKEN")
+CHAT_ID_JSON=$(json_escape "$CHAT_ID")
+WORKSPACE_JSON=$(json_escape "$WORKSPACE_DIR")
+MCP_CONFIG_JSON=$(json_escape "$WORKSPACE_DIR/.mcp.json")
+CRON_SCHEDULE_JSON=$(json_escape "$CLAUDE_DIR/cron-schedule.json")
+MODEL_JSON=$(json_escape "$MODEL")
+DEFAULT_BACKEND_JSON=$(json_escape "$DEFAULT_BACKEND")
+OPENAI_API_KEY_JSON=$(json_escape "$OPENAI_API_KEY")
+RESTART_CMD_JSON=$(json_escape "$RESTART_CMD")
+AGENT_NAME_JSON=$(json_escape "$AGENT_NAME")
+USER_NAME_JSON=$(json_escape "$USER_NAME")
+
 cat > "$BRIDGE_DIR/config.json" << EOF
 {
-  "botToken": "$BOT_TOKEN",
-  "allowedChatIds": ["$CHAT_ID"],
-  "workspace": "$WORKSPACE_DIR",
-  "mcpConfig": "$WORKSPACE_DIR/.mcp.json",
-  "cronSchedule": "$CLAUDE_DIR/cron-schedule.json",
-  "model": "$MODEL",
-  "defaultBackend": "claude",
-  "openaiApiKey": "$OPENAI_API_KEY",
-  "restartCommand": "$RESTART_CMD"
+  "botToken": "$BOT_TOKEN_JSON",
+  "allowedChatIds": ["$CHAT_ID_JSON"],
+  "workspace": "$WORKSPACE_JSON",
+  "mcpConfig": "$MCP_CONFIG_JSON",
+  "cronSchedule": "$CRON_SCHEDULE_JSON",
+  "model": "$MODEL_JSON",
+  "defaultBackend": "$DEFAULT_BACKEND_JSON",
+  "agentName": "$AGENT_NAME_JSON",
+  "userName": "$USER_NAME_JSON",
+  "firstRunOnboarding": true,
+  "openaiApiKey": "$OPENAI_API_KEY_JSON",
+  "restartCommand": "$RESTART_CMD_JSON"
 }
 EOF
 
@@ -406,6 +527,7 @@ echo ""
 echo "[Optional] Image Generation (Nano Banana)"
 echo ""
 echo "  Nano Banana enables AI image generation via Google Gemini."
+echo "  Skip this if you only want chat, coding, memory, and automation."
 echo "  Get a free API key at: https://aistudio.google.com/apikey"
 echo "  (Press Enter to skip)"
 echo ""
@@ -454,7 +576,8 @@ echo "[Optional] Memory Search (QMD)"
 echo ""
 echo "  QMD adds semantic search across all your memory files, daily logs,"
 echo "  and feedback — so your agent can recall past events and decisions."
-echo "  Requires a free Google AI API key (same one Nano Banana uses)."
+echo "  It uses Google's Gemini embedding API. For normal personal memory,"
+echo "  usage is usually tiny, and the same Google AI key can power Nano Banana."
 echo "  Get one at: https://aistudio.google.com/apikey"
 echo "  (Press Enter to skip — you can enable QMD later via the README)"
 echo ""
@@ -577,7 +700,9 @@ echo ""
 # -------------------------------------------------------
 echo "[7/8] Auth token..."
 
-if [ -s "$CLAUDE_DIR/.session-token" ]; then
+if [ "$ENABLE_CLAUDE" -eq 0 ]; then
+    echo "  Claude backend not selected. Skipping Claude auth token setup."
+elif [ -s "$CLAUDE_DIR/.session-token" ]; then
     echo "  Token already configured. Skipping."
 else
     echo "  Setting up auth token. This will open your browser."
