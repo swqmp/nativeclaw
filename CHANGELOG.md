@@ -1,6 +1,26 @@
 # NativeClaw Changelog
 
 
+
+## v1.10.3 — Drift sweep + friendlier `/usage` errors
+
+### `/usage` polish
+- Codex auth-missing now reads **`Codex not logged in. Run \`codex login\` to enable.`** instead of the technical `no Codex auth.json`.
+- Same friendly treatment on the Claude side: missing keychain credentials now read **`Claude credentials missing. Run \`claude setup-token\` to enable.`**
+- **Linux note:** `/usage` shows Claude only unless you've run `codex login` — Codex line will say "not logged in" until you do. Single-backend installs are fully supported.
+
+### Workspace template (`workspace/AGENTS.md`) — drift sweep
+Promoted three sections from production agent rules into the shipped template:
+
+- **Backend-Switch Context Recovery (Claude ↔ Codex):** documents the 2-tier handoff (summary + raw transcript fallback) used by `/claude` and `/codex` switches. Already documented in `NATIVECLAW.md` but missing from agent rules.
+- **File & Folder Creation (Local + Cloud Drive):** "search before create" discipline, with specific guidance on shared-drive path-string traps.
+- **Browser:** generic Chromium + CDP lifecycle pattern, Web Search vs Playwright vs browser-use priority.
+
+User-specific sections (Email, Task Management, Trello, Newsletter, Client Disambiguation) remain user-customization, not in template.
+
+### Docs
+- README slash-commands table: `/usage` row now calls out the `codex login` prereq.
+
 ## v1.10.2 — Cold-boot resilience: bridge auto-restart fix
 
 Fixes a stacked failure mode where the Telegram bridge would silently fail to come up after a Mac wake/boot if Wi-Fi wasn't yet ready when launchd fired the agent.

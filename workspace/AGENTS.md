@@ -50,6 +50,23 @@ These override everything. Tuned for anti-hallucination and anti-slop.
 
 ---
 
+### Backend-Switch Context Recovery (Claude ↔ Codex)
+
+If your install runs both Claude and Codex backends, the bridge supports a 2-tier context handoff when you switch via `/claude` or `/codex`.
+
+- **Tier 1 (happy path):** the source backend builds a handoff summary the bridge injects into the target backend's prompt.
+- **Tier 2 (source crashing/unresponsive/empty):** the bridge skips the summary and injects the last 20 raw exchanges from the source transcript instead.
+
+Either way, you have what you need to continue. If neither tier produces context (source had no usable session at all), the bridge ships nothing — greet the user normally and ask what they need.
+
+**User-triggered catchup:** the `/catchup` slash command pulls context from the OTHER backend into the current one without switching. Same 2-tier logic.
+
+**Transcript paths (for self-reads or manual investigation):**
+- Claude sessions: `~/.claude/projects/<workspace-slug>/<session-id>.jsonl`
+- Codex sessions: `~/.codex/sessions/YYYY/MM/DD/rollout-*-<thread-id>.jsonl`
+- Current session IDs live in your bridge's state file (typically `~/.claude/telegram-bridge/state.json`).
+
+
 ## SESSION START (every new session)
 
 System files (SOUL, USER, MEMORY, TOOLS, NATIVECLAW, device, this file) are already injected via the bridge's context profiles — don't re-read them.
@@ -126,10 +143,30 @@ First successful use of a new tool, API, database, or capability → write it to
 
 Before every checkpoint, ask: did I use anything new that's not in TOOLS.md? If yes, write it first.
 
+
+### File & Folder Creation (Local + Cloud Drive)
+
+Before creating any new file or folder anywhere — local filesystem, Google Drive, GitHub repo — search first.
+
+- **Local:** glob the parent directory before creating a folder. If the user said "I'm putting files in X," X already exists — find it and use it.
+- **Cloud Drive:** never trust path strings as the destination. Always resolve to a folder ID via search/list before uploading. Path strings on shared-drive uploads can silently create duplicate folders in your personal drive when an identically-named shared-drive folder exists.
+- **Verify shared vs personal drive.** Tools that accept both default to personal unless you pass an explicit shared-drive ID.
+- If you create a duplicate by accident, surface it immediately and ask whether to merge or delete.
+
 ### Video Links
 You cannot watch video directly. Extract caption + transcript via `bash system/scripts/video-extract.sh "<url>"`. Fallback: native browser snapshot → read page text.
 
 NEVER claim you "watched" a video or fabricate what it shows.
+
+
+### Browser
+
+If your setup ships a browser helper (e.g., `agent-browser.sh` for persistent Chromium with CDP), respect its lifecycle:
+
+- **Start before** any browser-automation task (Playwright, etc.). Most helper scripts launch Chromium with a persistent profile so logins survive across sessions.
+- **Stop after** the task completes, unless the user is using the same browser interactively or the task is paused.
+- Prefer **Web Search** for research, **Playwright** for interactive automation. Use `browser-use` only as a fallback.
+- If a tool errors, report the actual error — don't assume a tool is broken without trying it.
 
 ### Website / Code Modifications
 Read existing styles before adding any element. Match patterns (radius, colors, spacing, classes, naming conventions). Don't create new abstractions when existing ones cover it.

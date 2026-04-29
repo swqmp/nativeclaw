@@ -176,7 +176,7 @@ Important files after install:
 | `/reset` | Clear current backend session/thread |
 | `/fresh` | Alias for `/reset` |
 | `/stats` | Show last response stats |
-| `/usage` | Plan usage: 5-hour + 7-day windows for Claude and Codex |
+| `/usage` | Plan usage: 5-hour + 7-day windows for Claude and Codex (Codex line requires `codex login` first; otherwise shows `Codex not logged in`) |
 | `/session` | Show session/thread info |
 | `/status` | Show backend/model/session state |
 | `/restart` | Ask the service manager to restart the bridge |

@@ -1664,12 +1664,12 @@ async function fetchClaudeUsage() {
       if (fs.existsSync(credPath)) {
         raw = fs.readFileSync(credPath, 'utf8');
       } else {
-        return { error: 'no Claude credentials available on this platform' };
+        return { error: 'Claude credentials not found. Run `claude setup-token` to enable.' };
       }
     }
     const creds = JSON.parse(raw)?.claudeAiOauth || {};
     const token = creds.accessToken;
-    if (!token) return { error: 'no Claude access token' };
+    if (!token) return { error: 'Claude credentials missing. Run `claude setup-token` to enable.' };
     const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
       headers: {
         'Authorization': `Bearer ${token}`,
@@ -1689,11 +1689,11 @@ async function fetchClaudeUsage() {
 async function fetchCodexUsage() {
   try {
     const authPath = path.join(HOME_DIR, '.codex', 'auth.json');
-    if (!fs.existsSync(authPath)) return { error: 'no Codex auth.json' };
+    if (!fs.existsSync(authPath)) return { error: 'Codex not logged in. Run `codex login` to enable.' };
     const auth = JSON.parse(fs.readFileSync(authPath, 'utf8'));
     const token = auth?.tokens?.access_token;
     const acct = auth?.tokens?.account_id;
-    if (!token) return { error: 'no Codex access_token' };
+    if (!token) return { error: 'Codex token missing. Run `codex login` to refresh.' };
     const res = await fetch('https://chatgpt.com/backend-api/wham/usage', {
       headers: {
         'Authorization': `Bearer ${token}`,
