@@ -123,9 +123,30 @@ Outputs `nativeclaw-diag-YYYY-MM-DD-HHMM.zip`. User DMs the zip to whoever is su
 
 ---
 
+### F. Hermes-derived feature candidates (research-pending)
+
+From Apr 28, 2026 research thread investigating the Hermes agent (competing personal-AI project). Three candidates surfaced as worth evaluating for v2.0 inclusion. Final yes/no decision pending tonight's deeper investigation.
+
+| Candidate | What it is | Effort | Status |
+|-----------|-----------|--------|--------|
+| **Honcho dialectic user modeling** | Self-hosted user-modeling layer (`@honcho-ai/sdk`), runs alongside QMD. QMD = retrieval; Honcho = active user representation that updates as the agent learns about the user. Complementary, not redundant. | ~6-10 hrs | Worth doing — research validates fit before commit |
+| **Self-improving skills (agentskills.io adoption)** | Portable open standard for agent skills/system prompts. The "self-improving" framing is mostly marketing; the real win is the **open standard** that lets skills move between agent platforms. | ~8-12 hrs | Worth doing but pace it — adopt the standard, skip the hype |
+| **Interrupt + redirect** | Lets the user interrupt a running agent turn and redirect mid-stream. Pragmatic version: SIGTERM + auto-resume with a redirect-prompt prefix. True fork-CLI version is deferred. | ~3-5 hrs | Pragmatic version only — 80% of UX without forking the CLI |
+
+**Decision gate before locking into v2.0:** Tonight's investigation pass should answer:
+1. Honcho — is the user-modeling quality measurably better than QMD-only? Does docker-compose self-host on Nova add operational burden?
+2. agentskills.io — is the standard live and stable enough to adopt, or still pre-1.0?
+3. Interrupt+redirect — does the SIGTERM approach interact cleanly with our existing session-day anchor and Codex execution serialization?
+
+Items that pass the gate get scoped into the appropriate Phase. Items that don't get parked for v2.1+.
+
+
 ## Open research / decisions before shipping
 
-### 1. Voice transcription provider
+### 1. Hermes-agent feature gate (Honcho / agentskills.io / interrupt+redirect)
+Tonight's investigation produces a yes/no/defer decision per candidate. See Scope section F. Three candidates surfaced from Apr 28 research; final v2.0 inclusion pending the deeper dive. Trello card on Plans/Today bucket tracks the investigation task.
+
+### 2. Voice transcription provider
 Currently bridge uses OpenAI cloud Whisper (whisper-1). Need a comparison study before v2.0 to decide what to default to, and what to offer:
 
 - **OpenAI Whisper API** (current) — paid, network-dependent, decent quality
@@ -138,13 +159,13 @@ Currently bridge uses OpenAI cloud Whisper (whisper-1). Need a comparison study 
 
 Deliverable: `docs/voice-transcription-research.md` comparing latency, cost per minute, quality (WER), install effort, supported languages, privacy story. Recommendation: which to ship as default + which to expose as user choice in Connections tab.
 
-### 2. Google Workspace OAuth client
+### 3. Google Workspace OAuth client
 - **Option A:** ship a NativeClaw-owned shared OAuth client; users authenticate against it. Lower friction, but Jamiah owns the audit trail and verification status.
 - **Option B:** users create their own GCP project + OAuth client. Higher friction, full user ownership.
 
 Decide before shipping the Connections tab. v2.0 likely ships with B and adds A later if user demand justifies.
 
-### 3. Settings server lifetime + auth
+### 4. Settings server lifetime + auth
 - **Lifetime:** on-demand only (`nativeclaw settings` starts it; auto-shutdown after 30 min idle). No always-on daemon.
 - **Auth:** random URL token in initial browser launch URL (not guessable by other local processes). Revoked when server shuts down.
 - **Multi-user shared machines:** bind to user's loopback only, document the token model.
