@@ -1647,6 +1647,131 @@ function getSettings(chatId) {
   return chatSettings[chatId];
 }
 
+// ============================================================
+// USAGE QUERIES (plan / weekly / session limits)
+// Anthropic: api.anthropic.com/api/oauth/usage  (Bearer from OS keychain)
+// OpenAI:    chatgpt.com/backend-api/wham/usage (Bearer from ~/.codex/auth.json)
+// ============================================================
+
+async function fetchClaudeUsage() {
+  try {
+    let raw;
+    if (process.platform === 'darwin') {
+      raw = execSync('security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null', { encoding: 'utf8' }).trim();
+    } else {
+      // Linux: Claude credentials path; fall back to ~/.claude/.credentials.json or env
+      const credPath = path.join(HOME_DIR, '.claude', '.credentials.json');
+      if (fs.existsSync(credPath)) {
+        raw = fs.readFileSync(credPath, 'utf8');
+      } else {
+        return { error: 'no Claude credentials available on this platform' };
+      }
+    }
+    const creds = JSON.parse(raw)?.claudeAiOauth || {};
+    const token = creds.accessToken;
+    if (!token) return { error: 'no Claude access token' };
+    const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+        'User-Agent': 'claude-cli',
+      },
+    });
+    if (!res.ok) return { error: `Anthropic HTTP ${res.status}` };
+    const body = await res.json();
+    body._subscriptionType = creds.subscriptionType || 'unknown';
+    return body;
+  } catch (e) {
+    return { error: e.message || String(e) };
+  }
+}
+
+async function fetchCodexUsage() {
+  try {
+    const authPath = path.join(HOME_DIR, '.codex', 'auth.json');
+    if (!fs.existsSync(authPath)) return { error: 'no Codex auth.json' };
+    const auth = JSON.parse(fs.readFileSync(authPath, 'utf8'));
+    const token = auth?.tokens?.access_token;
+    const acct = auth?.tokens?.account_id;
+    if (!token) return { error: 'no Codex access_token' };
+    const res = await fetch('https://chatgpt.com/backend-api/wham/usage', {
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'ChatGPT-Account-ID': acct || '',
+        'User-Agent': 'codex_cli_rs',
+      },
+    });
+    if (!res.ok) return { error: `OpenAI HTTP ${res.status}` };
+    return await res.json();
+  } catch (e) {
+    return { error: e.message || String(e) };
+  }
+}
+
+function usageBar(pct) {
+  const n = Math.round(Math.max(0, Math.min(100, Number(pct) || 0)) / 10);
+  return '▓'.repeat(n) + '░'.repeat(10 - n);
+}
+
+function usageResetLabel(input) {
+  if (input == null) return 'unknown';
+  const d = typeof input === 'number' ? new Date(input * 1000) : new Date(input);
+  if (isNaN(d.getTime())) return 'unknown';
+  const now = new Date();
+  const tomorrow = new Date(now.getTime() + 86400000);
+  const tz = process.env.TZ || 'America/New_York';
+  const time = d.toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: tz });
+  const sameDay = d.toLocaleDateString('en-US', { timeZone: tz }) === now.toLocaleDateString('en-US', { timeZone: tz });
+  const isTomorrow = d.toLocaleDateString('en-US', { timeZone: tz }) === tomorrow.toLocaleDateString('en-US', { timeZone: tz });
+  if (sameDay) return time;
+  if (isTomorrow) return `tomorrow ${time}`;
+  const day = d.toLocaleString('en-US', { weekday: 'short', timeZone: tz });
+  return `${day} ${time}`;
+}
+
+function formatUsageReply(claude, codex) {
+  const lines = ['⚡ Usage', ''];
+
+  // Bars show "% left" — fuel-gauge semantics: full bar = healthy, draining = burning quota.
+  // Both Anthropic (utilization) and OpenAI (used_percent) report % consumed; we invert for display.
+
+  const claudeLabel = claude.error
+    ? 'Claude'
+    : `Claude (${(claude._subscriptionType || 'unknown').toString().toUpperCase()})`;
+  lines.push(claudeLabel);
+  if (claude.error) {
+    lines.push(`  ⚠️ ${claude.error}`);
+  } else {
+    const fh = claude.five_hour;
+    const sd = claude.seven_day;
+    if (fh) { const left = 100 - fh.utilization; lines.push(`  Session  ${usageBar(left)} ${left}% left   resets ${usageResetLabel(fh.resets_at)}`); }
+    if (sd) { const left = 100 - sd.utilization; lines.push(`  Weekly   ${usageBar(left)} ${left}% left   resets ${usageResetLabel(sd.resets_at)}`); }
+    const opus = claude.seven_day_opus;
+    const sonnet = claude.seven_day_sonnet;
+    if (opus && opus.utilization > 0) { const left = 100 - opus.utilization; lines.push(`  Opus 7d  ${usageBar(left)} ${left}% left`); }
+    if (sonnet && sonnet.utilization > 0) { const left = 100 - sonnet.utilization; lines.push(`  Sonnet 7d ${usageBar(left)} ${left}% left`); }
+  }
+
+  lines.push('');
+
+  const codexLabel = codex.error
+    ? 'Codex'
+    : `Codex (ChatGPT ${(codex.plan_type || 'unknown').toString().toUpperCase()})`;
+  lines.push(codexLabel);
+  if (codex.error) {
+    lines.push(`  ⚠️ ${codex.error}`);
+  } else {
+    const rl = codex.rate_limit || {};
+    const pw = rl.primary_window;
+    const sw = rl.secondary_window;
+    if (pw) { const left = 100 - pw.used_percent; lines.push(`  Session  ${usageBar(left)} ${left}% left   resets ${usageResetLabel(pw.reset_at)}`); }
+    if (sw) { const left = 100 - sw.used_percent; lines.push(`  Weekly   ${usageBar(left)} ${left}% left   resets ${usageResetLabel(sw.reset_at)}`); }
+    if (rl.limit_reached) lines.push(`  ⚠️ Rate limit reached`);
+  }
+
+  return lines.join('\n');
+}
+
 async function handleSlashCommand(chatId, text) {
   const parts = text.trim().split(/\s+/);
   const cmd = parts[0].toLowerCase();
@@ -1902,6 +2027,11 @@ async function handleSlashCommand(chatId, text) {
       return `${backend.toUpperCase()} session cleared. Next message starts fresh.`;
     }
 
+    case '/usage': {
+      const [claude, codex] = await Promise.all([fetchClaudeUsage(), fetchCodexUsage()]);
+      return formatUsageReply(claude, codex);
+    }
+
     case '/stats': {
       const last = settings.lastResult;
       if (!last) return 'No stats yet. Send a message first.';
@@ -2004,6 +2134,7 @@ async function handleSlashCommand(chatId, text) {
         '/session — Show session info',
         '/catchup — Pull context from the OTHER backend into this one (use if a handoff was lost to rate-limit or crash)',
         '/stats — Last response stats (cached %, cumulative warning)',
+        '/usage — Plan usage: 5-hour + 7-day windows for Claude and Codex',
         '/effort <low|medium|high|xhigh|max> — Set Claude/Codex thinking effort',
         '/think — Alias/toggle for /effort max',
         '/verbosity <default|low|medium|high> — Set Codex answer verbosity',

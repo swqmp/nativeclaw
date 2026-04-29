@@ -85,6 +85,7 @@ schtasks /delete /tn "NativeClaw" /f
 | `/fresh` | Alias for `/reset` |
 | `/stop` | Abort running task and clear queue |
 | `/stats` | Last response stats |
+| `/usage` | Plan usage (5-hour + 7-day) for Claude and Codex |
 | `/session` | Session/thread info |
 | `/status` | Backend/model/session status |
 | `/restart` | Ask the service manager to restart the bridge |

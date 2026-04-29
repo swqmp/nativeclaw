@@ -1,5 +1,15 @@
 # NativeClaw Changelog
 
+## v1.10.1 — `/usage` slash command
+
+- **`/usage` Telegram command:** Returns current plan utilization for both backends in one fast view. Hits the same internal endpoints the official CLIs use under the hood:
+  - Claude: `GET https://api.anthropic.com/api/oauth/usage` with the OAuth token from the OS keychain (`Claude Code-credentials` on macOS) plus `anthropic-beta: oauth-2025-04-20`. Returns `five_hour.utilization`, `seven_day.utilization`, `seven_day_opus`, `seven_day_sonnet`, each with `resets_at`.
+  - Codex: `GET https://chatgpt.com/backend-api/wham/usage` with the access token from `~/.codex/auth.json` plus `ChatGPT-Account-ID` header. Returns `rate_limit.primary_window` (5h) + `secondary_window` (7d), each with `used_percent`, `reset_at`, plus `plan_type` and `credits.has_credits`.
+- **Fuel-gauge bar UI:** Bars display `% left` — full bar = plenty of quota, draining bar = burning through. Both APIs return `% used` semantically; bridge inverts to `% left` for visual consistency with Codex CLI's native `/status` rendering.
+- **Parallel fetch:** Both backends queried via `Promise.all`; one slow backend doesn't block the other. Per-backend errors render as `⚠️ <reason>` line without crashing the reply.
+- **Risk:** Both endpoints are undocumented internal APIs. If Anthropic or OpenAI changes them, `/usage` will degrade gracefully (per-backend error line). Worth re-verifying on each major CLI version bump.
+
+
 ## v1.10.0 — Agent Reliability Stack
 
 First major release focused on making the agent reliable out-of-box, not just functional. Every piece here came from real-world patterns that caught hallucinations, context loss, or credential leaks.
