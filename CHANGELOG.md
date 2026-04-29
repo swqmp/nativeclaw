@@ -1,5 +1,28 @@
 # NativeClaw Changelog
 
+
+## v1.10.2 — Cold-boot resilience: bridge auto-restart fix
+
+Fixes a stacked failure mode where the Telegram bridge would silently fail to come up after a Mac wake/boot if Wi-Fi wasn't yet ready when launchd fired the agent.
+
+### Problem
+1. `bridge.js` validated the bot token by calling Telegram's `getMe` exactly once. If that fetch failed (e.g. network not yet up), it logged `FATAL: Invalid bot token: fetch failed` and exited. The error message was misleading — the token was fine; the network wasn't.
+2. `claude-restart.sh` only watched the bridge process when a PID file existed. When the bridge died before writing the PID file, the wrapper fell into an indefinite `sleep`/`wait` loop, hiding the failure from launchd. Result: the agent looked alive to the OS, but the bridge was actually dead.
+
+### Fix
+- **`bridge.js`:** `getMe` now retries with backoff (2s · 5s · 10s · 15s · 30s · 30s ≈ 92s total). Auth-shaped errors (401/403/Unauthorized/Forbidden) still bail immediately; only transient `fetch failed` / network errors trigger retries.
+- **`scripts/claude-restart.sh`:** rewritten as a supervisor loop. The same path handles healthy-bridge-died (quick respawn, no failure counter bump) and bridge-failed-to-start (linear backoff up to 60s). After 5 consecutive failed starts, the wrapper exits non-zero so launchd's `KeepAlive` performs a full agent restart.
+
+### How to apply on existing installs
+Pull the new `scripts/claude-restart.sh` and `bridge/bridge.js`, then restart the bridge:
+
+```
+launchctl kickstart -k gui/$(id -u)/com.nativeclaw.session   # macOS
+systemctl --user restart nativeclaw.service                  # Linux
+```
+
+No plist or service file changes required.
+
 ## v1.10.1 — `/usage` slash command
 
 - **`/usage` Telegram command:** Returns current plan utilization for both backends in one fast view. Hits the same internal endpoints the official CLIs use under the hood:

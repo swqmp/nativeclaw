@@ -2890,14 +2890,32 @@ async function main() {
     log('WARNING: Could not detect Claude Code version');
   }
 
-  // Validate bot token
-  try {
-    const me = await tg('getMe');
-    log(`Bot: @${me.username} (${me.first_name})`);
-  } catch (err) {
-    log(`FATAL: Invalid bot token: ${err.message}`);
-    process.exit(1);
+  // Validate bot token (with retry for cold-boot network races)
+  // Auth-shaped errors (401/403) bail immediately; transient fetch/network errors retry with backoff.
+  // Total retry window: ~92s — covers Wi-Fi handshake delay after a cold boot.
+  const TOKEN_VERIFY_BACKOFFS_MS = [2000, 5000, 10000, 15000, 30000, 30000];
+  let me = null;
+  for (let attempt = 1; attempt <= TOKEN_VERIFY_BACKOFFS_MS.length + 1; attempt++) {
+    try {
+      me = await tg('getMe');
+      break;
+    } catch (err) {
+      const msg = err && (err.message || String(err));
+      const isAuthError = /\b(401|403|Unauthorized|Forbidden|invalid token)\b/i.test(msg || '');
+      if (isAuthError) {
+        log(`FATAL: Bot token rejected by Telegram: ${msg}`);
+        process.exit(1);
+      }
+      const delay = TOKEN_VERIFY_BACKOFFS_MS[attempt - 1];
+      if (delay === undefined) {
+        log(`FATAL: getMe failed after ${attempt} attempts (network never recovered): ${msg}`);
+        process.exit(1);
+      }
+      log(`getMe attempt ${attempt} failed (${msg}). Retrying in ${delay}ms...`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
   }
+  log(`Bot: @${me.username} (${me.first_name})`);
 
   // Post-restart confirmation — let the user know the bridge is back up
   if (state.pendingRestartConfirm && state.pendingRestartConfirm.chatId) {
