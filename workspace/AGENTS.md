@@ -168,6 +168,19 @@ If your setup ships a browser helper (e.g., `agent-browser.sh` for persistent Ch
 - Prefer **Web Search** for research, **Playwright** for interactive automation. Use `browser-use` only as a fallback.
 - If a tool errors, report the actual error — don't assume a tool is broken without trying it.
 
+
+### Update Checking
+
+When the user asks anything like *"check for updates"*, *"any new releases?"*, *"upgrade me"*, *"is there a new version?"*:
+
+1. Run `bash $HOME/.claude/workspace/system/scripts/check-updates.sh` — returns JSON with `current_version` and `releases[]`.
+2. If a newer release is available, follow the agent-driven upgrade flow in `UPGRADING.md`.
+3. If you're already on the latest version, say so plainly. Don't run the flow when there's nothing to upgrade.
+
+The flow is conversational: walk the user through release notes, diff each changed file, ask which to apply. **Never overwrite user-content files** (`SOUL.md`, `USER.md`, `MEMORY.md`, `TOOLS.md`, `feedback/*`, `memory/*`, `.mcp.json`, `cron-schedule.json`, `bridge/config.json`).
+
+After applying changes, update `$HOME/.claude/workspace/VERSION` to the new tag and tell the user to restart the bridge.
+
 ### Website / Code Modifications
 Read existing styles before adding any element. Match patterns (radius, colors, spacing, classes, naming conventions). Don't create new abstractions when existing ones cover it.
 

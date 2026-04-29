@@ -2,6 +2,30 @@
 
 
 
+
+## v1.10.4 — Agent-driven update flow
+
+Adds a conversational upgrade path: the agent inside your install can detect newer releases, walk you through the changes, and merge selectively without ever overwriting your custom files.
+
+### What's new
+- **`VERSION` file** at the repo root and shipped to user workspace. Single line, the installed tag. Setup creates it; the agent updates it after applying an upgrade.
+- **`system/scripts/check-updates.sh`** — fetches releases from GitHub, manages a source cache at `~/.nativeclaw-source/`, returns structured JSON for the agent. Falls back to `curl` if `gh` CLI isn't installed. Requires `jq`.
+- **`UPGRADING.md`** — rewritten as agent-driving instructions. Documents the detect → fetch → categorize → merge → apply flow. The legacy v1.9 → v1.10 manual notes are preserved at the bottom.
+- **`workspace/AGENTS.md` template** — new "Update Checking" section so agents recognize phrases like "check for updates" / "upgrade me" and trigger the flow.
+
+### How it works (user side)
+1. Say "check for updates" (or similar) to your agent.
+2. Agent reports the gap and summarizes each newer release.
+3. Agent diffs changed files, categorized as auto-apply / merge-needed / skip / new.
+4. Agent walks you through merge-needed files: keep mine, take new, or guided 3-way merge.
+5. Agent applies approved changes, updates `VERSION`, suggests bridge restart.
+
+### Files the agent will never touch on upgrade
+`SOUL.md`, `USER.md`, `MEMORY.md`, `TOOLS.md`, `HEARTBEAT.md`, `feedback/*`, `memory/*`, `.mcp.json`, `cron-schedule.json`, `bridge/config.json`.
+
+### Why agent-driven instead of a blunt upgrade script
+A pure-bash upgrade script would either overwrite blindly or skip everything ambiguous. The conversational flow lets the agent's judgment handle nuance ("this section conflicts with your custom Trello workflow — keep yours and just take the new Browser section?"), with the user reviewing each merge before any write.
+
 ## v1.10.3 — Drift sweep + friendlier `/usage` errors
 
 ### `/usage` polish
