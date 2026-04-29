@@ -1,9 +1,72 @@
 # NativeClaw Changelog
 
+## v1.10.0 — Agent Reliability Stack
+
+First major release focused on making the agent reliable out-of-box, not just functional. Every piece here came from real-world patterns that caught hallucinations, context loss, or credential leaks.
+
+### Bridge — Session & Backend Architecture
+- **5 AM ET session-day anchor:** `getCurrentSessionDay()` treats hours 00:00–04:59 ET as the previous calendar day so live sessions survive the midnight boundary. The 5:10 AM `session-audit` cron is now safety-net only, not the primary kill.
+- **Two-tier backend handoff:** `/codex` and `/claude` first try a source-owned summary; if the source backend can't produce one (crashing/empty/unresponsive), the bridge falls back to injecting the **last 20 raw transcript exchanges**. If neither tier produces context, the bridge ships nothing instead of guessing — the resumed backend just greets normally. Old "breadcrumb pointer" path removed.
+- **Collapsed Codex `CONTEXT_PROFILES`:** `chat` and `work` profiles merged into a single `chat` profile that injects SOUL + USER + TOOLS + NATIVECLAW + device + MEMORY + last 3 daily logs, matching Claude's primer for parity. `cron` profile remains lean. `detectContextProfile()` removed.
+- **`SESSION_START_COMPLETED_TODAY` flag:** New global flag in `state.json` so the SESSION START checklist runs once per 5 AM session day instead of on every fresh session/thread switch. Both Claude and Codex primers honor it.
+- **Per-day Claude/Codex session tracking:** `state.sessionDates` and `state.codexSessionDates` bind sessions/threads to the day they were created. Switching `/claude` ↔ `/codex` resumes the target backend's same-day session/thread instead of force-cold-starting it. True cold start happens at daily session audit, on `/reset`, or on `clearStoredSession()`.
+- **Codex execution serialization:** Codex user turns and Codex crons no longer launch in parallel. User priority — fixes the empty-response bug seen during overlapping heartbeat/task-queue runs.
+- **Codex rollover relaxed:** Thresholds bumped to 1.5 MB / 250 entries, missing rollout files no longer force fresh threads. Daily reset remains the main bound; rollover is a true safety valve.
+- **Codex CLI emit handling:** Bridge filters `codex exec --json` replies to the last `agent_message` only — Codex emits commentary and final answers as the same event type with no phase marker, which was bundling startup chatter into Telegram replies.
+
+### Bridge — File Attachments
+- **Image extension fallback:** HEIC, HEIF, WebP, BMP, TIFF, SVG now accepted via filename extension when the document MIME is missing or generic (Telegram strips MIME for some iPhone uploads).
+- **Expanded document allowlist:** RTF, ODT/ODS/ODP (OpenDocument), EPUB, YAML/TOML, EML/MSG (email), TEX (LaTeX), IPYNB (Jupyter), `.log` files, and PPT (legacy Office) added to MIME and extension fallbacks. Existing PDF/DOCX/XLSX/PPTX/TXT/CSV/MD/JSON/XML/HTML preserved.
+- **Updated user-facing error message** lists the new coverage when an unsupported type is sent.
+
+### New — Memory That Learns
+- **QMD semantic memory search (opt-in):** `workspace/system/mcp/qmd/server.js` — Gemini Embedding 2 over daily logs, MEMORY.md, and feedback files. Disabled by default; enable during `setup.sh` or by renaming `__qmd_disabled` to `qmd` in `.mcp.json`.
+- **Feedback loop starter:** `workspace/feedback/{general,emails,reports}.md` — the agent reads the matching file before producing repeatable output. Checkpoint discipline enforced in the new AGENTS.md (mandatory fields, promotion table).
+- **Memory snapshots:** `workspace/system/scripts/snapshot-memory.sh` keeps the last 30 MEMORY.md versions. Wired as `snapshot-memory` cron at 5:05 AM.
+
+### New — Reliability
+- **MCP wrapper supervisor:** `workspace/system/mcp-health/mcp-wrapper.js` — init replay, circuit breaker, auto-respawn. Fetches secrets from the platform keychain (macOS `security`, Linux `secret-tool`).
+- **MCP pre-flight probe:** `workspace/system/mcp-health/probe.js` — 15-minute health check (cron: `mcp-probe`). Writes `last-probe.json` consumed by session-start checklists.
+- **MCP triage:** `workspace/system/scripts/mcp-status.sh` — classifies outages via `mcp-criticality.json` before escalating.
+- **Keychain tooling:** `keychain-add.sh` (macOS) / `keychain-add-linux.sh` (libsecret). API keys leave `.mcp.json` and move to the OS keychain.
+- **Secrets scanner:** `workspace/system/scripts/scan-secrets.sh` — daily sweep for accidentally-committed keys (cron: `secrets-scan` at 7:15 AM).
+
+### New — Context Preservation
+- **Task queue:** `workspace/system/task-queue/queue.json` survives rate-limits and crashes. Recovered hourly by `task-queue-recovery` cron.
+- **Session self-audit:** `workspace/system/scripts/session-self-audit.js` runs 10am/2pm/6pm/10pm. Scans recent transcript for unkept commitments, unlogged corrections, stale checkpoints.
+- **Prompt hooks:** `hooks/memory-check.sh` + `hooks/feedback-check.sh` — UserPromptSubmit hooks that inject "search memory first" or "log this correction" reminders based on user phrasing.
+
+### New — Quality of Life
+- **Video extraction:** `workspace/system/scripts/video-extract.sh` — YouTube/Instagram/TikTok caption + Whisper transcription via yt-dlp. Paths parameterized via `$NATIVECLAW_WORKSPACE`.
+- **Platform formatting rules:** `workspace/system/PLATFORM_FORMATTING.md` — Discord/WhatsApp/group-chat guidance.
+- **Bundled skills:** 14 total — adds frontend-design, web-design-guidelines, webapp-testing, docx/pdf/xlsx/pptx, brainstorming, ab-test-setup, canvas-design, algorithmic-art. See new `workspace/skills/SKILL_INDEX.md`.
+
+### AGENTS.md — Full Rewrite
+- Non-negotiables section covers honesty, execution, git safety, memory discipline, feedback loop.
+- SESSION START 5-step checklist (backup / daily logs / task queue / MCP health / greet).
+- AFTER COMPACTION protocol.
+- Checkpoint format with 6 mandatory fields (What we did / Decisions / Open questions / Next actions / Feedback logged / MEMORY.md delta).
+- System file promotion table.
+
+### Setup Wizard
+- New steps: optional QMD enable (stores Gemini key in OS keychain), optional hook install into `~/.claude/settings.json`.
+- Installs all 14 bundled skills instead of just 3.
+- Copies reliability scripts, MCP health files, task queue, and platform formatting docs.
+
+### Cron Schedule
+- Added `mcp-probe` (*/15 min, command-only), `secrets-scan` (7:15 AM, command-only), `snapshot-memory` (5:05 AM, command-only), `session-self-audit` (10am/2pm/6pm/10pm, command-only). None burn an LLM turn.
+
+### Parameterization
+- All paths use `$NATIVECLAW_WORKSPACE` (falls back to `$HOME/.claude/workspace`).
+- Keychain account via `$NATIVECLAW_KEYCHAIN_ACCOUNT` (falls back to `$USER`).
+- Claude Code project dir derivable from workspace via `$NATIVECLAW_PROJECT_DIR`.
+
+---
+
 ## v1.9.4 — Claude/Codex Backend Bridge
 
 ### Bridge (bridge.js)
-- **Codex backend support:** `/codex` switches from Claude to Codex, `/claude` switches back. Backend switches clear stale target sessions and carry continuity through curated handoff summaries.
+- **Codex backend support:** `/codex` switches from Claude to Codex, `/claude` switches back. Backend switches resume same-day target sessions/threads when available and carry continuity through curated handoff summaries.
 - **Symmetric handoffs:** `/codex` and `/claude` precompute handoff summaries during the slash command. `/codex --full` and `/claude --full` keep raw transcript replay as escape hatches.
 - **Sonnet handoff summaries:** Handoffs use Sonnet and include a deterministic latest-exchange block so short answers, IDs, tokens, command output, and test phrases survive backend switches.
 - **Codex model shortcuts:** `/5.4`, `/5.4-mini`, `/5.3-codex`, `/5.2`, `/5.2-codex`, `/5.1-codex-max`, and `/5.1-codex-mini`.

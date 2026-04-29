@@ -1,8 +1,25 @@
 {
+  "__note_qmd": "Enable QMD semantic memory search. Requires GEMINI_API_KEY stored via `bash system/scripts/keychain-add.sh GEMINI_API_KEY` from the workspace root. Rename __qmd_disabled to qmd to activate.",
   "mcpServers": {
+    "__qmd_disabled": {
+      "command": "node",
+      "args": [
+        "PATH_TO_WORKSPACE/system/mcp-health/mcp-wrapper.js",
+        "--keychain-env",
+        "GEMINI_API_KEY",
+        "qmd",
+        "node",
+        "PATH_TO_WORKSPACE/system/mcp/qmd/server.js"
+      ],
+      "env": {
+        "QMD_WORKSPACE": "PATH_TO_WORKSPACE"
+      }
+    },
     "google-calendar": {
       "command": "node",
-      "args": ["PATH_TO_GOOGLE_CALENDAR_MCP/dist/index.js"],
+      "args": [
+        "PATH_TO_GOOGLE_CALENDAR_MCP/dist/index.js"
+      ],
       "env": {
         "GOOGLE_CLIENT_ID": "YOUR_CLIENT_ID",
         "GOOGLE_CLIENT_SECRET": "YOUR_CLIENT_SECRET",
@@ -11,7 +28,9 @@
     },
     "email": {
       "command": "node",
-      "args": ["PATH_TO_EMAIL_MCP/dist/index.js"],
+      "args": [
+        "PATH_TO_EMAIL_MCP/dist/index.js"
+      ],
       "env": {
         "IMAP_HOST": "imap.gmail.com",
         "IMAP_USER": "your@gmail.com",

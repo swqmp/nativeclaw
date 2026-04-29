@@ -3,7 +3,7 @@
 // Telegram Bridge for Claude Code Native Setup
 // Custom built — no external dependencies, Node.js built-in modules only
 // Handles: Telegram message reception/response + cron job scheduling
-// Version: 1.9.4 — unified effort/verbosity controls
+// Version: 1.10.0 — agent reliability stack (memory, MCP health, context preservation, QoL)
 //
 // Architecture:
 //   Telegram polling → message queue → claude -p subprocess → response back to Telegram
@@ -26,6 +26,12 @@ const LOG_DIR = path.join(HOME_DIR, '.claude', 'logs');
 const LOG_PATH = path.join(LOG_DIR, 'telegram-bridge.log');
 const IMAGE_DIR = path.join(HOME_DIR, '.claude', 'telegram-images');
 
+function toClaudeProjectDir(workspacePath) {
+  const resolved = path.resolve(workspacePath);
+  const slug = resolved.replace(/[\\/.:]/g, '-');
+  return path.join(HOME_DIR, '.claude', 'projects', slug);
+}
+
 // Ensure log and image directories exist
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
 if (!fs.existsSync(IMAGE_DIR)) fs.mkdirSync(IMAGE_DIR, { recursive: true });
@@ -47,6 +53,9 @@ const CRON_WORKSPACE = path.join(config.workspace, 'cron-workspace');
 const MCP_CONFIG = config.mcpConfig;
 const CRON_SCHEDULE_PATH = config.cronSchedule;
 const DEFAULT_MODEL = config.model || 'sonnet';
+const SESSION_DAY_TIMEZONE = config.sessionTimeZone || process.env.NATIVECLAW_SESSION_TIMEZONE || 'America/New_York';
+const AGENT_LABEL = config.agentName || 'the NativeClaw agent';
+const USER_LABEL = config.userName || 'the user';
 
 // Per-chat settings (model overrides, effort, verbosity, etc.)
 let chatSettings = {};
@@ -55,9 +64,13 @@ let chatSettings = {};
 let state = {
   updateOffset: 0,
   sessions: {},         // { chatId: string } — Claude session IDs (legacy flat shape, kept for compat)
+  sessionDates: {},     // { chatId: "YYYY-MM-DD" } — day bound for Claude sessions
   codexSessions: {},    // { chatId: string } — Codex thread IDs
+  codexSessionDates: {},// { chatId: "YYYY-MM-DD" } — day bound for Codex sessions
   backends: {},         // { chatId: "claude" | "codex" }
   pendingTransfer: {},  // { chatId: {from, to, context?} } — one-shot flag to inject cross-backend context on next message
+  sessionStartRanToday: '',  // YYYY-MM-DD — set once SESSION START ran today on either backend; implicitly cleared when day rolls (5 AM ET anchor)
+  arrivedAt: {},        // { chatId: { claude: ISO, codex: ISO } } — when the user most recently arrived at each backend; gap-transcript boundary
   exchangeCount: {},
 };
 if (fs.existsSync(STATE_PATH)) {
@@ -66,9 +79,20 @@ if (fs.existsSync(STATE_PATH)) {
     state = { ...state, ...loaded };
     // Back-fill any missing fields from older state.json versions
     if (!state.exchangeCount) state.exchangeCount = {};
+    if (!state.sessionDates) state.sessionDates = {};
     if (!state.codexSessions) state.codexSessions = {};
+    if (!state.codexSessionDates) state.codexSessionDates = {};
     if (!state.backends) state.backends = {};
     if (!state.pendingTransfer) state.pendingTransfer = {};
+    if (typeof state.sessionStartRanToday !== 'string') state.sessionStartRanToday = '';
+    if (!state.arrivedAt || typeof state.arrivedAt !== 'object') state.arrivedAt = {};
+    const today = getCurrentSessionDay();
+    for (const [cid, sid] of Object.entries(state.sessions)) {
+      if (sid && !state.sessionDates[cid]) state.sessionDates[cid] = today;
+    }
+    for (const [cid, tid] of Object.entries(state.codexSessions)) {
+      if (tid && !state.codexSessionDates[cid]) state.codexSessionDates[cid] = today;
+    }
     // Restore persisted chat settings (model choices survive restart)
     if (loaded.chatSettings) {
       for (const [cid, s] of Object.entries(loaded.chatSettings)) {
@@ -84,22 +108,117 @@ function getBackend(chatId) {
   return state.backends[String(chatId)] || config.defaultBackend || 'claude';
 }
 
+function getCurrentSessionDay(date = new Date()) {
+  // Session day anchored at 05:00 ET. Hours 00:00-04:59 ET count as the previous day
+  // so mid-conversation midnight does not force-kill a live session. The 5:10 AM
+  // session-audit cron is the safety-net rotation trigger.
+  const etHourParts = new Intl.DateTimeFormat('en-US', {
+    timeZone: SESSION_DAY_TIMEZONE,
+    hour: 'numeric',
+    hourCycle: 'h23',
+  }).formatToParts(date);
+  const etHour = parseInt((etHourParts.find((p) => p.type === 'hour') || { value: '0' }).value, 10);
+  const anchorDate = etHour < 5 ? new Date(date.getTime() - 24 * 60 * 60 * 1000) : date;
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: SESSION_DAY_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).formatToParts(anchorDate);
+  const values = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function getSessionStores(kind) {
+  if (kind === 'codex') {
+    return { ids: state.codexSessions, dates: state.codexSessionDates, label: 'Codex thread' };
+  }
+  return { ids: state.sessions, dates: state.sessionDates, label: 'Claude session' };
+}
+
+function clearStoredSession(kind, chatId, reason = '') {
+  const key = String(chatId);
+  const { ids, dates, label } = getSessionStores(kind);
+  const id = ids[key];
+  if (reason && id) {
+    log(`${label} ${id} cleared for ${key}: ${reason}`);
+  }
+  delete ids[key];
+  delete dates[key];
+  clearBackendArrival(chatId, kind);
+}
+
+function getStoredSessionId(kind, chatId) {
+  const key = String(chatId);
+  const today = getCurrentSessionDay();
+  const { ids, dates, label } = getSessionStores(kind);
+  const id = ids[key];
+  if (!id) return null;
+  const sessionDay = dates[key];
+  if (sessionDay === today) return id;
+  log(`${label} ${id} for ${key} is stale (stored=${sessionDay || 'unknown'}, today=${today}); ignoring it`);
+  clearStoredSession(kind, chatId);
+  saveState();
+  return null;
+}
+
+function setStoredSessionId(kind, chatId, id) {
+  const key = String(chatId);
+  const { ids, dates } = getSessionStores(kind);
+  ids[key] = id;
+  dates[key] = getCurrentSessionDay();
+  // First time this backend sees activity today? Mark arrival so future gap-transcript
+  // calculations have a boundary. /claude and /codex slash handlers will overwrite this
+  // with a fresh now() after gap injection if the user is explicitly switching.
+  if (!state.arrivedAt[key]) state.arrivedAt[key] = {};
+  if (!state.arrivedAt[key][kind]) state.arrivedAt[key][kind] = new Date().toISOString();
+}
+
+function getBackendArrival(chatId, backend) {
+  const key = String(chatId);
+  return (state.arrivedAt[key] && state.arrivedAt[key][backend]) || null;
+}
+
+function markBackendArrival(chatId, backend, when) {
+  const key = String(chatId);
+  if (!state.arrivedAt[key]) state.arrivedAt[key] = {};
+  state.arrivedAt[key][backend] = when || new Date().toISOString();
+}
+
+function clearBackendArrival(chatId, backend) {
+  const key = String(chatId);
+  if (!state.arrivedAt[key]) return;
+  delete state.arrivedAt[key][backend];
+  if (Object.keys(state.arrivedAt[key]).length === 0) delete state.arrivedAt[key];
+}
+
+function formatGapTimestamp(iso) {
+  if (!iso) return '?';
+  try {
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return iso;
+    return new Intl.DateTimeFormat('en-US', {
+      timeZone: SESSION_DAY_TIMEZONE,
+      month: 'short',
+      day: 'numeric',
+      hour: 'numeric',
+      minute: '2-digit',
+      hour12: true,
+      timeZoneName: 'short',
+    }).format(d);
+  } catch {
+    return iso;
+  }
+}
+
 function setBackend(chatId, backend, transfer = undefined) {
   const key = String(chatId);
   const prev = getBackend(chatId);
   state.backends[key] = backend;
   if (prev !== backend) {
-    // Backend switches should be clean handoffs, not resumes of old target
-    // backend threads. The transfer summary carries continuity; stale target
-    // sessions are what caused massive cumulative Codex token usage.
-    if (backend === 'codex') {
-      if (state.codexSessions[key]) log(`Switch ${prev}→${backend}: clearing stale Codex thread ${state.codexSessions[key]} for ${key}`);
-      delete state.codexSessions[key];
-    } else if (backend === 'claude') {
-      if (state.sessions[key]) log(`Switch ${prev}→${backend}: clearing stale Claude session ${state.sessions[key]} for ${key}`);
-      delete state.sessions[key];
-    }
-    delete state.exchangeCount[key];
+    // Daily backend sessions are paused/resumed across switches. Continuity
+    // still flows through a handoff, but the target backend keeps its own
+    // same-day session/thread unless the daily reset or explicit recovery clears it.
     // Queue a one-shot context transfer on the next message.
     // `transfer.context` can be precomputed by slash commands so the first
     // real message on the new backend does not pay the handoff latency.
@@ -124,20 +243,29 @@ function log(msg) {
   fs.appendFileSync(LOG_PATH, line);
 }
 
+function nativeClawEnv() {
+  return {
+    NATIVECLAW_WORKSPACE: process.env.NATIVECLAW_WORKSPACE || WORKSPACE,
+    NATIVECLAW_PROJECT_DIR: process.env.NATIVECLAW_PROJECT_DIR || toClaudeProjectDir(WORKSPACE),
+    NATIVECLAW_KEYCHAIN_ACCOUNT: process.env.NATIVECLAW_KEYCHAIN_ACCOUNT || process.env.USER || process.env.USERNAME || 'nativeclaw',
+  };
+}
+
 // ============================================================
 // SESSION PRIMER — inject recent daily logs on fresh sessions
 // ============================================================
 // When a session is cleared (by /reset or session-audit cron), the next
 // message spawns a fresh claude -p with no memory of prior days. AGENTS.md
-// tells the agent to read recent daily logs on session start, but that's a
+// tells the agent to read the last 3 daily logs on session start, but that's a
 // rule, not a mechanism. This injects the logs via --append-system-prompt
 // so they're guaranteed to be loaded.
 
-function buildSessionPrimer() {
+function buildSessionPrimer(options = {}) {
+  const sessionStartDone = Boolean(options.sessionStartDone);
   try {
     if (!fs.existsSync(MEMORY_DIR)) return null;
     const files = fs.readdirSync(MEMORY_DIR)
-      .filter(f => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
+      .filter((f) => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
       .sort()
       .reverse()
       .slice(0, 3);
@@ -158,6 +286,8 @@ function buildSessionPrimer() {
     return [
       '# RECENT CONTEXT (auto-injected on fresh session)',
       '',
+      `SESSION_START_COMPLETED_TODAY=${sessionStartDone ? 'true' : 'false'}`,
+      '',
       'Your session was cleared since the last conversation. Below are the 3 most recent daily logs so you have continuity. Read them before responding to the user\'s message.',
       '',
       sections.join('\n\n'),
@@ -173,7 +303,8 @@ function buildSessionPrimer() {
 // ============================================================
 
 const CODEX_MODELS = {
-  '5.4':             { id: 'gpt-5.4',             display: 'GPT-5.4 (frontier, default)' },
+  '5.5':             { id: 'gpt-5.5',             display: 'GPT-5.5 (frontier, default)' },
+  '5.4':             { id: 'gpt-5.4',             display: 'GPT-5.4' },
   '5.4-mini':        { id: 'gpt-5.4-mini',        display: 'GPT-5.4 Mini' },
   '5.3-codex':       { id: 'gpt-5.3-codex',       display: 'GPT-5.3 Codex' },
   '5.2':             { id: 'gpt-5.2',             display: 'GPT-5.2' },
@@ -181,8 +312,8 @@ const CODEX_MODELS = {
   '5.1-codex-max':   { id: 'gpt-5.1-codex-max',   display: 'GPT-5.1 Codex Max' },
   '5.1-codex-mini':  { id: 'gpt-5.1-codex-mini',  display: 'GPT-5.1 Codex Mini' },
 };
-const CODEX_DEFAULT_MODEL = 'gpt-5.4';
-const HANDOFF_SUMMARY_MODEL = 'sonnet';
+const CODEX_DEFAULT_MODEL = 'gpt-5.5';
+const GAP_CAP_CHARS = 50000; // Hard cap on injected backend-switch gap transcript size; oldest events drop first if exceeded.
 
 // Files to inject as standing context on fresh Codex threads.
 // AGENTS.md is excluded because Codex auto-loads it from the workspace.
@@ -196,18 +327,18 @@ const CODEX_BASE_CONTEXT_FILES = [
 
 const CODEX_PREAMBLE = `# CODEX BACKEND — OPERATING CONSTRAINTS
 
-You are a NativeClaw agent running through the OpenAI Codex CLI as an alternate backend.
-The user switched to you from Claude. You share the same identity (SOUL.md),
-user context (USER.md), tool notes (TOOLS.md), runtime notes (NATIVECLAW.md),
-device reference (device.md), and business memory (MEMORY.md when needed).
+You are ${AGENT_LABEL}, running through the OpenAI Codex CLI as an alternate backend.
+${USER_LABEL} switched to you from Claude. Continue using the same workspace identity
+(SOUL.md), user context (USER.md), tool notes (TOOLS.md), runtime notes
+(NATIVECLAW.md), device reference (device.md), and durable memory (MEMORY.md).
 
 ## What you CAN do
 - Read and write files on this device
-- Run shell commands (bash, python, node, git, etc.)
+- Run available shell commands (python, node, git, etc.)
 - Chat, brainstorm, answer questions
 - Edit code, build websites, run scripts
-- Access the internet via shell tools (curl, etc.)
-- MCP tools — config is mirrored in ~/.codex/config.toml when Codex tool access is configured
+- Access the internet via configured tools or shell commands when available
+- MCP tools — config can be mirrored in ~/.codex/config.toml for this install
 - Bridge-level cron jobs, heartbeats, and session-audit can run while either
   Claude or Codex is active. The bridge owns scheduling.
 
@@ -221,18 +352,19 @@ device reference (device.md), and business memory (MEMORY.md when needed).
 - Git rules from AGENTS.md — never commit/push/deploy without permission
 - Honesty rules — never fabricate, never say "done" without doing it
 - Memory writes — use file-editing tools or python to write to workspace files
-- Long-term context from MEMORY.md; live data should come from the configured source-of-truth tool
+- Durable context from MEMORY.md; live external data comes from the configured tools/APIs
 - Tool-Use Enforcement from AGENTS.md — MUST call tools before answering data questions
 
-## Memory Retrieval (CRITICAL)
-You have access to QMD search_memory MCP tool. It semantically searches all daily
-logs, MEMORY.md, and feedback files. When the user asks about ANY client, lead,
-past event, decision, price, agreement, or history — call search_memory FIRST,
-then answer. Do NOT guess from standing context alone. The standing context is a
-summary; search_memory has the full history.
+## Memory Retrieval
+If the QMD search_memory MCP tool is configured, use it for history questions.
+It semantically searches daily logs, MEMORY.md, and feedback files. When the user
+asks about a person, company, past event, decision, price, agreement, or history,
+call search_memory before answering. If QMD is not enabled, use the best
+available local/tool-backed source instead of guessing from standing context.
 
 When you see instructions referencing Claude-specific features like Claude
-Code slash commands, skip them silently. MCP tools ARE available to you — use them.
+Code slash commands, skip them silently. MCP tools that are configured for
+Codex are available to you, so use them when the task requires tool-backed data.
 `;
 
 function extractLatestCheckpoint(logContent) {
@@ -245,48 +377,19 @@ function extractLatestCheckpoint(logContent) {
 }
 
 // Context profiles control how much gets injected per interaction type.
-const CONTEXT_PROFILES = {
-  chat: {
-    files: CODEX_BASE_CONTEXT_FILES,
-    injectCheckpoint: true,
-    injectMemory: false,
-  },
-  work: {
-    files: [...CODEX_BASE_CONTEXT_FILES, 'MEMORY.md'],
-    injectCheckpoint: true,
-    injectMemory: false,
-  },
-  cron: {
-    files: [],
-    injectCheckpoint: false,
-    injectMemory: false,
-  },
-};
+// Codex standing context mirrors Claude's fresh-session primer for parity:
+// - All chat turns get SOUL + USER + TOOLS + MEMORY + NATIVECLAW + device.
+//   (AGENTS.md is auto-loaded by Codex from the workspace.)
+// - Fresh threads also get the last 3 full daily logs, matching Claude.
+// `work` and `chat` profiles collapsed into one. `cron` path uses buildCodexCronContext
+// directly and does not pass through this function.
+const CODEX_STANDING_FILES = [...CODEX_BASE_CONTEXT_FILES, 'MEMORY.md'];
 
-function detectContextProfile(prompt) {
-  const lower = (prompt || '').toLowerCase();
-  const workSignals = [
-    'build', 'fix', 'deploy', 'update', 'create', 'implement', 'add', 'remove',
-    'edit', 'write', 'code', 'debug', 'test', 'review', 'check', 'run',
-    'client', 'project', 'task', 'pipeline', 'website', 'site', 'page',
-    'api', 'endpoint', 'database', 'server', 'css', 'html', 'js',
-    'email', 'send', 'draft', 'schedule', 'call', 'meeting',
-    'trello', 'linear', 'hq', 'drive', 'sheet', 'doc',
-    'codex', 'claude', 'backend', 'bridge', 'config', 'agent',
-    'system', 'heartbeat', 'cron', 'nativeclaw', 'tools', 'memory',
-  ];
-  for (const signal of workSignals) {
-    if (lower.includes(signal)) return 'work';
-  }
-  return 'chat';
-}
-
-function buildCodexContext(profile) {
-  profile = profile || 'work';
-  const cfg = CONTEXT_PROFILES[profile] || CONTEXT_PROFILES.work;
+function buildCodexContext(options = {}) {
+  const sessionStartDone = Boolean(options.sessionStartDone);
   const sections = [];
 
-  for (const fname of cfg.files) {
+  for (const fname of CODEX_STANDING_FILES) {
     const fpath = path.join(WORKSPACE, fname);
     try {
       if (!fs.existsSync(fpath)) continue;
@@ -296,32 +399,30 @@ function buildCodexContext(profile) {
     } catch {}
   }
 
-  if (cfg.injectCheckpoint) {
-    try {
-      if (fs.existsSync(MEMORY_DIR)) {
-        const files = fs.readdirSync(MEMORY_DIR)
-          .filter(f => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
-          .sort()
-          .reverse();
-        for (const f of files.slice(0, 2)) {
-          try {
-            const content = fs.readFileSync(path.join(MEMORY_DIR, f), 'utf8').trim();
-            if (content.length < 100) continue;
-            const checkpoint = extractLatestCheckpoint(content);
-            if (checkpoint) {
-              sections.push(`=== memory/${f} (latest checkpoint) ===\n${checkpoint}`);
-              break;
-            }
-          } catch {}
-        }
+  // Inject last 3 full daily logs on fresh thread (matches Claude primer)
+  try {
+    if (fs.existsSync(MEMORY_DIR)) {
+      const files = fs.readdirSync(MEMORY_DIR)
+        .filter((f) => /^\d{4}-\d{2}-\d{2}\.md$/.test(f))
+        .sort()
+        .reverse()
+        .slice(0, 3);
+      for (const f of files) {
+        try {
+          const content = fs.readFileSync(path.join(MEMORY_DIR, f), 'utf8').trim();
+          if (content.length < 100) continue;
+          sections.push(`=== memory/${f} ===\n${content}`);
+        } catch {}
       }
-    } catch {}
-  }
+    }
+  } catch {}
 
   if (sections.length === 0) return '';
 
   return [
-    `# STANDING CONTEXT (profile: ${profile})`,
+    '# STANDING CONTEXT',
+    '',
+    `SESSION_START_COMPLETED_TODAY=${sessionStartDone ? 'true' : 'false'}`,
     '',
     sections.join('\n\n'),
     '',
@@ -333,7 +434,7 @@ function buildCodexCronContext() {
   return [
     '# CODEX CRON CONTEXT',
     '',
-    'You are a NativeClaw agent running a scheduled background cron through the Telegram bridge.',
+    `You are ${AGENT_LABEL}, running a scheduled background cron through the Telegram bridge.`,
     `Workspace: ${WORKSPACE}`,
     '',
     'Rules:',
@@ -383,50 +484,79 @@ function findCodexRolloutPath(threadId) {
   }
 }
 
-// Extract the last N user/assistant exchanges from a Codex session rollout.
-// Shared by buildCodexTranscriptReplay and buildCodexHandoffSummary.
-function extractCodexTranscriptExchanges(threadId, maxExchanges = 30) {
+// Extract filtered user/assistant exchanges from a Codex session rollout.
+function extractCodexTranscriptExchanges(threadId, maxExchanges = 30, sinceISO = null) {
   const rolloutPath = findCodexRolloutPath(threadId);
   if (!rolloutPath) return [];
+  const sinceMs = sinceISO ? Date.parse(sinceISO) : null;
   try {
     const lines = fs.readFileSync(rolloutPath, 'utf8').trim().split('\n');
     const exchanges = [];
+    const seen = new Set();  // dedup user_message events that also echo into response_item
 
     for (const line of lines) {
       try {
         const ev = JSON.parse(line);
-        // Codex logs conversation as response_item events with role + content[].
-        // User sends look like input_text, assistant sends look like output_text.
-        if (ev.type !== 'response_item') continue;
-        const p = ev.payload;
-        if (!p || p.type !== 'message') continue;
-        const role = p.role;
-        if (role !== 'user' && role !== 'assistant') continue;
-
+        // Codex CLI rollout format (verified Apr 2026):
+        //   - User-typed inputs:  ev.type === 'event_msg', ev.payload.type === 'user_message',
+        //                         ev.payload.message string contains the user prompt.
+        //   - Assistant outputs:  ev.type === 'response_item', ev.payload.type === 'message',
+        //                         ev.payload.role === 'assistant', payload.content[] holds
+        //                         input_text/output_text parts.
+        //   - Older Codex builds also echoed user prompts inside response_item; we still accept
+        //     those but the # STANDING CONTEXT / AGENTS.md filter strips the noisy primer dumps.
+        //   - Everything else (reasoning, function_call, token_count, turn_context, agent_message
+        //     duplicates of response_item, session_meta) is skipped.
+        let role = null;
         const texts = [];
-        if (Array.isArray(p.content)) {
-          for (const c of p.content) {
-            if (typeof c.text === 'string' && (c.type === 'input_text' || c.type === 'output_text')) {
-              const t = c.text.trim();
-              // Skip Codex/bridge injected context blocks; only preserve real user/assistant conversation.
-              if (
-                !t ||
-                t.startsWith('<permissions') ||
-                t.startsWith('<environment') ||
-                t.startsWith('<skills_instructions') ||
-                t.startsWith('# AGENTS.md instructions') ||
-                t.startsWith('# CODEX BACKEND') ||
-                t.startsWith('# HANDOFF BRIEF') ||
-                t.startsWith('# STANDING CONTEXT')
-              ) continue;
-              texts.push(t);
+
+        if (ev.type === 'event_msg' && ev.payload && ev.payload.type === 'user_message') {
+          role = 'user';
+          if (typeof ev.payload.message === 'string') {
+            texts.push(ev.payload.message);
+          }
+        } else if (ev.type === 'response_item') {
+          const p = ev.payload;
+          if (!p || p.type !== 'message') continue;
+          if (p.role !== 'user' && p.role !== 'assistant') continue;
+          role = p.role;
+          if (Array.isArray(p.content)) {
+            for (const c of p.content) {
+              if (typeof c.text === 'string' && (c.type === 'input_text' || c.type === 'output_text')) {
+                texts.push(c.text);
+              }
             }
           }
+        } else {
+          continue;
         }
-        if (texts.length === 0) continue;
-        const joined = texts.join('\n').trim();
+
+        const filtered = [];
+        for (let t of texts) {
+          t = t.trim();
+          if (
+            !t ||
+            t.startsWith('<permissions') ||
+            t.startsWith('<environment') ||
+            t.startsWith('<skills_instructions') ||
+            t.startsWith('# AGENTS.md instructions') ||
+            t.startsWith('# CODEX BACKEND') ||
+            t.startsWith('# CODEX CRON CONTEXT') ||
+            t.startsWith('# CODEX CONVERSATION TO SUMMARIZE') ||
+            t.startsWith('# HANDOFF BRIEF') ||
+            t.startsWith('# STANDING CONTEXT')
+          ) continue;
+          filtered.push(t);
+        }
+        if (filtered.length === 0) continue;
+        const joined = filtered.join('\n').trim();
         if (!joined) continue;
-        exchanges.push({ role, text: joined.slice(0, 4000) });
+        const ts = (typeof ev.timestamp === 'string') ? ev.timestamp : null;
+        if (sinceMs && ts && Date.parse(ts) < sinceMs) continue;
+        const dedupKey = `${role}:${joined.slice(0, 200)}`;
+        if (seen.has(dedupKey)) continue;
+        seen.add(dedupKey);
+        exchanges.push({ role, text: joined.slice(0, 4000), timestamp: ts });
       } catch {}
     }
 
@@ -437,192 +567,60 @@ function extractCodexTranscriptExchanges(threadId, maxExchanges = 30) {
   }
 }
 
-// Format raw Codex exchanges as a replay block for Claude context injection.
-function buildCodexTranscriptReplay(threadId, maxExchanges = 20) {
-  const tail = extractCodexTranscriptExchanges(threadId, maxExchanges);
-  if (tail.length === 0) return '';
+// Build a gap transcript: filtered + timestamped tail of the source backend's
+// session/thread since the user last arrived at it. Replaces the old summary+replay
+// dual path. Returns formatted block or '' if no events / no session.
+function buildGapTranscript(sourceBackend, sessionKey, sinceISO) {
+  const sessionId = sourceBackend === 'codex'
+    ? getStoredSessionId('codex', sessionKey)
+    : getStoredSessionId('claude', sessionKey);
+  if (!sessionId) return '';
 
-  const rendered = tail
-    .map(e => `[${e.role.toUpperCase()}]: ${e.text}`)
-    .join('\n\n');
+  const exchanges = sourceBackend === 'codex'
+    ? extractCodexTranscriptExchanges(sessionId, 9999, sinceISO)
+    : extractClaudeTranscriptExchanges(sessionId, 9999, sinceISO);
+  if (exchanges.length === 0) return '';
 
-  return [
-    '# PRIOR CONVERSATION (from Codex session, for continuity)',
-    '',
-    'The user just switched from Codex back to you (Claude). Below is the tail of that conversation so you can pick up where Codex left off. Do not re-greet or restart — continue naturally.',
-    '',
-    rendered,
-    '',
-    '# END PRIOR CONVERSATION',
-  ].join('\n');
-}
-
-function buildLatestExchangeBlock(exchanges, label) {
-  if (!Array.isArray(exchanges) || exchanges.length === 0) return '';
-  let latestUser = null;
-  let latestAssistant = null;
-
-  for (let i = exchanges.length - 1; i >= 0; i--) {
-    if (!latestAssistant && exchanges[i].role === 'assistant') latestAssistant = exchanges[i].text;
-    if (!latestUser && exchanges[i].role === 'user') latestUser = exchanges[i].text;
-    if (latestUser && latestAssistant) break;
+  // Hard cap (oldest drops first) so a heavy session doesn't blow up Claude/Codex
+  // context windows on switch.
+  let totalChars = exchanges.reduce((sum, e) => sum + (e.text || '').length + 60, 0);
+  let truncated = 0;
+  while (totalChars > GAP_CAP_CHARS && exchanges.length > 1) {
+    const dropped = exchanges.shift();
+    totalChars -= (dropped.text || '').length + 60;
+    truncated++;
   }
 
+  const sourceLabel = sourceBackend === 'codex' ? 'Codex' : 'Claude';
+  const targetLabel = sourceBackend === 'codex' ? 'Claude' : 'Codex';
+
   const lines = [
-    `# LATEST ${label} EXCHANGE (verbatim)`,
+    `# GAP TRANSCRIPT (from ${sourceLabel} session, while you were on the other backend)`,
     '',
-    'This block is exact continuity data. Preserve short answers, test phrases, IDs, tokens, command output, and user wording verbatim.',
+    `The user just switched from ${sourceLabel} back to you (${targetLabel}). Below is the conversation that happened on ${sourceLabel} during the gap, with timestamps. Continue naturally — do not re-greet, do not re-summarize. Pick up where things left off.`,
     '',
   ];
-  if (latestUser) lines.push(`[USER]: ${latestUser}`, '');
-  if (latestAssistant) lines.push(`[ASSISTANT]: ${latestAssistant}`, '');
-  lines.push(`# END LATEST ${label} EXCHANGE`);
+  if (truncated > 0) {
+    lines.push(`[${truncated} earlier message(s) truncated to fit ${GAP_CAP_CHARS}-char cap]`);
+    lines.push('');
+  }
+  for (const e of exchanges) {
+    const tag = (e.role || '?').toUpperCase();
+    const time = formatGapTimestamp(e.timestamp);
+    lines.push(`[${time} \u2014 ${tag}]: ${e.text}`);
+    lines.push('');
+  }
+  lines.push('# END GAP TRANSCRIPT');
   return lines.join('\n');
 }
 
-// Generate a meta-prompt handoff summary from Codex back to Claude.
-// Returns a formatted handoff block, or null on failure (caller falls back to raw replay).
-async function buildCodexHandoffSummary(threadId) {
-  if (!threadId) return null;
-  try {
-    const exchanges = extractCodexTranscriptExchanges(threadId, 30);
-    if (exchanges.length === 0) return null;
-
-    const transcriptText = exchanges
-      .map(e => `[${e.role.toUpperCase()}]: ${e.text}`)
-      .join('\n\n');
-
-    const metaPrompt = [
-      '# CODEX CONVERSATION TO SUMMARIZE',
-      '',
-      transcriptText,
-      '',
-      '---',
-      '',
-      'Generate a structured handoff brief for a backend switch. The user is switching from Codex back to Claude. Claude already has its earlier Claude session history, so focus only on what happened while Codex was active.',
-      '',
-      'Include:',
-      '1. Current task or topic — what Codex was working on or discussing',
-      '2. Key decisions — what was decided and why (be specific)',
-      '3. Rules or feedback established — any new rules the user set, corrections they gave, or behavioral guidance. Include the exact rule and where it was saved (file path). This is CRITICAL — dropped rules cause repeated mistakes.',
-      '4. Files modified — every file that was created, edited, or written to during this session (exact paths)',
-      '5. Active artifacts — URLs, commands, code snippets, or API responses still in play',
-      '6. Open questions — anything unresolved or waiting on someone',
-      '7. Next action — what Claude should do next if we were mid-task',
-      '8. Latest exchange — include the latest user message and latest assistant answer verbatim. This is mandatory for short answers, test phrases, IDs, tokens, command output, and context checks.',
-      '',
-      'Keep it under 1500 tokens. Be specific — vague summaries are useless. Rules, feedback, and exact latest exchange data are the HIGHEST priority items. If there was no active task (just chatting), summarize the key points briefly but preserve short answers and test phrases verbatim.',
-      '',
-      'Output ONLY the handoff brief. No preamble.',
-    ].join('\n');
-
-    log(`Generating Codex→Claude handoff summary for thread ${threadId}...`);
-
-    const summary = await new Promise((resolve) => {
-      const args = [
-        '-p', metaPrompt,
-        '--output-format', 'json',
-        '--dangerously-skip-permissions',
-        '--model', HANDOFF_SUMMARY_MODEL,
-        '--max-turns', '1',
-      ];
-
-      const cleanEnv = { ...process.env };
-      delete cleanEnv.CLAUDECODE;
-      delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
-      delete cleanEnv.MCP_CLAUDE;
-
-      const proc = spawn('claude', args, {
-        cwd: WORKSPACE,
-        env: cleanEnv,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-
-      let stdout = '';
-      proc.stdout.on('data', (d) => { stdout += d.toString(); });
-      proc.stderr.on('data', () => {}); // suppress stderr noise
-
-      const timer = setTimeout(() => {
-        proc.kill('SIGTERM');
-        log(`Codex→Claude handoff summary timed out for thread ${threadId}`);
-        resolve(null);
-      }, 45000);
-
-      proc.on('close', () => {
-        clearTimeout(timer);
-        try {
-          const lines = stdout.trim().split('\n');
-          for (let i = lines.length - 1; i >= 0; i--) {
-            try {
-              const parsed = JSON.parse(lines[i]);
-              if (parsed.type === 'result') {
-                resolve(parsed.result || parsed.message || null);
-                return;
-              }
-            } catch {}
-          }
-          resolve(stdout.trim() || null);
-        } catch {
-          resolve(null);
-        }
-      });
-
-      proc.on('error', () => {
-        clearTimeout(timer);
-        resolve(null);
-      });
-    });
-
-    if (!summary) {
-      log(`Codex→Claude handoff summary returned empty — falling back to transcript replay`);
-      return null;
-    }
-
-    log(`Codex→Claude handoff summary generated (${summary.length} chars) for thread ${threadId}`);
-    return [
-      '# HANDOFF BRIEF (from Codex session)',
-      '',
-      'You are the Claude backend. The user just switched back from Codex. Below is a curated handoff summary of what happened while Codex was active. Continue naturally from where things left off. Do not re-greet.',
-      '',
-      buildLatestExchangeBlock(exchanges, 'CODEX'),
-      '',
-      summary.trim(),
-      '',
-      '# END HANDOFF BRIEF',
-    ].join('\n');
-  } catch (err) {
-    log(`buildCodexHandoffSummary failed: ${err.message}`);
-    return null;
-  }
-}
-
-function findClaudeTranscriptPath(sessionId) {
-  if (!sessionId) return null;
-  const projectsRoot = path.join(HOME_DIR, '.claude', 'projects');
-  try {
-    if (!fs.existsSync(projectsRoot)) return null;
-
-    const dirs = fs.readdirSync(projectsRoot, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => path.join(projectsRoot, entry.name));
-
-    for (const dir of dirs) {
-      const candidate = path.join(dir, `${sessionId}.jsonl`);
-      if (fs.existsSync(candidate)) return candidate;
-    }
-  } catch (err) {
-    log(`findClaudeTranscriptPath failed: ${err.message}`);
-  }
-  return null;
-}
-
-// Extract the last N user/assistant exchanges from a Claude session transcript.
-// Shared by buildClaudeTranscriptReplay and buildClaudeHandoffSummary.
-function extractClaudeTranscriptExchanges(sessionId, maxExchanges = 30) {
+// Extract filtered user/assistant exchanges from a Claude session transcript.
+function extractClaudeTranscriptExchanges(sessionId, maxExchanges = 30, sinceISO = null) {
   if (!sessionId) return [];
+  const sinceMs = sinceISO ? Date.parse(sinceISO) : null;
   try {
-    const transcriptPath = findClaudeTranscriptPath(sessionId);
-    if (!transcriptPath) return [];
+    const transcriptDir = toClaudeProjectDir(WORKSPACE);
+    const transcriptPath = path.join(transcriptDir, `${sessionId}.jsonl`);
     if (!fs.existsSync(transcriptPath)) return [];
 
     const lines = fs.readFileSync(transcriptPath, 'utf8').trim().split('\n');
@@ -631,19 +629,21 @@ function extractClaudeTranscriptExchanges(sessionId, maxExchanges = 30) {
     for (const line of lines) {
       try {
         const entry = JSON.parse(line);
+        const ts = (typeof entry.timestamp === 'string') ? entry.timestamp : null;
+        if (sinceMs && ts && Date.parse(ts) < sinceMs) continue;
         if (entry.type === 'user' && entry.message?.content) {
           const content = Array.isArray(entry.message.content)
             ? entry.message.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
             : entry.message.content;
           if (typeof content === 'string' && content.trim() && !content.startsWith('<')) {
-            exchanges.push({ role: 'user', text: content.trim().slice(0, 4000) });
+            exchanges.push({ role: 'user', text: content.trim().slice(0, 4000), timestamp: ts });
           }
         } else if (entry.type === 'assistant' && entry.message?.content) {
           const content = Array.isArray(entry.message.content)
             ? entry.message.content.filter(c => c.type === 'text').map(c => c.text).join('\n')
             : entry.message.content;
           if (typeof content === 'string' && content.trim()) {
-            exchanges.push({ role: 'assistant', text: content.trim().slice(0, 4000) });
+            exchanges.push({ role: 'assistant', text: content.trim().slice(0, 4000), timestamp: ts });
           }
         }
       } catch {}
@@ -653,142 +653,6 @@ function extractClaudeTranscriptExchanges(sessionId, maxExchanges = 30) {
   } catch (err) {
     log(`extractClaudeTranscriptExchanges failed: ${err.message}`);
     return [];
-  }
-}
-
-// Format raw exchanges as a replay block for Codex context injection.
-function buildClaudeTranscriptReplay(sessionId, maxExchanges = 20) {
-  const exchanges = extractClaudeTranscriptExchanges(sessionId, maxExchanges);
-  if (exchanges.length === 0) return '';
-
-  const rendered = exchanges
-    .map(e => `[${e.role.toUpperCase()}]: ${e.text}`)
-    .join('\n\n');
-
-  return [
-    '# PRIOR CONVERSATION (from Claude session, for continuity)',
-    '',
-    'The user just switched from the Claude backend to you (Codex). Below is the tail of that conversation so you can pick up where Claude left off. Do not re-greet or restart — continue naturally from the last exchange.',
-    '',
-    rendered,
-    '',
-    '# END PRIOR CONVERSATION',
-  ].join('\n');
-}
-
-// Generate a meta-prompt handoff summary via a fresh Claude subprocess.
-// Returns a formatted handoff block, or null on failure (caller falls back to raw replay).
-async function buildClaudeHandoffSummary(sessionId) {
-  if (!sessionId) return null;
-  try {
-    const exchanges = extractClaudeTranscriptExchanges(sessionId, 30);
-    if (exchanges.length === 0) return null;
-
-    const transcriptText = exchanges
-      .map(e => `[${e.role.toUpperCase()}]: ${e.text}`)
-      .join('\n\n');
-
-    const metaPrompt = [
-      '# CONVERSATION TO SUMMARIZE',
-      '',
-      transcriptText,
-      '',
-      '---',
-      '',
-      'Generate a structured handoff brief for a backend switch. The user is switching to a different AI backend (Codex) that will not have access to this conversation history — only this summary.',
-      '',
-      'Include:',
-      '1. Current task or topic — what we were working on or discussing',
-      '2. Key decisions — what was decided and why (be specific)',
-      '3. Rules or feedback established — any new rules the user set, corrections they gave, or behavioral guidance. Include the exact rule and where it was saved (file path). This is CRITICAL — dropped rules cause repeated mistakes.',
-      '4. Files modified — every file that was created, edited, or written to during this session (exact paths)',
-      '5. Active artifacts — URLs, commands, code snippets, or API responses still in play',
-      '6. Open questions — anything unresolved or waiting on someone',
-      '7. Next action — what to do next if we were mid-task',
-      '8. Latest exchange — include the latest user message and latest assistant answer verbatim. This is mandatory for short answers, test phrases, IDs, tokens, command output, and context checks.',
-      '',
-      'Keep it under 1500 tokens. Be specific — vague summaries are useless. Rules, feedback, and exact latest exchange data are the HIGHEST priority items. If there was no active task (just chatting), summarize the key points briefly but preserve short answers and test phrases verbatim.',
-      '',
-      'Output ONLY the handoff brief. No preamble.',
-    ].join('\n');
-
-    log(`Generating handoff summary for session ${sessionId}...`);
-
-    const summary = await new Promise((resolve) => {
-      const args = [
-        '-p', metaPrompt,
-        '--output-format', 'json',
-        '--dangerously-skip-permissions',
-        '--model', HANDOFF_SUMMARY_MODEL,
-        '--max-turns', '1',
-      ];
-
-      const cleanEnv = { ...process.env };
-      delete cleanEnv.CLAUDECODE;
-      delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
-      delete cleanEnv.MCP_CLAUDE;
-
-      const proc = spawn('claude', args, {
-        cwd: WORKSPACE,
-        env: cleanEnv,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-
-      let stdout = '';
-      proc.stdout.on('data', (d) => { stdout += d.toString(); });
-      proc.stderr.on('data', () => {}); // suppress stderr noise
-
-      const timer = setTimeout(() => {
-        proc.kill('SIGTERM');
-        log(`Handoff summary timed out for session ${sessionId}`);
-        resolve(null);
-      }, 45000);
-
-      proc.on('close', () => {
-        clearTimeout(timer);
-        try {
-          const lines = stdout.trim().split('\n');
-          for (let i = lines.length - 1; i >= 0; i--) {
-            try {
-              const parsed = JSON.parse(lines[i]);
-              if (parsed.type === 'result') {
-                resolve(parsed.result || parsed.message || null);
-                return;
-              }
-            } catch {}
-          }
-          resolve(stdout.trim() || null);
-        } catch {
-          resolve(null);
-        }
-      });
-
-      proc.on('error', () => {
-        clearTimeout(timer);
-        resolve(null);
-      });
-    });
-
-    if (!summary) {
-      log(`Handoff summary generation returned empty — falling back to transcript replay`);
-      return null;
-    }
-
-    log(`Handoff summary generated (${summary.length} chars) for session ${sessionId}`);
-    return [
-      '# HANDOFF BRIEF (from Claude session)',
-      '',
-      'You are the Codex backend. The user just switched from Claude. Below is a curated handoff summary — not raw history. Continue naturally from where things left off. Do not re-greet.',
-      '',
-      buildLatestExchangeBlock(exchanges, 'CLAUDE'),
-      '',
-      summary.trim(),
-      '',
-      '# END HANDOFF BRIEF',
-    ].join('\n');
-  } catch (err) {
-    log(`buildClaudeHandoffSummary failed: ${err.message}`);
-    return null;
   }
 }
 
@@ -824,30 +688,18 @@ async function tg(method, params = {}) {
 }
 
 async function sendPhoto(chatId, imagePath, caption = '') {
+  const FormData = require('form-data');
   const https = require('https');
   return new Promise((resolve, reject) => {
-    const boundary = '----NativeClawBoundary' + Math.random().toString(36).slice(2);
-    const fileName = path.basename(imagePath);
-    const fileBuffer = fs.readFileSync(imagePath);
-    const parts = [
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="chat_id"\r\n\r\n${chatId}\r\n`),
-      Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="photo"; filename="${fileName}"\r\nContent-Type: image/${path.extname(fileName).slice(1) || 'png'}\r\n\r\n`),
-      fileBuffer,
-      Buffer.from('\r\n'),
-    ];
-    if (caption) {
-      parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="caption"\r\n\r\n${caption}\r\n`));
-    }
-    parts.push(Buffer.from(`--${boundary}--\r\n`));
-    const body = Buffer.concat(parts);
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    form.append('photo', fs.createReadStream(imagePath));
+    if (caption) form.append('caption', caption);
     const options = {
       method: 'POST',
       host: 'api.telegram.org',
       path: `/bot${BOT_TOKEN}/sendPhoto`,
-      headers: {
-        'Content-Type': `multipart/form-data; boundary=${boundary}`,
-        'Content-Length': body.length,
-      },
+      headers: form.getHeaders(),
     };
     const req = https.request(options, res => {
       let body = '';
@@ -861,8 +713,7 @@ async function sendPhoto(chatId, imagePath, caption = '') {
       });
     });
     req.on('error', err => { log(`sendPhoto error: ${err.message}`); sendMessage(chatId, `[Image failed to send: ${err.message}]`); reject(err); });
-    req.write(body);
-    req.end();
+    form.pipe(req);
   });
 }
 
@@ -1084,8 +935,8 @@ async function transcribeVoice(audioPath) {
 function extractFullResponseFromSession(sessionId) {
   if (!sessionId) return null;
   try {
-    const transcriptPath = findClaudeTranscriptPath(sessionId);
-    if (!transcriptPath) return null;
+    const transcriptDir = toClaudeProjectDir(WORKSPACE);
+    const transcriptPath = path.join(transcriptDir, `${sessionId}.jsonl`);
     if (!fs.existsSync(transcriptPath)) return null;
 
     const lines = fs.readFileSync(transcriptPath, 'utf8').trim().split('\n');
@@ -1148,6 +999,53 @@ function extractFullResponseFromSession(sessionId) {
 
 // Track the currently running subprocess so /stop can kill it
 let activeSubprocess = null;
+let activeKillFn = null; // backend-specific kill: proc.kill for claude/cron, killTree for codex
+let codexExecutionOwner = null;
+let codexExecutionSeq = 0;
+const codexExecutionQueue = [];
+
+function codexLockPriority(priority) {
+  return priority === 'cron' ? 1 : 0;
+}
+
+function flushCodexExecutionQueue() {
+  if (codexExecutionOwner || codexExecutionQueue.length === 0) return;
+  codexExecutionQueue.sort((a, b) => {
+    const priorityDiff = codexLockPriority(a.priority) - codexLockPriority(b.priority);
+    return priorityDiff !== 0 ? priorityDiff : a.seq - b.seq;
+  });
+  const next = codexExecutionQueue.shift();
+  codexExecutionOwner = next;
+  log(`Codex execution lock acquired by ${next.label}`);
+  next.resolve(() => {
+    if (codexExecutionOwner === next) {
+      codexExecutionOwner = null;
+      log(`Codex execution lock released by ${next.label}`);
+      flushCodexExecutionQueue();
+    }
+  });
+}
+
+function acquireCodexExecutionLock(priority, label) {
+  return new Promise((resolve) => {
+    codexExecutionQueue.push({
+      priority,
+      label,
+      seq: codexExecutionSeq++,
+      resolve,
+    });
+    flushCodexExecutionQueue();
+  });
+}
+
+async function withCodexExecutionLock(priority, label, fn) {
+  const release = await acquireCodexExecutionLock(priority, label);
+  try {
+    return await fn();
+  } finally {
+    release();
+  }
+}
 
 function runClaude(prompt, sessionId, options = {}) {
   return new Promise((resolve, reject) => {
@@ -1183,8 +1081,10 @@ function runClaude(prompt, sessionId, options = {}) {
 
     log(`Spawning: claude ${args.slice(0, 6).join(' ')}... (cwd: ${options.isCron ? 'cron' : 'main'})`);
 
-    // Strip only the "nested session" detection vars, keep session auth token
-    const cleanEnv = { ...process.env };
+    // Strip only the "nested session" detection vars, keep session auth token.
+    // Inject NATIVECLAW_* so downstream wrappers (mcp-wrapper.js, keychain helpers,
+    // memory tooling) resolve per-install paths without hardcoding.
+    const cleanEnv = { ...process.env, ...nativeClawEnv() };
     delete cleanEnv.CLAUDECODE;
     delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
     delete cleanEnv.MCP_CLAUDE;
@@ -1196,6 +1096,7 @@ function runClaude(prompt, sessionId, options = {}) {
     });
 
     activeSubprocess = proc;
+    activeKillFn = (sig) => proc.kill(sig);
 
     let stdout = '';
     let stderr = '';
@@ -1213,6 +1114,7 @@ function runClaude(prompt, sessionId, options = {}) {
 
     proc.on('close', (code) => {
       activeSubprocess = null;
+      activeKillFn = null;
       clearTimeout(timer);
 
       if (code !== 0 && !stdout.trim()) {
@@ -1272,10 +1174,11 @@ function runClaude(prompt, sessionId, options = {}) {
   });
 }
 
-// Codex thread rollover thresholds — auto-rotate before bloat-induced stalls.
-// Failure case (Apr 18 2026): 1.65MB / 771-entry rollout caused chatgpt.com to stall silently.
-const CODEX_ROLLOVER_BYTES = 250 * 1024;
-const CODEX_ROLLOVER_ENTRIES = 20;
+// Codex thread rollover thresholds — relaxed so a single daily thread survives
+// normal use. Safety valve only, not normal flow. Failure case (Apr 18 2026):
+// 1.65MB / 771-entry rollout caused Codex to stall silently.
+const CODEX_ROLLOVER_BYTES = 1536 * 1024;
+const CODEX_ROLLOVER_ENTRIES = 250;
 
 function findCodexRollout(threadId) {
   if (!threadId) return null;
@@ -1303,7 +1206,7 @@ function findCodexRollout(threadId) {
 
 function shouldRolloverCodex(threadId) {
   const filePath = findCodexRollout(threadId);
-  if (!filePath) return { rollover: true, reason: 'rollout file not found' };
+  if (!filePath) return { rollover: false, reason: 'rollout file not found', missing: true };
   try {
     const stat = fs.statSync(filePath);
     if (stat.size > CODEX_ROLLOVER_BYTES) {
@@ -1333,8 +1236,9 @@ function reapOrphanMCPs() {
 }
 
 // Codex subprocess runner. Returns the same shape as runClaude for drop-in dispatch.
-// Codex emits JSONL events on stdout; we collect the final agent_message text,
-// the thread_id, and usage.
+// Codex emits JSONL events on stdout. In Codex CLI JSON, commentary updates and
+// final answers both arrive as agent_message items with no phase marker, so only
+// the last agent_message should be forwarded to Telegram.
 function runCodex(prompt, threadId, options = {}) {
   return new Promise((resolve, reject) => {
     const model = options.codexModel || CODEX_DEFAULT_MODEL;
@@ -1366,7 +1270,7 @@ function runCodex(prompt, threadId, options = {}) {
     // Defensive: clean up orphan MCPs from prior killed subprocesses before spawning
     reapOrphanMCPs();
 
-    const cleanEnv = { ...process.env };
+    const cleanEnv = { ...process.env, ...nativeClawEnv() };
     delete cleanEnv.CLAUDECODE;
     delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
     delete cleanEnv.MCP_CLAUDE;
@@ -1385,6 +1289,7 @@ function runCodex(prompt, threadId, options = {}) {
     };
 
     activeSubprocess = proc;
+    activeKillFn = killTree;
     const startTime = Date.now();
 
     let stdout = '';
@@ -1413,6 +1318,7 @@ function runCodex(prompt, threadId, options = {}) {
 
     proc.on('close', (code) => {
       activeSubprocess = null;
+      activeKillFn = null;
       clearTimeout(timer);
       clearInterval(idleTimer);
 
@@ -1426,7 +1332,7 @@ function runCodex(prompt, threadId, options = {}) {
       let outputTokens = 0;
       let cachedInputTokens = 0;
       let turns = 0;
-      const textParts = [];
+      let latestAgentText = '';
       let errorMsg = null;
 
       for (const line of stdout.split('\n')) {
@@ -1443,7 +1349,7 @@ function runCodex(prompt, threadId, options = {}) {
               break;
             case 'item.completed':
               if (ev.item?.type === 'agent_message' && typeof ev.item.text === 'string') {
-                textParts.push(ev.item.text);
+                latestAgentText = ev.item.text;
               }
               break;
             case 'turn.completed':
@@ -1464,12 +1370,12 @@ function runCodex(prompt, threadId, options = {}) {
         }
       }
 
-      if (errorMsg && textParts.length === 0) {
+      if (errorMsg && !latestAgentText.trim()) {
         return reject(new Error(`Codex error: ${errorMsg.slice(0, 400)}`));
       }
 
       resolve({
-        text: textParts.join('\n\n').trim(),
+        text: latestAgentText.trim(),
         sessionId: outThreadId,
         // Subscription-billed; real $ is $0 per message. Expose tokens for /stats.
         cost: 0,
@@ -1492,53 +1398,83 @@ function runCodex(prompt, threadId, options = {}) {
 // and threads through session state.
 async function runBackend(backend, prompt, options, sessionKey) {
   if (backend === 'codex') {
-    let threadId = state.codexSessions[sessionKey] || null;
+    let threadId = getStoredSessionId('codex', sessionKey);
     let rolloverNote = null;
 
     // Auto-rollover: rotate to fresh thread if existing rollout is bloated.
-    // Prevents the silent chatgpt.com stall observed Apr 18 2026 on a 1.65MB rollout.
+    // Prevents the silent Codex stall observed Apr 18 2026 on a 1.65MB rollout.
     if (threadId) {
       const check = shouldRolloverCodex(threadId);
       if (check.rollover) {
         log(`Codex thread ${threadId} rollover triggered: ${check.reason}`);
-        delete state.codexSessions[sessionKey];
+        clearStoredSession('codex', sessionKey, `rollover: ${check.reason}`);
         saveState();
         threadId = null;
-        rolloverNote = `[System note: Prior Codex thread was auto-rolled over to prevent stall (${check.reason}). If you need conversation history beyond this message, read today's daily log in memory/ and search QMD via search_memory.]`;
+        rolloverNote = `[System note: Prior Codex thread was auto-rolled over to prevent stall (${check.reason}). If you need conversation history beyond this message, read today's daily log in memory/. If QMD/search_memory is configured, search it for deeper history.]`;
+      } else if (check.missing) {
+        log(`Codex thread ${threadId} has no rollout file yet; keeping the same-day thread and skipping rollover`);
       } else {
         log(`Codex thread ${threadId} ok: size=${check.size}B entries=${check.entries}`);
       }
     }
 
-    const contextParts = [];
+    const executeCodexTurn = async (activeThreadId, extraNotes = []) => {
+      const contextParts = [];
 
-    // Standing context: only injected on a FRESH Codex thread.
-    // Once the thread exists, `codex exec resume` preserves conversation history
-    // server-side, so we don't need to re-send 50k tokens every message.
-    if (!threadId) {
-      const profile = detectContextProfile(prompt);
-      const standing = buildCodexContext(profile);
-      if (standing) {
-        contextParts.push(standing);
-        log(`Fresh Codex thread: injecting ${profile} context (${standing.length} chars)`);
+      // Standing context: only injected on a FRESH Codex thread.
+      // Once the thread exists, `codex exec resume` preserves conversation history
+      // server-side, so we don't need to re-send 50k tokens every message.
+      if (!activeThreadId) {
+        const today = getCurrentSessionDay();
+        const sessionStartDone = state.sessionStartRanToday === today;
+        const standing = buildCodexContext({ sessionStartDone });
+        if (standing) {
+          contextParts.push(standing);
+          log(`Fresh Codex thread: injecting standing context (${standing.length} chars, sessionStartDone=${sessionStartDone})`);
+        }
+        if (!sessionStartDone) {
+          state.sessionStartRanToday = today;
+          saveState();
+        }
+      }
+
+      // Pending cross-backend transfer — one-shot on switch, goes in regardless of thread state
+      if (options.transferContext) contextParts.push(options.transferContext);
+
+      for (const note of extraNotes) {
+        if (note) contextParts.push(note);
+      }
+
+      const finalPrompt = contextParts.length > 0
+        ? `${contextParts.join('\n\n')}\n\n# USER MESSAGE\n\n${prompt}`
+        : prompt;
+
+      return withCodexExecutionLock(options.codexLockPriority || 'user', options.codexLockLabel || `telegram:${sessionKey}`, () =>
+        runCodex(finalPrompt, activeThreadId, options)
+      );
+    };
+
+    let result = await executeCodexTurn(threadId, rolloverNote ? [rolloverNote] : []);
+    if (!result.text) {
+      const retryReason = threadId
+        ? `same-day thread ${threadId} returned no agent response`
+        : 'fresh Codex turn returned no agent response';
+      log(`Codex empty response for ${sessionKey}: ${retryReason}`);
+      clearStoredSession('codex', sessionKey, retryReason);
+      saveState();
+      result = await executeCodexTurn(null, [
+        '[System note: The previous Codex attempt produced no agent response. Start clean, answer the user directly, and finish the turn normally.]',
+      ]);
+      if (!result.text) {
+        throw new Error('Codex returned no response after a fresh retry');
       }
     }
 
-    // Pending cross-backend transfer — one-shot on switch, goes in regardless of thread state
-    if (options.transferContext) contextParts.push(options.transferContext);
-
-    // One-shot rollover note appended after standing context so the agent sees it on the fresh thread
-    if (rolloverNote) contextParts.push(rolloverNote);
-
-    const finalPrompt = contextParts.length > 0
-      ? `${contextParts.join('\n\n')}\n\n# USER MESSAGE\n\n${prompt}`
-      : prompt;
-
-    return runCodex(finalPrompt, threadId, options);
+    return result;
   }
 
   // Claude path
-  const sessionId = state.sessions[sessionKey] || null;
+  const sessionId = getStoredSessionId('claude', sessionKey);
   return runClaude(prompt, sessionId, options);
 }
 
@@ -1576,6 +1512,10 @@ function enqueueCron(item) {
   processCronQueue();
 }
 
+function hasPendingTelegramWork() {
+  return processingTelegram || telegramQueue.length > 0 || Object.keys(chatDebounceTimers).length > 0;
+}
+
 async function processTelegramQueue() {
   if (processingTelegram || telegramQueue.length === 0) return;
   processingTelegram = true;
@@ -1608,6 +1548,14 @@ async function processCronQueue() {
   processingCron = true;
 
   while (cronQueue.length > 0) {
+    const nextItem = cronQueue[0];
+    const primaryChat = ALLOWED_CHAT_IDS[0];
+    const codexCronPending = !!(nextItem && !nextItem.command && primaryChat && getBackend(primaryChat) === 'codex');
+    if (codexCronPending && hasPendingTelegramWork()) {
+      await sleep(1000);
+      continue;
+    }
+
     const item = cronQueue.shift();
     try {
       await handleCronJob(item);
@@ -1728,18 +1676,23 @@ async function handleSlashCommand(chatId, text) {
           `Send /codex to toggle backend. Current backend: ${getBackend(chatId).toUpperCase()}.`,
         ].join('\n');
       }
-      // `/codex --full` → switch to Codex and prebuild raw transcript replay.
+      // `/codex --full` → switch to Codex with full session gap (no time filter).
       if (sub === '--full') {
         const previousBackend = getBackend(chatId);
         const sessionKey = String(chatId);
         let transferContext = null;
         if (previousBackend === 'claude') {
-          transferContext = buildClaudeTranscriptReplay(state.sessions[sessionKey], 20);
-          if (transferContext) log(`Prebuilt claude→codex full replay for ${sessionKey}: ${transferContext.length} chars`);
+          transferContext = buildGapTranscript('claude', sessionKey, null);
+          if (transferContext) {
+            log(`Prebuilt claude→codex full gap for ${sessionKey}: ${transferContext.length} chars`);
+          } else {
+            log(`No claude→codex full gap to inject for ${sessionKey} (no Claude session or no extractable events)`);
+          }
         }
         setBackend(chatId, 'codex', transferContext ? { context: transferContext, mode: 'full' } : undefined);
+        markBackendArrival(sessionKey, 'codex');
         const currentId = settings.codexModel || CODEX_DEFAULT_MODEL;
-        return `Backend switched to CODEX (${currentId}). Full transcript replay is ready for your next message.`;
+        return `Backend switched to CODEX (${currentId}). Full transcript replay is ready, and today's Codex thread will resume if it already exists.`;
       }
       if (sub) {
         // Allow `/codex 5.4-mini` as shortcut to switch model
@@ -1751,28 +1704,30 @@ async function handleSlashCommand(chatId, text) {
         return `Unknown Codex model "${arg}". Try /codex help.`;
       }
 
-      // Bare `/codex` → generate the handoff summary now, then switch.
+      // Bare `/codex` → switch to Codex with gap transcript from Claude since user last arrived there.
       const previousBackend = getBackend(chatId);
       const sessionKey = String(chatId);
       let transferContext = null;
       let transferMode = null;
       if (previousBackend === 'claude') {
-        await tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
-        transferContext = await buildClaudeHandoffSummary(state.sessions[sessionKey]);
-        transferMode = 'handoff';
+        const since = getBackendArrival(sessionKey, 'claude');
+        transferContext = buildGapTranscript('claude', sessionKey, since);
+        transferMode = 'gap';
         if (transferContext) {
-          log(`Prebuilt claude→codex handoff for ${sessionKey}: ${transferContext.length} chars`);
+          log(`Prebuilt claude→codex gap for ${sessionKey}: ${transferContext.length} chars (since=${since || 'beginning-of-session'})`);
         } else {
-          transferContext = buildClaudeTranscriptReplay(state.sessions[sessionKey], 20);
-          transferMode = 'replay-fallback';
-          if (transferContext) log(`Prebuilt claude→codex replay fallback for ${sessionKey}: ${transferContext.length} chars`);
+          log(`No claude→codex gap to inject for ${sessionKey} (since=${since || 'beginning-of-session'}; no events in window or no Claude session)`);
         }
       }
       setBackend(chatId, 'codex', transferContext ? { context: transferContext, mode: transferMode } : undefined);
+      markBackendArrival(sessionKey, 'codex');
       const currentId = settings.codexModel || CODEX_DEFAULT_MODEL;
+      const resumeNote = getStoredSessionId('codex', sessionKey)
+        ? "Today's Codex thread will resume on your next message."
+        : 'Next Codex message starts a fresh daily thread.';
       return transferContext
-        ? `Backend switched to CODEX (${currentId}). Handoff is ready.`
-        : `Backend switched to CODEX (${currentId}). No Claude handoff context was available.`;
+        ? `Backend switched to CODEX (${currentId}). Gap transcript is ready. ${resumeNote}`
+        : `Backend switched to CODEX (${currentId}). No Claude gap context to inject. ${resumeNote}`;
     }
 
     case '/claude': {
@@ -1787,31 +1742,38 @@ async function handleSlashCommand(chatId, text) {
       }
 
       if (previousBackend === 'codex') {
-        await tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
         if (sub === '--full') {
-          transferContext = buildCodexTranscriptReplay(state.codexSessions[sessionKey], 20);
+          transferContext = buildGapTranscript('codex', sessionKey, null);
           transferMode = 'full';
-          if (transferContext) log(`Prebuilt codex→claude full replay for ${sessionKey}: ${transferContext.length} chars`);
-        } else {
-          transferContext = await buildCodexHandoffSummary(state.codexSessions[sessionKey]);
-          transferMode = 'handoff';
           if (transferContext) {
-            log(`Prebuilt codex→claude handoff for ${sessionKey}: ${transferContext.length} chars`);
+            log(`Prebuilt codex→claude full gap for ${sessionKey}: ${transferContext.length} chars`);
           } else {
-            transferContext = buildCodexTranscriptReplay(state.codexSessions[sessionKey], 20);
-            transferMode = 'replay-fallback';
-            if (transferContext) log(`Prebuilt codex→claude replay fallback for ${sessionKey}: ${transferContext.length} chars`);
+            log(`No codex→claude full gap to inject for ${sessionKey} (no Codex thread or no extractable events)`);
+          }
+        } else {
+          const since = getBackendArrival(sessionKey, 'codex');
+          transferContext = buildGapTranscript('codex', sessionKey, since);
+          transferMode = 'gap';
+          if (transferContext) {
+            log(`Prebuilt codex→claude gap for ${sessionKey}: ${transferContext.length} chars (since=${since || 'beginning-of-thread'})`);
+          } else {
+            log(`No codex→claude gap to inject for ${sessionKey} (since=${since || 'beginning-of-thread'}; no events in window or no Codex thread)`);
           }
         }
       }
 
       setBackend(chatId, 'claude', transferContext ? { context: transferContext, mode: transferMode } : undefined);
+      markBackendArrival(sessionKey, 'claude');
+      const resumeNote = getStoredSessionId('claude', sessionKey)
+        ? "Today's Claude session will resume on your next message."
+        : 'Next Claude message starts a fresh daily session.';
       return transferContext
-        ? 'Backend switched to CLAUDE. Handoff is ready.'
-        : 'Backend switched to CLAUDE. Resuming your prior Claude session if one exists.';
+        ? `Backend switched to CLAUDE. Gap transcript is ready. ${resumeNote}`
+        : `Backend switched to CLAUDE. ${resumeNote}`;
     }
 
     // Codex model shortcuts (mirror Claude's /opus /sonnet /haiku pattern)
+    case '/5.5':
     case '/5.4':
     case '/5.4-mini':
     case '/5.3-codex':
@@ -1824,6 +1786,22 @@ async function handleSlashCommand(chatId, text) {
       if (!m) return `Unknown Codex model "${cmd}".`;
       settings.codexModel = m.id;
       return `Codex model set to ${m.display}. ${getBackend(chatId) === 'codex' ? '' : '(Run /codex to activate Codex backend.)'}`.trim();
+    }
+
+    case '/catchup': {
+      // Force the current backend to read the OTHER backend's session on the next turn.
+      // Useful when a previous /codex or /claude switch lost its handoff (rate limit,
+      // crash, empty session) and the current backend is missing context.
+      const sessionKey = String(chatId);
+      const currentBackend = getBackend(chatId);
+      const otherBackend = currentBackend === 'claude' ? 'codex' : 'claude';
+      let context = null;
+      const since = getBackendArrival(sessionKey, otherBackend);
+      context = buildGapTranscript(otherBackend, sessionKey, since);
+      if (!context) return `No ${otherBackend} session found to catch up from. Source transcript is empty or unreadable.`;
+      state.pendingTransfer[sessionKey] = { from: otherBackend, to: currentBackend, context, mode: 'catchup' };
+      saveState();
+      return `Catchup queued. Your next message on ${currentBackend} will be prefixed with the ${otherBackend} session context (${context.length} chars).`;
     }
 
     case '/effort': {
@@ -1889,9 +1867,9 @@ async function handleSlashCommand(chatId, text) {
     case '/fresh': {
       const backend = getBackend(chatId);
       if (backend === 'codex') {
-        delete state.codexSessions[sessionKey];
+        clearStoredSession('codex', sessionKey, 'manual reset');
       } else {
-        delete state.sessions[sessionKey];
+        clearStoredSession('claude', sessionKey, 'manual reset');
       }
       delete state.exchangeCount[sessionKey];
       saveState();
@@ -1928,7 +1906,7 @@ async function handleSlashCommand(chatId, text) {
 
     case '/session': {
       const backend = getBackend(chatId);
-      const sid = backend === 'codex' ? state.codexSessions[sessionKey] : state.sessions[sessionKey];
+      const sid = backend === 'codex' ? getStoredSessionId('codex', sessionKey) : getStoredSessionId('claude', sessionKey);
       return sid
         ? `${backend.toUpperCase()} session: ${sid}\nUse /reset to start fresh.`
         : `No active ${backend.toUpperCase()} session. Next message will start one.`;
@@ -1947,8 +1925,8 @@ async function handleSlashCommand(chatId, text) {
       const thinking = settings.effort === 'max' ? 'ON' : 'OFF';
       const verbosity = settings.codexVerbosity || 'default';
       const sid = backend === 'codex'
-        ? (state.codexSessions[sessionKey] ? 'Active' : 'None')
-        : (state.sessions[sessionKey] ? 'Active' : 'None');
+        ? (getStoredSessionId('codex', sessionKey) ? 'Active' : 'None')
+        : (getStoredSessionId('claude', sessionKey) ? 'Active' : 'None');
       return [
         'NativeClaw Status:',
         `  Bridge PID: ${bridgePid}`,
@@ -1975,9 +1953,9 @@ async function handleSlashCommand(chatId, text) {
         'NativeClaw Commands:',
         '',
         '— Backend —',
-        '/claude — Use Claude backend (default)',
+        '/claude — Use Claude backend, resuming today\'s Claude session if it exists',
         '/claude --full — Use Claude with raw Codex replay',
-        '/codex — Use Codex (GPT) backend',
+        '/codex — Use Codex (GPT) backend, resuming today\'s Codex thread if it exists',
         '/codex --full — Use Codex with raw Claude replay',
         '/codex help — List GPT models',
         '',
@@ -1989,7 +1967,8 @@ async function handleSlashCommand(chatId, text) {
         '/model <name> — Any Claude model',
         '',
         '— Codex models —',
-        '/5.4 — GPT-5.4 (default)',
+        '/5.5 — GPT-5.5 (default)',
+        '/5.4 — GPT-5.4',
         '/5.4-mini — GPT-5.4 Mini',
         '/5.3-codex, /5.2, /5.2-codex, /5.1-codex-max, /5.1-codex-mini',
         '',
@@ -1997,6 +1976,7 @@ async function handleSlashCommand(chatId, text) {
         '/reset — Clear current backend\'s session',
         '/fresh — Alias for /reset; clear current backend session',
         '/session — Show session info',
+        '/catchup — Pull context from the OTHER backend into this one (use if a handoff was lost to rate-limit or crash)',
         '/stats — Last response stats (cached %, cumulative warning)',
         '/effort <low|medium|high|xhigh|max> — Set Claude/Codex thinking effort',
         '/think — Alias/toggle for /effort max',
@@ -2084,31 +2064,22 @@ async function handleTelegramMessage(item) {
       transferContext = pending.context;
       log(`Transfer ${pending.from}→${pending.to} (${pending.mode || 'prebuilt'}) for ${sessionKey}: ${transferContext.length} chars`);
     } else if (pending.from === 'claude' && backend === 'codex') {
-      const claudeSid = state.sessions[sessionKey];
-      if (settings.transferMode === 'full') {
-        // /codex --full: raw transcript replay
-        transferContext = buildClaudeTranscriptReplay(claudeSid, 20);
-        delete settings.transferMode;
-        if (transferContext) log(`Transfer claude→codex (full) for ${sessionKey}: ${transferContext.length} chars`);
+      const sinceClaude = getBackendArrival(sessionKey, 'claude');
+      const useFullSession = settings.transferMode === 'full';
+      transferContext = buildGapTranscript('claude', sessionKey, useFullSession ? null : sinceClaude);
+      if (useFullSession) delete settings.transferMode;
+      if (transferContext) {
+        log(`Transfer claude→codex gap for ${sessionKey}: ${transferContext.length} chars (mode=${useFullSession ? 'full' : 'gap'})`);
       } else {
-        // Default: meta-prompt handoff summary via Sonnet
-        transferContext = await buildClaudeHandoffSummary(claudeSid);
-        if (transferContext) {
-          log(`Transfer claude→codex (handoff) for ${sessionKey}: ${transferContext.length} chars`);
-        } else {
-          // Fallback to raw replay if summary fails
-          transferContext = buildClaudeTranscriptReplay(claudeSid, 20);
-          if (transferContext) log(`Transfer claude→codex (replay fallback) for ${sessionKey}: ${transferContext.length} chars`);
-        }
+        log(`Transfer claude→codex gap empty for ${sessionKey} (no Claude session or no events in window)`);
       }
     } else if (pending.from === 'codex' && backend === 'claude') {
-      const codexTid = state.codexSessions[sessionKey];
-      transferContext = await buildCodexHandoffSummary(codexTid);
+      const sinceCodex = getBackendArrival(sessionKey, 'codex');
+      transferContext = buildGapTranscript('codex', sessionKey, sinceCodex);
       if (transferContext) {
-        log(`Transfer codex→claude (handoff) for ${sessionKey}: ${transferContext.length} chars`);
+        log(`Transfer codex→claude gap for ${sessionKey}: ${transferContext.length} chars`);
       } else {
-        transferContext = buildCodexTranscriptReplay(codexTid, 20);
-        if (transferContext) log(`Transfer codex→claude (replay fallback) for ${sessionKey}: ${transferContext.length} chars`);
+        log(`Transfer codex→claude gap empty for ${sessionKey} (no Codex thread or no events in window)`);
       }
     }
     delete state.pendingTransfer[sessionKey];
@@ -2125,11 +2096,17 @@ async function handleTelegramMessage(item) {
   let appendSystemPrompt = null;
   if (backend === 'claude') {
     const parts = [];
-    if (!state.sessions[sessionKey]) {
-      const primer = buildSessionPrimer();
+    if (!getStoredSessionId('claude', sessionKey)) {
+      const today = getCurrentSessionDay();
+      const sessionStartDone = state.sessionStartRanToday === today;
+      const primer = buildSessionPrimer({ sessionStartDone });
       if (primer) {
         parts.push(primer);
-        log(`Fresh Claude session for ${sessionKey}: injecting primer (${primer.length} chars)`);
+        log(`Fresh Claude session for ${sessionKey}: injecting primer (${primer.length} chars, sessionStartDone=${sessionStartDone})`);
+      }
+      if (!sessionStartDone) {
+        state.sessionStartRanToday = today;
+        saveState();
       }
     }
     if (transferContext) parts.push(transferContext);
@@ -2163,17 +2140,17 @@ async function handleTelegramMessage(item) {
       sessionId: result.sessionId,
     };
 
-    // Persist session ID on the correct backend's slot
-    if (result.sessionId) {
-      if (backend === 'codex') {
-        state.codexSessions[sessionKey] = result.sessionId;
-      } else {
-        state.sessions[sessionKey] = result.sessionId;
-      }
-      saveState();
-    }
-
     if (result.text) {
+      // Persist session ID on the correct backend's slot only after we have
+      // a real assistant message for the user.
+      if (result.sessionId) {
+        if (backend === 'codex') {
+          setStoredSessionId('codex', sessionKey, result.sessionId);
+        } else {
+          setStoredSessionId('claude', sessionKey, result.sessionId);
+        }
+        saveState();
+      }
       const sendResult = await sendMessage(chatId, result.text);
       const costStr = backend === 'codex'
         ? `tokens in=${result.usage?.inputTokens || 0}/out=${result.usage?.outputTokens || 0}`
@@ -2184,8 +2161,7 @@ async function handleTelegramMessage(item) {
         log(`Replied to ${name} [${backend}]: ${result.text.length} chars, ${result.turns} turns, ${costStr}`);
       }
     } else {
-      await sendMessage(chatId, '(No response generated)');
-      log(`Empty response for ${name} [${backend}]`);
+      throw new Error(`${backend.toUpperCase()} returned no response`);
     }
 
     if (_imagePath) {
@@ -2202,11 +2178,11 @@ async function handleTelegramMessage(item) {
     await sendMessage(chatId, `Something went wrong: ${err.message.slice(0, 200)}${rateLimitHint}`);
 
     // If session/thread is broken, clear the active backend's session so next message starts fresh
-    if (err.message.includes('session') || err.message.includes('resume') || err.message.includes('thread')) {
+    if (err.message.includes('session') || err.message.includes('resume') || err.message.includes('thread') || err.message.includes('no response')) {
       if (backend === 'codex') {
-        delete state.codexSessions[sessionKey];
+        clearStoredSession('codex', sessionKey, err.message);
       } else {
-        delete state.sessions[sessionKey];
+        clearStoredSession('claude', sessionKey, err.message);
       }
       saveState();
       log(`Cleared broken ${backend} session for ${sessionKey}`);
@@ -2230,7 +2206,7 @@ function runCronCommand(command, options = {}) {
 
     log(`Spawning cron command: ${command}`);
 
-    const cleanEnv = { ...process.env };
+    const cleanEnv = { ...process.env, ...nativeClawEnv() };
     delete cleanEnv.CLAUDECODE;
     delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
     delete cleanEnv.MCP_CLAUDE;
@@ -2242,6 +2218,7 @@ function runCronCommand(command, options = {}) {
     });
 
     activeSubprocess = proc;
+    activeKillFn = (sig) => proc.kill(sig);
     const startTime = Date.now();
     let stdout = '';
     let stderr = '';
@@ -2258,6 +2235,7 @@ function runCronCommand(command, options = {}) {
 
     proc.on('close', (code) => {
       activeSubprocess = null;
+      activeKillFn = null;
       clearTimeout(timer);
 
       const text = [stdout.trim(), stderr.trim()].filter(Boolean).join('\n');
@@ -2277,6 +2255,7 @@ function runCronCommand(command, options = {}) {
 
     proc.on('error', (err) => {
       activeSubprocess = null;
+      activeKillFn = null;
       clearTimeout(timer);
       reject(new Error(`Failed to spawn cron command: ${err.message}`));
     });
@@ -2306,12 +2285,14 @@ async function handleCronJob(item) {
       const finalPrompt = `${buildCodexCronContext()}\n\n# CRON TASK\n\n${prompt}`;
       // Crons always run fresh — no resume, pass null threadId.
       const codexChatSettings = primaryChat ? getSettings(primaryChat) : {};
-      result = await runCodex(finalPrompt, null, {
-        timeout: timeout || 300,
-        codexModel: codexChatSettings.codexModel || CODEX_DEFAULT_MODEL,
-        effort: codexChatSettings.effort || 'xhigh',
-        codexVerbosity: codexChatSettings.codexVerbosity || null,
-      });
+      result = await withCodexExecutionLock('cron', `cron:${name}`, () =>
+        runCodex(finalPrompt, null, {
+          timeout: timeout || 300,
+          codexModel: codexChatSettings.codexModel || CODEX_DEFAULT_MODEL,
+          effort: codexChatSettings.effort || 'xhigh',
+          codexVerbosity: codexChatSettings.codexVerbosity || null,
+        })
+      );
     } else {
       result = await runClaude(prompt, null, {
         timeout: timeout || 300,
@@ -2336,14 +2317,14 @@ async function handleCronJob(item) {
       for (const key of Object.keys(state.sessions)) {
         if (state.sessions[key]) {
           log(`Session-audit: clearing Claude session ${state.sessions[key]} for chat ${key}`);
-          state.sessions[key] = '';
+          clearStoredSession('claude', key);
           state.exchangeCount[key] = 0;
         }
       }
       for (const key of Object.keys(state.codexSessions)) {
         if (state.codexSessions[key]) {
           log(`Session-audit: clearing Codex thread ${state.codexSessions[key]} for chat ${key}`);
-          state.codexSessions[key] = '';
+          clearStoredSession('codex', key);
         }
       }
       saveState();
@@ -2489,12 +2470,11 @@ async function pollTelegram() {
 
       // Handle /stop immediately — bypass queue, kill active subprocess
       if (msg.text && msg.text.trim().toLowerCase() === '/stop') {
-        if (activeSubprocess) {
+        if (activeSubprocess && activeKillFn) {
           log(`/stop received — killing active subprocess (PID ${activeSubprocess.pid})`);
-          activeSubprocess.kill('SIGTERM');
-          setTimeout(() => {
-            if (activeSubprocess) activeSubprocess.kill('SIGKILL');
-          }, 5000);
+          const killFn = activeKillFn; // capture before close event nulls it
+          killFn('SIGTERM');
+          setTimeout(() => killFn('SIGKILL'), 5000);
           // Clear the message queue so queued messages don't fire after stop
           telegramQueue.length = 0;
           await sendMessage(chatId, 'Stopped. Task killed and queue cleared.');
@@ -2600,24 +2580,54 @@ async function pollTelegram() {
         const caption = msg.caption || '';
 
         // Supported file types
-        const imageTypes = ['image/'];
+        const imageTypes = ['image/']; // image/jpeg, image/png, image/heic, image/heif, image/webp, etc.
+        const imageExtFallback = /\.(jpe?g|png|gif|webp|bmp|tiff?|heic|heif|svg)$/i;
         const fileTypes = [
+          // PDFs
           'application/pdf',
+          // Microsoft Office
           'application/vnd.openxmlformats-officedocument.wordprocessingml.document', // docx
           'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', // xlsx
           'application/vnd.openxmlformats-officedocument.presentationml.presentation', // pptx
           'application/msword', // doc
           'application/vnd.ms-excel', // xls
+          'application/vnd.ms-powerpoint', // ppt
+          // OpenDocument (LibreOffice)
+          'application/vnd.oasis.opendocument.text', // odt
+          'application/vnd.oasis.opendocument.spreadsheet', // ods
+          'application/vnd.oasis.opendocument.presentation', // odp
+          // Rich text + plain
+          'application/rtf',
+          'text/rtf',
           'text/plain',
           'text/csv',
           'text/markdown',
+          'text/x-markdown',
+          // Structured / config
           'application/json',
           'application/xml',
+          'text/xml',
           'text/html',
+          'application/x-yaml',
+          'application/yaml',
+          'text/yaml',
+          'text/x-yaml',
+          'application/toml',
+          // E-books
+          'application/epub+zip',
+          // Email
+          'message/rfc822',
+          'application/vnd.ms-outlook', // .msg
+          // LaTeX / academic
+          'application/x-tex',
+          'text/x-tex',
+          // Jupyter
+          'application/x-ipynb+json',
         ];
+        const fileExtFallback = /\.(pdf|docx?|xlsx?|pptx?|odt|ods|odp|rtf|txt|csv|tsv|md|markdown|json|xml|ya?ml|toml|html?|epub|eml|msg|tex|ipynb|log)$/i;
 
-        const isImage = imageTypes.some(t => mime.startsWith(t));
-        const isFile = fileTypes.some(t => mime === t) || fileName.match(/\.(pdf|docx?|xlsx?|pptx?|txt|csv|md|json|xml|html)$/i);
+        const isImage = imageTypes.some(t => mime.startsWith(t)) || imageExtFallback.test(fileName);
+        const isFile = fileTypes.some(t => mime === t) || fileExtFallback.test(fileName);
 
         if (isImage) {
           try {
@@ -2652,7 +2662,7 @@ async function pollTelegram() {
             await sendMessage(chatId, `Failed to download file: ${err.message}`);
           }
         } else {
-          await sendMessage(chatId, `${mime || 'Unknown'} file type not supported. Supported: images, PDF, DOCX, XLSX, PPTX, TXT, CSV, JSON, Markdown.`);
+          await sendMessage(chatId, `${mime || 'Unknown'} file type not supported. Supported: images (incl. HEIC), PDF, Office (docx/xlsx/pptx + legacy), OpenDocument (odt/ods/odp), RTF, plain text, CSV, Markdown, JSON, XML, YAML, TOML, HTML, EPUB, EML, LaTeX, Jupyter.`);
         }
       }
     }

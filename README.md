@@ -16,16 +16,19 @@ It started as a Claude Code bridge. Current NativeClaw can run either Claude or 
 
 ## What's Current
 
-Current bridge version: `v1.9.4`.
+Current bridge version: `v1.10.0`.
 
 Highlights:
-- `/codex` and `/claude` backend switching
+- **Agent reliability stack** (new in v1.10): QMD semantic memory search, feedback-loop discipline, platform keychain for API keys, MCP probe + wrapper, task queue, session self-audit, memory-reminder hooks
+- `/codex` and `/claude` backend switching with Sonnet handoff summaries
 - `/codex --full` and `/claude --full` raw replay escape hatches
 - `/effort <low|medium|high|xhigh|max>` for Claude/Codex reasoning depth
 - `/verbosity <default|low|medium|high>` for Codex response verbosity
 - `/opus` maps to Opus 4.7, with `/opus4.6` kept as a legacy alias
 - Session-audit cron clears both Claude and Codex sessions
 - Slash-command eval harness: `node ~/.claude/telegram-bridge/eval-slash-commands.js`
+
+See **[CHANGELOG.md](CHANGELOG.md)** and **[UPGRADING.md](UPGRADING.md)** (if you're on v1.9.x).
 
 See [CHANGELOG.md](CHANGELOG.md) for the detailed history.
 
@@ -58,9 +61,41 @@ The setup wizard will:
 1. Check Node.js and Claude CLI
 2. Walk you through Telegram bot setup
 3. Let you choose the default Claude model
-4. Install bridge, scripts, workspace templates, and cron schedule
+4. Install bridge, scripts, workspace templates, skills, hooks, and cron schedule
 5. Store optional OpenAI API key for voice transcription
-6. Install and optionally start the service
+6. Offer optional Nano Banana image generation (Google Gemini)
+7. Offer optional QMD semantic memory search (Google Gemini; key stored in your OS keychain)
+8. Offer to wire memory-check + feedback-check prompt hooks into `~/.claude/settings.json`
+9. Install and optionally start the service
+
+## What You Get Out of the Box
+
+Beyond the core bridge, v1.10 ships an **agent reliability stack** so your agent behaves well from day one:
+
+**Memory that learns**
+- `feedback/` — per-task correction logs the agent reads before repeatable output
+- Checkpoint discipline baked into `AGENTS.md` (mandatory fields, promotion rules)
+- `memory/` daily logs + system file promotion
+- Optional QMD (`search_memory` MCP) — semantic search across all of the above via Gemini Embedding 2
+
+**Reliability**
+- `system/mcp-health/mcp-wrapper.js` — init-replay supervisor with circuit breaker for flaky MCPs; fetches secrets from OS keychain
+- `system/mcp-health/probe.js` — every-15-min pre-flight check, writes `last-probe.json`, surfaces stale/failing MCPs
+- `system/scripts/mcp-status.sh` — critical-vs-optional triage before escalating
+- `system/scripts/keychain-add.sh` (macOS) / `keychain-add-linux.sh` (libsecret) — store API keys outside `.mcp.json`
+- `system/scripts/scan-secrets.sh` — daily sweep for accidentally-committed secrets
+
+**Context preservation**
+- `system/task-queue/queue.json` — survives rate-limits and crashes via `task-queue-recovery` cron
+- `system/scripts/session-self-audit.js` — scans transcripts every 4 hours for unkept commitments and stale checkpoints
+- `hooks/memory-check.sh` + `hooks/feedback-check.sh` — UserPromptSubmit hooks that inject reminders when the agent should search memory or log a correction
+
+**Quality of life**
+- `system/scripts/video-extract.sh` — YouTube/Instagram/TikTok caption + Whisper transcription
+- `system/PLATFORM_FORMATTING.md` — Discord/WhatsApp/group-chat formatting rules
+- `skills/` — 14 bundled skills (design, document handling, testing, brainstorming) plus `SKILL_INDEX.md`
+
+All optional pieces (QMD, hooks, image gen) can be skipped during setup and enabled later. See [OPERATIONS.md](OPERATIONS.md).
 
 ## Architecture
 

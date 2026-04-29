@@ -1,0 +1,34 @@
+{
+  "_meta": {
+    "generated": "template",
+    "purpose": "Source of truth for MCP criticality. When an MCP errors during a session, check here to decide: restart the bridge, wait it out, or work around.",
+    "tiers": {
+      "critical": "workflow fails or the agent will fabricate without it \u2014 escalate to user for restart",
+      "important": "degraded but workable via fallback \u2014 note and continue",
+      "optional": "nice-to-have \u2014 safe to ignore for the session"
+    },
+    "fallback_rule": "Only claim an MCP is broken after attempting to use it and getting an error. Report the actual error, not a guess."
+  },
+  "servers": {
+    "qmd": {
+      "tier": "optional",
+      "purpose": "semantic memory search over daily logs, MEMORY.md, feedback/",
+      "fallback": "Grep across the workspace \u2014 slower, no semantic matching. If you rely on QMD heavily, change this tier to critical after enabling it in .mcp.json."
+    },
+    "google-calendar": {
+      "tier": "important",
+      "purpose": "your schedule",
+      "fallback": "ask the user for what's on their calendar, do not guess"
+    },
+    "email": {
+      "tier": "important",
+      "purpose": "read/send email",
+      "fallback": "the user's web mail UI via browser"
+    },
+    "_template_entry": {
+      "tier": "critical | important | optional",
+      "purpose": "one sentence on what this MCP does for you",
+      "fallback": "what to do when it's down \u2014 or 'none' if no fallback exists"
+    }
+  }
+}
