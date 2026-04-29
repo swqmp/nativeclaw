@@ -65,31 +65,18 @@ const checks = [
     },
   },
   {
-    name: 'handoff summaries use Sonnet, not Haiku',
+    name: 'legacy LLM handoff summary and replay helpers are removed',
     run() {
-      return source.includes("const HANDOFF_SUMMARY_MODEL = 'sonnet'") ? [] : ['missing HANDOFF_SUMMARY_MODEL sonnet constant'];
-    },
-  },
-  {
-    name: 'handoff prompt requires latest user and assistant messages verbatim',
-    run() {
-      const patterns = [
-        /latest user message/i,
-        /latest assistant (answer|message)/i,
-        /verbatim/i,
+      const forbidden = [
+        /HANDOFF_SUMMARY_MODEL/,
+        /function buildClaudeHandoffSummary/,
+        /function buildCodexHandoffSummary/,
+        /function buildClaudeTranscriptReplay/,
+        /function buildCodexTranscriptReplay/,
+        /function buildLatestExchangeBlock/,
+        /# PRIOR CONVERSATION/,
       ];
-      return patterns.filter((pattern) => !pattern.test(source)).map((pattern) => `missing ${pattern}`);
-    },
-  },
-  {
-    name: 'handoff prompt requires exact short answers and test phrases',
-    run() {
-      const patterns = [
-        /short answers/i,
-        /test phrases/i,
-        /tokens/i,
-      ];
-      return patterns.filter((pattern) => !pattern.test(source)).map((pattern) => `missing ${pattern}`);
+      return forbidden.filter((pattern) => pattern.test(source)).map((pattern) => `found ${pattern}`);
     },
   },
   {
@@ -151,6 +138,8 @@ const checks = [
         /while \(totalChars > GAP_CAP_CHARS && exchanges\.length > 1\)/,
         /# GAP TRANSCRIPT/,
         /# END GAP TRANSCRIPT/,
+        /Continue naturally/,
+        /do not re-summarize/,
         /formatGapTimestamp\(/,
       ];
       return patterns.filter((p) => !p.test(source)).map((p) => `missing ${p}`);

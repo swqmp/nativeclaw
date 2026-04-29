@@ -313,7 +313,6 @@ const CODEX_MODELS = {
   '5.1-codex-mini':  { id: 'gpt-5.1-codex-mini',  display: 'GPT-5.1 Codex Mini' },
 };
 const CODEX_DEFAULT_MODEL = 'gpt-5.5';
-const HANDOFF_SUMMARY_MODEL = 'sonnet';
 const GAP_CAP_CHARS = 50000; // Hard cap on injected backend-switch gap transcript size; oldest events drop first if exceeded.
 
 // Files to inject as standing context on fresh Codex threads.
@@ -485,8 +484,7 @@ function findCodexRolloutPath(threadId) {
   }
 }
 
-// Extract the last N user/assistant exchanges from a Codex session rollout.
-// Shared by buildCodexTranscriptReplay and buildCodexHandoffSummary.
+// Extract filtered user/assistant exchanges from a Codex session rollout.
 function extractCodexTranscriptExchanges(threadId, maxExchanges = 30, sinceISO = null) {
   const rolloutPath = findCodexRolloutPath(threadId);
   if (!rolloutPath) return [];
@@ -569,49 +567,6 @@ function extractCodexTranscriptExchanges(threadId, maxExchanges = 30, sinceISO =
   }
 }
 
-// Format raw Codex exchanges as a replay block for Claude context injection.
-function buildCodexTranscriptReplay(threadId, maxExchanges = 20) {
-  const tail = extractCodexTranscriptExchanges(threadId, maxExchanges);
-  if (tail.length === 0) return '';
-
-  const rendered = tail
-    .map(e => `[${e.role.toUpperCase()}]: ${e.text}`)
-    .join('\n\n');
-
-  return [
-    '# PRIOR CONVERSATION (from Codex session, for continuity)',
-    '',
-    'The user just switched from Codex back to you (Claude). Below is the tail of that conversation so you can pick up where Codex left off. Do not re-greet or restart — continue naturally.',
-    '',
-    rendered,
-    '',
-    '# END PRIOR CONVERSATION',
-  ].join('\n');
-}
-
-function buildLatestExchangeBlock(exchanges, label) {
-  if (!Array.isArray(exchanges) || exchanges.length === 0) return '';
-  let latestUser = null;
-  let latestAssistant = null;
-
-  for (let i = exchanges.length - 1; i >= 0; i--) {
-    if (!latestAssistant && exchanges[i].role === 'assistant') latestAssistant = exchanges[i].text;
-    if (!latestUser && exchanges[i].role === 'user') latestUser = exchanges[i].text;
-    if (latestUser && latestAssistant) break;
-  }
-
-  const lines = [
-    `# LATEST ${label} EXCHANGE (verbatim)`,
-    '',
-    'This block is exact continuity data. Preserve short answers, test phrases, IDs, tokens, command output, and user wording verbatim.',
-    '',
-  ];
-  if (latestUser) lines.push(`[USER]: ${latestUser}`, '');
-  if (latestAssistant) lines.push(`[ASSISTANT]: ${latestAssistant}`, '');
-  lines.push(`# END LATEST ${label} EXCHANGE`);
-  return lines.join('\n');
-}
-
 // Build a gap transcript: filtered + timestamped tail of the source backend's
 // session/thread since the user last arrived at it. Replaces the old summary+replay
 // dual path. Returns formatted block or '' if no events / no session.
@@ -659,79 +614,7 @@ function buildGapTranscript(sourceBackend, sessionKey, sinceISO) {
   return lines.join('\n');
 }
 
-// Generate a meta-prompt handoff summary from Codex back to Claude.
-// Returns a formatted handoff block, or null on failure (caller falls back to raw replay).
-async function buildCodexHandoffSummary(threadId, options = {}) {
-  if (!threadId) return null;
-  try {
-    const exchanges = extractCodexTranscriptExchanges(threadId, 30);
-    if (exchanges.length === 0) return null;
-
-    const transcriptText = exchanges
-      .map(e => `[${e.role.toUpperCase()}]: ${e.text}`)
-      .join('\n\n');
-
-    const metaPrompt = [
-      '# CODEX CONVERSATION TO SUMMARIZE',
-      '',
-      transcriptText,
-      '',
-      '---',
-      '',
-      'Generate a structured handoff brief for a backend switch. The user is switching from Codex back to Claude. Claude already has its earlier Claude session history, so focus only on what happened while Codex was active.',
-      '',
-      'Include:',
-      '1. Current task or topic — what Codex was working on or discussing',
-      '2. Key decisions — what was decided and why (be specific)',
-      '3. Rules or feedback established — any new rules the user set, corrections they gave, or behavioral guidance. Include the exact rule and where it was saved (file path). This is CRITICAL — dropped rules cause repeated mistakes.',
-      '4. Files modified — every file that was created, edited, or written to during this session (exact paths)',
-      '5. Active artifacts — URLs, commands, code snippets, or API responses still in play',
-      '6. Open questions — anything unresolved or waiting on someone',
-      '7. Next action — what Claude should do next if we were mid-task',
-      '8. Latest exchange — include the latest user message and latest assistant answer verbatim. This is mandatory for short answers, test phrases, IDs, tokens, command output, and context checks.',
-      '',
-      'Keep it under 1500 tokens. Be specific — vague summaries are useless. Rules, feedback, and exact latest exchange data are the HIGHEST priority items. If there was no active task (just chatting), summarize the key points briefly but preserve short answers and test phrases verbatim.',
-      '',
-      'Output ONLY the handoff brief. No preamble.',
-    ].join('\n');
-
-    log(`Generating Codex→Claude handoff summary with Codex for thread ${threadId}...`);
-    const summaryResult = await withCodexExecutionLock('user', `handoff:${threadId}`, () =>
-      runCodex(metaPrompt, null, {
-        timeout: 45,
-        idleTimeout: 45,
-        codexModel: options.codexModel || CODEX_DEFAULT_MODEL,
-        effort: options.effort || 'medium',
-        codexVerbosity: options.codexVerbosity || null,
-      })
-    );
-    const summary = summaryResult?.text || null;
-
-    if (!summary) {
-      log(`Codex→Claude handoff summary returned empty — falling back to transcript replay`);
-      return null;
-    }
-
-    log(`Codex→Claude handoff summary generated (${summary.length} chars) for thread ${threadId}`);
-    return [
-      '# HANDOFF BRIEF (from Codex session)',
-      '',
-      'You are the Claude backend. The user just switched back from Codex. Below is a curated handoff summary of what happened while Codex was active. Continue naturally from where things left off. Do not re-greet.',
-      '',
-      buildLatestExchangeBlock(exchanges, 'CODEX'),
-      '',
-      summary.trim(),
-      '',
-      '# END HANDOFF BRIEF',
-    ].join('\n');
-  } catch (err) {
-    log(`buildCodexHandoffSummary failed: ${err.message}`);
-    return null;
-  }
-}
-
-// Extract the last N user/assistant exchanges from a Claude session transcript.
-// Shared by buildClaudeTranscriptReplay and buildClaudeHandoffSummary.
+// Extract filtered user/assistant exchanges from a Claude session transcript.
 function extractClaudeTranscriptExchanges(sessionId, maxExchanges = 30, sinceISO = null) {
   if (!sessionId) return [];
   const sinceMs = sinceISO ? Date.parse(sinceISO) : null;
@@ -770,142 +653,6 @@ function extractClaudeTranscriptExchanges(sessionId, maxExchanges = 30, sinceISO
   } catch (err) {
     log(`extractClaudeTranscriptExchanges failed: ${err.message}`);
     return [];
-  }
-}
-
-// Format raw exchanges as a replay block for Codex context injection.
-function buildClaudeTranscriptReplay(sessionId, maxExchanges = 20) {
-  const exchanges = extractClaudeTranscriptExchanges(sessionId, maxExchanges);
-  if (exchanges.length === 0) return '';
-
-  const rendered = exchanges
-    .map(e => `[${e.role.toUpperCase()}]: ${e.text}`)
-    .join('\n\n');
-
-  return [
-    '# PRIOR CONVERSATION (from Claude session, for continuity)',
-    '',
-    'The user just switched from the Claude backend to you (Codex). Below is the tail of that conversation so you can pick up where Claude left off. Do not re-greet or restart — continue naturally from the last exchange.',
-    '',
-    rendered,
-    '',
-    '# END PRIOR CONVERSATION',
-  ].join('\n');
-}
-
-// Generate a meta-prompt handoff summary via a fresh Claude subprocess.
-// Returns a formatted handoff block, or null on failure (caller falls back to raw replay).
-async function buildClaudeHandoffSummary(sessionId) {
-  if (!sessionId) return null;
-  try {
-    const exchanges = extractClaudeTranscriptExchanges(sessionId, 30);
-    if (exchanges.length === 0) return null;
-
-    const transcriptText = exchanges
-      .map(e => `[${e.role.toUpperCase()}]: ${e.text}`)
-      .join('\n\n');
-
-    const metaPrompt = [
-      '# CONVERSATION TO SUMMARIZE',
-      '',
-      transcriptText,
-      '',
-      '---',
-      '',
-      'Generate a structured handoff brief for a backend switch. The user is switching to a different AI backend (Codex) that will not have access to this conversation history — only this summary.',
-      '',
-      'Include:',
-      '1. Current task or topic — what we were working on or discussing',
-      '2. Key decisions — what was decided and why (be specific)',
-      '3. Rules or feedback established — any new rules the user set, corrections they gave, or behavioral guidance. Include the exact rule and where it was saved (file path). This is CRITICAL — dropped rules cause repeated mistakes.',
-      '4. Files modified — every file that was created, edited, or written to during this session (exact paths)',
-      '5. Active artifacts — URLs, commands, code snippets, or API responses still in play',
-      '6. Open questions — anything unresolved or waiting on someone',
-      '7. Next action — what to do next if we were mid-task',
-      '8. Latest exchange — include the latest user message and latest assistant answer verbatim. This is mandatory for short answers, test phrases, IDs, tokens, command output, and context checks.',
-      '',
-      'Keep it under 1500 tokens. Be specific — vague summaries are useless. Rules, feedback, and exact latest exchange data are the HIGHEST priority items. If there was no active task (just chatting), summarize the key points briefly but preserve short answers and test phrases verbatim.',
-      '',
-      'Output ONLY the handoff brief. No preamble.',
-    ].join('\n');
-
-    log(`Generating handoff summary for session ${sessionId}...`);
-
-    const summary = await new Promise((resolve) => {
-      const args = [
-        '-p', metaPrompt,
-        '--output-format', 'json',
-        '--dangerously-skip-permissions',
-        '--model', HANDOFF_SUMMARY_MODEL,
-        '--max-turns', '1',
-      ];
-
-      const cleanEnv = { ...process.env, ...nativeClawEnv() };
-      delete cleanEnv.CLAUDECODE;
-      delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
-      delete cleanEnv.MCP_CLAUDE;
-
-      const proc = spawn('claude', args, {
-        cwd: WORKSPACE,
-        env: cleanEnv,
-        stdio: ['ignore', 'pipe', 'pipe'],
-      });
-
-      let stdout = '';
-      proc.stdout.on('data', (d) => { stdout += d.toString(); });
-      proc.stderr.on('data', () => {}); // suppress stderr noise
-
-      const timer = setTimeout(() => {
-        proc.kill('SIGTERM');
-        log(`Handoff summary timed out for session ${sessionId}`);
-        resolve(null);
-      }, 45000);
-
-      proc.on('close', () => {
-        clearTimeout(timer);
-        try {
-          const lines = stdout.trim().split('\n');
-          for (let i = lines.length - 1; i >= 0; i--) {
-            try {
-              const parsed = JSON.parse(lines[i]);
-              if (parsed.type === 'result') {
-                resolve(parsed.result || parsed.message || null);
-                return;
-              }
-            } catch {}
-          }
-          resolve(stdout.trim() || null);
-        } catch {
-          resolve(null);
-        }
-      });
-
-      proc.on('error', () => {
-        clearTimeout(timer);
-        resolve(null);
-      });
-    });
-
-    if (!summary) {
-      log(`Handoff summary generation returned empty — falling back to transcript replay`);
-      return null;
-    }
-
-    log(`Handoff summary generated (${summary.length} chars) for session ${sessionId}`);
-    return [
-      '# HANDOFF BRIEF (from Claude session)',
-      '',
-      'You are the Codex backend. The user just switched from Claude. Below is a curated handoff summary — not raw history. Continue naturally from where things left off. Do not re-greet.',
-      '',
-      buildLatestExchangeBlock(exchanges, 'CLAUDE'),
-      '',
-      summary.trim(),
-      '',
-      '# END HANDOFF BRIEF',
-    ].join('\n');
-  } catch (err) {
-    log(`buildClaudeHandoffSummary failed: ${err.message}`);
-    return null;
   }
 }
 
