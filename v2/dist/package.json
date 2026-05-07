@@ -1,0 +1,40 @@
+{
+    "name": "@nativeclaw/v2",
+    "version": "2.0.0-alpha.1",
+    "description": "NativeClaw v2.0 — AI agent setup wizard, settings UI, and cross-platform tooling",
+    "main": "dist/index.js",
+    "bin": {
+        "nativeclaw": "./bin/nativeclaw"
+    },
+    "scripts": {
+        "build": "tsc",
+        "dev": "node scripts/watch.js",
+        "postinstall": "npm run build",
+        "test": "node test/test-cron-routing.js",
+        "lint": "eslint . --ext .ts",
+        "verify": "node scripts/verify.js",
+        "migrate": "node scripts/apply-v2.js"
+    },
+    "keywords": [
+        "ai",
+        "agent",
+        "telegram",
+        "claude",
+        "codex",
+        "opencode",
+        "setup",
+        "wizard"
+    ],
+    "author": "Jamiah Bartlett",
+    "license": "MIT",
+    "dependencies": {
+        "enquirer": "^2.4.1"
+    },
+    "devDependencies": {
+        "@types/node": "^20.19.39",
+        "typescript": "^5.4.0"
+    },
+    "engines": {
+        "node": ">=18.0.0"
+    }
+}

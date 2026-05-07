@@ -1,0 +1,75 @@
+#!/usr/bin/env node
+
+/**
+ * NativeClaw Bridge Wrapper
+ * Runs bridge.js in a managed loop: restarts on crash, logs restarts,
+ * and surfaces fatal errors cleanly.
+ */
+
+const { spawn } = require('child_process');
+const fs = require('fs');
+const path = require('path');
+
+const HOME = process.env.HOME || process.env.USERPROFILE;
+const BRIDGE_SCRIPT = path.join(HOME, '.claude', 'telegram-bridge', 'bridge.js');
+const LOG_DIR = path.join(HOME, '.claude', 'logs');
+const RESTART_LOG = path.join(LOG_DIR, 'nativeclaw-restarts.log');
+const CRASH_BACKOFF_MS = 5000;
+const MAX_CRASHES = 5;
+
+function log(msg) {
+  const line = `${new Date().toISOString()}  ${msg}\n`;
+  fs.mkdirSync(LOG_DIR, { recursive: true });
+  fs.appendFileSync(RESTART_LOG, line);
+}
+
+let crashCount = 0;
+let bridgeProc = null;
+
+function startBridge() {
+  if (!fs.existsSync(BRIDGE_SCRIPT)) {
+    log(`ERROR: bridge.js not found at ${BRIDGE_SCRIPT}. Exiting.`);
+    process.exit(1);
+  }
+
+  log(`Starting bridge.js (crash count: ${crashCount})`);
+  bridgeProc = spawn('node', [BRIDGE_SCRIPT], {
+    stdio: 'inherit',
+    cwd: path.dirname(BRIDGE_SCRIPT),
+    env: process.env,
+  });
+
+  bridgeProc.on('close', (code) => {
+    log(`bridge.js exited with code ${code}`);
+    crashCount++;
+    if (crashCount >= MAX_CRASHES) {
+      log(`FATAL: ${MAX_CRASHES} consecutive crashes. Stopping.`);
+      fs.writeFileSync(
+        path.join(LOG_DIR, 'nativeclaw-fatality.txt'),
+        `Stopped at ${new Date().toISOString()} after ${crashCount} crashes.\n`
+      );
+      process.exit(1);
+    }
+    setTimeout(startBridge, CRASH_BACKOFF_MS);
+  });
+
+  bridgeProc.on('error', (err) => {
+    log(`bridge.js spawn error: ${err.message}`);
+  });
+}
+
+// Graceful shutdown on SIGTERM/SIGINT
+['SIGTERM', 'SIGINT'].forEach((sig) => {
+  process.on(sig, () => {
+    log(`Received ${sig}. Stopping bridge...`);
+    if (bridgeProc) {
+      bridgeProc.kill(sig);
+      bridgeProc.on('close', () => process.exit(0));
+    } else {
+      process.exit(0);
+    }
+  });
+});
+
+log('NativeClaw Bridge Wrapper started.');
+startBridge();

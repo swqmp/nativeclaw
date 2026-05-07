@@ -123,22 +123,43 @@ Outputs `nativeclaw-diag-YYYY-MM-DD-HHMM.zip`. User DMs the zip to whoever is su
 
 ---
 
-### F. Hermes-derived feature candidates (research-pending)
+### F. v2 Agent Intelligence Features (Formerly Hermes-Derived)
 
-From Apr 28, 2026 research thread investigating the Hermes agent (competing personal-AI project). Three candidates surfaced as worth evaluating for v2.0 inclusion. Final yes/no decision pending tonight's deeper investigation.
+Research into Hermes Agent + testing of OpenCode/NativeClaw hybrid architecture surfaced five priority features for v2.0. These are **locked** for inclusion, not candidates.
 
-| Candidate | What it is | Effort | Status |
-|-----------|-----------|--------|--------|
-| **Honcho dialectic user modeling** | Self-hosted user-modeling layer (`@honcho-ai/sdk`), runs alongside QMD. QMD = retrieval; Honcho = active user representation that updates as the agent learns about the user. Complementary, not redundant. | ~6-10 hrs | Worth doing — research validates fit before commit |
-| **Self-improving skills (agentskills.io adoption)** | Portable open standard for agent skills/system prompts. The "self-improving" framing is mostly marketing; the real win is the **open standard** that lets skills move between agent platforms. | ~8-12 hrs | Worth doing but pace it — adopt the standard, skip the hype |
-| **Interrupt + redirect** | Lets the user interrupt a running agent turn and redirect mid-stream. Pragmatic version: SIGTERM + auto-resume with a redirect-prompt prefix. True fork-CLI version is deferred. | ~3-5 hrs | Pragmatic version only — 80% of UX without forking the CLI |
+| # | Feature | What it solves | Scope | Status |
+|---|---------|-------------|-------|--------|
+| 1 | **Skills auto-extraction** | After complex multi-step tasks, auto-craft a reusable `skills/auto-extracted/<id>.md` capturing tool sequence + reasoning pattern. Next similar task auto-loads the skill. | Bridge level — pattern detection after tool-heavy turns | **Locked for v2.0** |
+| 2 | **Context compaction (Mode A / OpenCode)** | When Kimi/Grok conversation history approaches context limit, auto-summarize oldest 50% of messages → inject as "Prior context" system message. Prevents the 262K wall. | Bridge-level session management; compression via lightweight model call | **Locked for v2.0** |
+| 3 | **Subagent delegation fix** | Spawn background agents as `child_process` with own OpenCode session. Parent returns immediately, polls for completion file on subsequent turns. No blocking. | Bridge `spawnSubagent()` refactor + completion-watch loop | **Locked for v2.0** |
+| 4 | **Background review enhancement** | Every 8-10 Claude Code messages: lightweight Haiku/GPT-mini "memory extraction" pass → append to session scratchpad → promote to MEMORY.md at session end. | Light subagent on existing backend — no bridge change | **Locked for v2.0** |
+| 5 | **Continuous background review** | Long-running subagent that watches session transcripts in near-realtime, captures decisions as they happen. | Independent worker process, not ride-along per turn | **Investigate → likely v2.1** |
 
-**Decision gate before locking into v2.0:** Tonight's investigation pass should answer:
-1. Honcho — is the user-modeling quality measurably better than QMD-only? Does docker-compose self-host on Nova add operational burden?
-2. agentskills.io — is the standard live and stable enough to adopt, or still pre-1.0?
-3. Interrupt+redirect — does the SIGTERM approach interact cleanly with our existing session-day anchor and Codex execution serialization?
+**How context compaction works with the single-process model (Mode A):**
 
-Items that pass the gate get scoped into the appropriate Phase. Items that don't get parked for v2.1+.
+1. Bridge maintains a per-session transcript file (e.g., `~/.claude/sessions/kimi/<id>.jsonl`) that records every message
+2. On each turn, bridge counts cumulative conversation size (system prompt + history + current message)
+3. When approaching threshold:
+   - **Kimi:** ~180K tokens (262K limit minus safety margin)
+   - **Grok:** ~150K tokens (1M limit but xAI's 200-tool cap is already handled by router)
+   - **Claude Code:** ~80K tokens (triggers at 65% of 200K to leave room for Claude's native compaction)
+4. Bridge spawns a **compression run**: `opencode run --model openrouter/anthropic/claude-haiku-4.5 --prompt "Summarize these N messages into 1-2 paragraphs capturing key decisions and open items. Keep it factual, not conversational."`
+5. Bridge receives summary back, then starts a **fresh session** with: system prompt + `{"role": "system", "content": "PRIOR CONTEXT: [summary]"}` + most recent 10 messages (the "live" window)
+6. From user perspective, the conversation continues seamlessly. The fresh session means OpenCode cold-start tax, but the cached system prompt makes it equivalent to a normal resume turn (~2s penalty, not 30s)
+7. For Claude Code lanes: this is a NO-OP. Claude handles its own compaction natively. The bridge only monitors and logs when it happens.
+
+This is analogous to what Hermes calls "context compression," but adapted for our stateless-turn architecture.
+
+---
+
+### G. Hermes-derived research candidates (deferred to v2.1+)
+
+| Candidate | What it is | Deferral reason |
+|-----------|-----------|-----------------|
+| **Honcho dialectic user modeling** | Self-hosted user-modeling layer alongside QMD | QMD already handles user profiling; Honcho adds a different style but not measurably better for our use case. Revisit if user-model quality becomes a blocker. |
+| **Interrupt + redirect** | SIGTERM + auto-resume with redirect prefix | Pragmatic version (Ctrl+C + new message) already works via bridge. True mid-stream redirect adds code complexity without solving a frequent pain point. |
+| **Session search w/ LLM summarization** | Hermes-style FTS5 + LLM cross-session recall | QMD handles this adequately. LLM-summarized cross-session search is richer but not urgent. |
+| **Insights /usage aggregation** | `"$ spent today, which tools used most"` dashboard | Nice-to-have, not production-blocking. |
 
 
 ## Open research / decisions before shipping
@@ -259,3 +280,115 @@ Power users who want nothing to change can ignore the wizard and settings UI ent
 2. Resume normal v1.10.x maintenance. Bug fixes and small features go to v1.10.5+.
 3. When ready to start v2.0, kick off Phase 1 with the wizard skeleton.
 4. Voice transcription research can happen in parallel — it is a research item, not a code item.
+
+
+---
+
+## v2 Candidate Decision — Mode B Universal (added 2026-05-06)
+
+**Open question for v2 architecture:** should NativeClaw standardize on OpenCode CLI as the single backend runner across all four lanes (Claude, Codex GPT, Kimi, Grok), enabling a single persistent `opencode serve` daemon that keeps MCPs warm for every turn regardless of which model is invoked?
+
+**Surfaced from:** the OpenCode migration prep (2026-05-06). Smoke test confirmed OpenCode handles all four model providers via OpenRouter, supports our 25 MCPs, has a clean JSON event schema, and ships `opencode serve` natively.
+
+**Pros if adopted:**
+- One CLI, one daemon, one MCP set across all lanes — eliminates the live/repo bridge drift
+- Mode B (persistent server) becomes uniform — every lane gets warm MCPs and ~50ms TTFT instead of 10-30s cold start
+- Consistent JSON schema = simpler bridge parser
+- Native skill support across all lanes (Codex CLI doesn't read `~/.claude/skills/`, OpenCode does)
+
+**Cons if adopted:**
+- Lose Claude Max subscription value — Anthropic models would route through OpenRouter at per-token pricing
+- Lose Anthropic-native features that don't pass through OpenRouter cleanly (extended thinking blocks, fine prompt cache control, citations API)
+- Lose the `/usage` introspection we wired up for Anthropic + OpenAI subscription plans
+- Lose Codex CLI native session resume / rollover features
+- Single point of failure: if OpenCode breaks or `anomalyco/opencode` repo goes inactive, we have no fallback
+- Cost model uncertain — needs side-by-side comparison vs current Claude Max + Codex subscription
+
+**Decision gate:** measure real usage for 2-4 weeks after Mode A cutover (current). Audit which Anthropic/OpenAI-native features we actually depend on in production. Then cost-model both architectures. If feature loss is acceptable AND cost works out, lock Mode B universal as a v2 phase. Otherwise keep Mode B scoped to OpenCode lanes only and accept the asymmetry.
+
+**Owner:** revisit during v2 phase planning. Reference: `~/.claude/workspace/projects/opencode-migration/PLAN.md` § Phase H.
+
+---
+
+## v2.1 Locked Spec — Subagent Delegation (added 2026-05-07)
+
+Decided 2026-05-07 with Whet. Originally listed under § F as "Locked for v2.0" but pulled to v2.1 because the orphan module (`lib/subagent-delegation.ts`) wasn't actually wired and needed a real spec before implementation.
+
+### Trigger
+Slash command: `/bg <prompt>`. No heuristic inference — explicit only. Optional flags: `--max <minutes>`, `--cost <dollars>`.
+
+### Backend
+Uses the user's **active backend at spawn time**. `/bg` from a Kimi context spawns a Kimi subagent, from Claude → Claude, etc. No backend override flag in v2.1 (revisit if asymmetric needs emerge).
+
+### Result delivery
+**Bridge polls + auto-delivers.** Bridge scans `~/.claude/.subagents/done/` every 60s. On new completion, sends to originating Telegram chat as `🤖 Subagent <id> done (Xs, $Y):\n\n<text>`. No user-poll required.
+
+### Failure delivery
+Telegram message regardless of outcome. Status enum: `completed | failed | timeout | budget | killed`. Failed/timeout messages prefix `❌` and include error + last 200 chars of subagent output.
+
+### Context
+Full primer (SOUL + USER + MEMORY + last 3 daily logs + TOOLS), same as a fresh `/reset` turn. No gap-transcript injection — subagent is its own thing, not a backend handoff.
+
+### Continuity
+Standalone. Subagent runs in its own session. Result drops to Telegram as a free-standing message, not threaded into the originating Claude/Codex/Kimi/Grok session history.
+
+### Caps
+- Wall-clock: 10 min default (override `/bg --max 30`, hard ceiling 60 min)
+- Cost: $2/run hard ceiling on Codex/OpenCode (live token billing visible). Claude only post-hoc reports cost — soft check, log warning if exceeded
+- Concurrent: 3 in-flight per chat; 4th queued
+- On cap hit: kill, deliver partial result if any, status = `timeout` or `budget`
+- **Cost reality check:** skipped for v2.1 (no Claude Max weekly-utilization gating). Revisit if subscription burn becomes a problem.
+
+### MEMORY evaluation flow
+Subagents do NOT write to daily logs. Instead:
+1. On completion, bridge runs cheap regex heuristic on result text (entity detection: client names, $/€ amounts, dates, "found/discovered/learned" keywords).
+2. If heuristic hits, marker file `~/.claude/.subagents/pending-review/<id>` written.
+3. Bridge prepends to **next user-message primer** for the originating chat: `📋 Subagent <id> just completed. Preview: <300 chars>. Evaluate if anything belongs in MEMORY.md.`
+4. Main agent (Whet) decides → writes if durable → removes marker.
+
+This means user sees raw result in real time, agent sees it on next turn with explicit "evaluate this" framing. Two-pass design, no race condition with live writes.
+
+### Bridge restart resilience
+On startup, bridge rediscovers `~/.claude/.subagents/inflight/*.json`:
+- For each, check if PID still alive via `process.kill(pid, 0)`
+- If alive: re-attach polling
+- If dead: check for `done/<id>.json`; if missing, mark status `orphaned`, write minimal result, deliver to Telegram
+
+### Self-spawn (agent-initiated)
+Whet (and any other agent on the install) can fire subagents via shared CLI: `bash ~/.claude/scripts/subagent fire --prompt "..." --backend <auto|claude|codex|kimi|grok> [--max] [--cost]`. Returns `{id, status: "queued"}` immediately. Same code path as `/bg`.
+
+**Default agent pattern: fire-and-forget.** Agent calls `subagent fire` and returns. Telegram gets the result async via the standard delivery path. Agent does NOT poll its own subagent results unless explicitly synthesizing.
+
+### File layout
+```
+~/.claude/.subagents/
+  queue/<id>.json       # written by /bg or `subagent fire`; bridge picks up every 5s
+  inflight/<id>.json    # bridge moved here after detached spawn (pid + start time)
+  done/<id>.json        # final result (text, status, cost, duration)
+  pending-review/<id>   # marker for memory-eval primer injection
+```
+
+### CLI
+```
+~/.claude/scripts/subagent
+  fire --prompt "..." --backend <auto|claude|codex|kimi|grok> [--max 600] [--cost 2]
+  poll <id>
+  list
+  kill <id>
+```
+
+### Slash commands (Telegram)
+- `/bg <prompt>` — fire subagent on active backend
+- `/agents` — list in-flight + last 5 completed (id, age, status, $)
+- `/agents kill <id>` — manual abort
+- `/agents view <id>` — re-send completed result
+
+### Out of scope for v2.1
+- Subagent-to-subagent delegation (recursion)
+- Cross-chat subagents (only delivers to originating chat)
+- Persistent named subagents (`/agents resume X`)
+- Voice trigger (text only)
+
+### Build estimate
+~7-8 hours real work. Existing `lib/subagent-delegation.ts` is partially reusable (detached-spawn pattern is correct); throw out the OpenCode-only assumption and the dead `idleTimer` no-op.
+

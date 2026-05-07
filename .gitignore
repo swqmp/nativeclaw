@@ -6,6 +6,9 @@ bridge/state.json
 bridge/bridge.pid
 telegram-images/
 
+# Local rollback backups (never commit)
+bridge/*.pre-*
+
 # Logs
 logs/
 

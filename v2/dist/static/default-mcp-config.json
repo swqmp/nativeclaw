@@ -1,0 +1,29 @@
+{
+    // NativeClaw v2.0 — Default MCP Server Config Skeleton
+    // Users customize and save as ~/.claude/.mcp.json
+    "mcpServers": {
+        "qmd_memory": {
+            "command": "npx",
+            "args": ["@anthropic-ai/mcp-server-qmd@latest"],
+            "env": {
+                "MCP_MEMORY_DIR": "${HOME}/.claude/workspace/system/mcp/qmd-memory"
+            }
+        },
+        "google_calendar": {
+            "command": "npx",
+            "args": ["@anthropic-ai/mcp-server-google-calendar@latest"],
+            "env": {
+                "GOOGLE_CLIENT_ID": "770836517733",
+                "GOOGLE_CLIENT_SECRET": "${KEYCHAIN:GOOGLE_CLIENT_SECRET}"
+            }
+        },
+        "reminders": {
+            "command": "npx",
+            "args": ["@anthropic-ai/mcp-server-reminders@latest"]
+        },
+        "web_search": {
+            "command": "npx",
+            "args": ["@anthropic-ai/mcp-server-web-search@latest"]
+        }
+    }
+}

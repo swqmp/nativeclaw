@@ -1,0 +1,99 @@
+#!/usr/bin/env node
+
+/**
+ * NativeClaw Setup Wizard — Terminal TUI Mode
+ * Thin wrapper around setup-core.ts using enquirer for interactive prompts.
+ */
+
+const Enquirer = require('enquirer');
+const { NativeClawSetup } = require('../dist/wizard/setup-core');
+const fs = require('fs');
+const path = require('path');
+
+const HOME = process.env.HOME || process.env.USERPROFILE;
+const WIZARD_STATE_PATH = path.join(HOME, '.claude', '.nativeclaw-wizard-state.json');
+
+async function main() {
+  const enquirer = new Enquirer();
+  const setup = new NativeClawSetup();
+
+  console.log('⚡ NativeClaw v2.0 Setup\n');
+
+  const steps = [
+    { name: 'welcome', run: () => setup.stepWelcome() },
+    { name: 'prereq', run: () => setup.stepPrereqCheck() },
+    { name: 'backend', run: () => setup.stepBackendChoice(enquirer) },
+    { name: 'identity', run: () => setup.stepIdentity(enquirer) },
+    { name: 'telegram', run: () => setup.stepTelegram(enquirer) },
+    { name: 'features', run: () => setup.stepFeatures(enquirer) },
+    { name: 'install', run: () => setup.stepInstall() },
+  ];
+
+  let current = 0;
+  const saved = loadProgress();
+  if (saved && saved.lastCompletedStep !== undefined) {
+    const resume = await enquirer.prompt({
+      type: 'confirm',
+      name: 'resume',
+      message: `Resume from step "${saved.lastStepName}"?`,
+      initial: true,
+    });
+    if (resume.resume) {
+      current = saved.lastCompletedStep + 1;
+      setup.loadState(saved.state);
+    }
+  }
+
+  for (let i = current; i < steps.length; i++) {
+    const step = steps[i];
+    console.log(`\n--- Step ${i + 1}/${steps.length}: ${step.name} ---\n`);
+    try {
+      const result = await step.run();
+      if (result === 'skip') {
+        console.log(`Skipping ${step.name} for now.`);
+      }
+      saveProgress(i, step.name, setup.getState());
+    } catch (err) {
+      console.error(`\n❌ Step "${step.name}" failed: ${err.message}`);
+      const action = await enquirer.prompt({
+        type: 'select',
+        name: 'action',
+        message: 'What now?',
+        choices: [
+          { name: 'retry', message: 'Retry this step' },
+          { name: 'skip', message: 'Skip for now' },
+          { name: 'manual', message: 'Show manual path and exit' },
+        ],
+      });
+      if (action.action === 'retry') {
+        i--; // retry
+      } else if (action.action === 'skip') {
+        saveProgress(i, step.name, setup.getState());
+      } else {
+        console.log(`\nManual config path: ~/.claude/telegram-bridge/config.json`);
+        process.exit(0);
+      }
+    }
+  }
+
+  console.log('\n✅ Setup complete! Run `nativeclaw status` to verify.');
+  fs.unlinkSync(WIZARD_STATE_PATH);
+}
+
+function loadProgress() {
+  try {
+    return JSON.parse(fs.readFileSync(WIZARD_STATE_PATH, 'utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function saveProgress(lastCompletedStep, lastStepName, state) {
+  const data = { lastCompletedStep, lastStepName, state, savedAt: new Date().toISOString() };
+  fs.writeFileSync(WIZARD_STATE_PATH, JSON.stringify(data, null, 2));
+}
+
+main().catch((err) => {
+  console.error('Setup error:', err.message);
+  process.exit(1);
+});

@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+
+/**
+ * NativeClaw Status — Quick health snapshot
+ * Shows bridge alive/dead, last cron, MCP summary.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { execSync } = require('child_process');
+
+const HOME = process.env.HOME || process.env.USERPROFILE;
+const BRIDGE_PID = path.join(HOME, '.claude', 'telegram-bridge', 'bridge.pid');
+const LOG_PATH = path.join(HOME, '.claude', 'logs', 'telegram-bridge.log');
+const STATE_PATH = path.join(HOME, '.claude', 'telegram-bridge', 'state.json');
+
+function pidAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function tailLog(lines = 10) {
+  try {
+    return execSync(`tail -n ${lines} "${LOG_PATH}"`, { encoding: 'utf8' }).trim();
+  } catch {
+    return '(no log)';
+  }
+}
+
+function main() {
+  console.log('⚡ NativeClaw Status\n');
+
+  let bridgeAlive = false;
+  if (fs.existsSync(BRIDGE_PID)) {
+    const pid = parseInt(fs.readFileSync(BRIDGE_PID, 'utf8'), 10);
+    bridgeAlive = pidAlive(pid);
+    console.log(`Bridge PID: ${pid} — ${bridgeAlive ? '✅ Alive' : '❌ Dead (stale PID)'}`);
+  } else {
+    console.log('Bridge PID file: ❌ Not found');
+  }
+
+  let lastCron = '(unknown)';
+  try {
+    const log = tailLog(30);
+    const m = log.match(/Cron (\S+).*completed/);
+    if (m) lastCron = m[0];
+  } catch {
+    /* ignore */
+  }
+  console.log(`Last cron: ${lastCron}`);
+
+  console.log(`\n--- Last 5 log lines ---\n${tailLog(5)}`);
+
+  if (!bridgeAlive) {
+    console.log('\n💡 Restart: launchctl kickstart -k gui/501/com.njdev.claude-session');
+  }
+}
+
+main();

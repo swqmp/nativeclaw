@@ -1,0 +1,22 @@
+#!/usr/bin/env node
+
+/**
+ * NativeClaw Logs — Tail the bridge log
+ * Usage: nativeclaw logs [<lines>]
+ */
+
+const { execSync } = require('child_process');
+const path = require('path');
+
+const HOME = process.env.HOME || process.env.USERPROFILE;
+const LOG_PATH = path.join(HOME, '.claude', 'logs', 'telegram-bridge.log');
+
+const lines = parseInt(process.argv[2] || '50', 10);
+
+try {
+  const out = execSync(`tail -n ${lines} "${LOG_PATH}"`, { encoding: 'utf8' });
+  process.stdout.write(out);
+} catch (err) {
+  console.error('Failed to read log:', err.message);
+  process.exit(1);
+}

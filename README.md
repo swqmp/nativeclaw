@@ -16,10 +16,22 @@ It started as a Claude Code bridge. Current NativeClaw can run either Claude or 
 
 ## What's Current
 
-Current bridge version: `v1.10.0`.
+Current bridge version: `v2.0.0`.
 
-Highlights:
-- **Agent reliability stack** (new in v1.10): QMD semantic memory search, feedback-loop discipline, platform keychain for API keys, MCP probe + wrapper, task queue, session self-audit, memory-reminder hooks
+**v2.0 is a major release** — NativeClaw becomes an installable assistant with a visual setup flow and a persistent control panel. See [v2/README.md](v2/README.md) and [v2/CHANGELOG.md](v2/CHANGELOG.md) for v2.0-specific docs.
+
+v2.0 highlights:
+- **Setup Wizard** at `127.0.0.1:9292` — browser-based 6-step flow with retry/skip/edit recovery, plus terminal TUI mode (`nativeclaw setup`)
+- **Settings UI** — on-demand control panel at `127.0.0.1:9292` with 7 tabs (Status / Config / MCP / Cron / Connections / Logs / Backup), random-token URL auth, 30-min idle auto-shutdown
+- **Cross-platform parity** — macOS (launchd), Linux (systemd), Windows (Task Scheduler + DPAPI). `install.sh` and `install.ps1` produce identical installs.
+- **Backup / Restore / Doctor** — `nativeclaw backup`, `nativeclaw restore <zip>`, `nativeclaw doctor` for diagnostic bundles
+- **xAI Grok STT** voice transcription (fast + cheap; OpenAI Whisper as fallback)
+- **Kimi / Grok auto-compaction** at ~180k / ~150k thresholds via `lib/compaction.ts`
+- **`/compact` slash command** — manual compaction across all four backends
+- **`/stats` context window display** — shows `Context: <window> (<filled>k filled)` per backend with per-message JSONL accuracy
+
+Carried over from v1.10:
+- **Agent reliability stack**: QMD semantic memory search, feedback-loop discipline, platform keychain for API keys, MCP probe + wrapper, task queue, session self-audit, memory-reminder hooks
 - `/codex` and `/claude` backend switching with timestamped gap transcripts
 - `/codex --full` and `/claude --full` force full available gap replay
 - `/effort <low|medium|high|xhigh|max>` for Claude/Codex reasoning depth
@@ -28,9 +40,7 @@ Highlights:
 - Session-audit cron clears both Claude and Codex sessions
 - Slash-command eval harness: `node ~/.claude/telegram-bridge/eval-slash-commands.js`
 
-See **[CHANGELOG.md](CHANGELOG.md)** and **[UPGRADING.md](UPGRADING.md)** (if you're on v1.9.x).
-
-See [CHANGELOG.md](CHANGELOG.md) for the detailed history.
+See **[v2/CHANGELOG.md](v2/CHANGELOG.md)** for v2.0 changes and **[CHANGELOG.md](CHANGELOG.md)** for v1.x history. **[UPGRADING.md](UPGRADING.md)** has migration notes from v1.9.x.
 
 ## Requirements
 

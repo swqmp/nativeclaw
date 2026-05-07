@@ -13,6 +13,7 @@
 const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
+const { runOpenCode } = require('./bridge-opencode');
 
 // ============================================================
 // CONFIG & STATE
@@ -67,11 +68,19 @@ let state = {
   sessionDates: {},     // { chatId: "YYYY-MM-DD" } — day bound for Claude sessions
   codexSessions: {},    // { chatId: string } — Codex thread IDs
   codexSessionDates: {},// { chatId: "YYYY-MM-DD" } — day bound for Codex sessions
-  backends: {},         // { chatId: "claude" | "codex" }
+  kimiSessions: {},     // { chatId: string } — Kimi/OpenRouter Codex thread IDs
+  kimiSessionDates: {}, // { chatId: "YYYY-MM-DD" } — day bound for Kimi threads
+  grokSessions: {},     // { chatId: string } — Grok/OpenRouter Codex thread IDs
+  grokSessionDates: {}, // { chatId: "YYYY-MM-DD" } — day bound for Grok threads
+  recentlyClearedSessions: {}, // { chatId: { claude?, codex?, kimi?, grok?: thread/session ID } }
+                                // — last cleared ID per backend, used as gap-transcript
+                                //   fallback when current session is null (e.g., after
+                                //   broken-session recovery wiped the thread but we still
+                                //   want to recover the old rollout's events).
+  backends: {},         // { chatId: "claude" | "codex" | "kimi" | "grok" }
   pendingTransfer: {},  // { chatId: {from, to, context?} } — one-shot flag to inject cross-backend context on next message
   sessionStartRanToday: '',  // YYYY-MM-DD — set once SESSION START ran today on either backend; implicitly cleared when day rolls (5 AM ET anchor)
   arrivedAt: {},        // { chatId: { claude: ISO, codex: ISO } } — when the user most recently arrived at each backend; gap-transcript boundary
-  firstRun: {},         // { chatId: { greetedAt: ISO } } — Telegram-first onboarding already shown
   exchangeCount: {},
 };
 if (fs.existsSync(STATE_PATH)) {
@@ -83,17 +92,48 @@ if (fs.existsSync(STATE_PATH)) {
     if (!state.sessionDates) state.sessionDates = {};
     if (!state.codexSessions) state.codexSessions = {};
     if (!state.codexSessionDates) state.codexSessionDates = {};
+    if (!state.kimiSessions) state.kimiSessions = {};
+    if (!state.kimiSessionDates) state.kimiSessionDates = {};
+    if (!state.grokSessions) state.grokSessions = {};
+    if (!state.grokSessionDates) state.grokSessionDates = {};
+    if (!state.recentlyClearedSessions) state.recentlyClearedSessions = {};
     if (!state.backends) state.backends = {};
     if (!state.pendingTransfer) state.pendingTransfer = {};
+    // Compaction state (added May 7 2026): track running token total per
+    // chat session so we can trigger pre-compaction checkpoint + new-session
+    // bootstrap when context approaches the model's window.
+    if (!state.sessionTokenTotals || typeof state.sessionTokenTotals !== 'object') state.sessionTokenTotals = {};
+    if (!state.compactionPending || typeof state.compactionPending !== 'object') state.compactionPending = {};
     if (typeof state.sessionStartRanToday !== 'string') state.sessionStartRanToday = '';
     if (!state.arrivedAt || typeof state.arrivedAt !== 'object') state.arrivedAt = {};
-    if (!state.firstRun || typeof state.firstRun !== 'object') state.firstRun = {};
     const today = getCurrentSessionDay();
     for (const [cid, sid] of Object.entries(state.sessions)) {
       if (sid && !state.sessionDates[cid]) state.sessionDates[cid] = today;
     }
     for (const [cid, tid] of Object.entries(state.codexSessions)) {
       if (tid && !state.codexSessionDates[cid]) state.codexSessionDates[cid] = today;
+    }
+    for (const [cid, tid] of Object.entries(state.kimiSessions)) {
+      if (tid && !state.kimiSessionDates[cid]) state.kimiSessionDates[cid] = today;
+    }
+    for (const [cid, tid] of Object.entries(state.grokSessions)) {
+      if (tid && !state.grokSessionDates[cid]) state.grokSessionDates[cid] = today;
+    }
+    // Post-OpenCode-cutover (May 6, 2026): purge legacy Codex thread IDs that
+    // pre-date the kimi/grok migration to OpenCode. OpenCode session IDs are
+    // 'ses_...' format; legacy Codex thread IDs are UUIDs. Resuming a Codex
+    // thread ID through OpenCode would error, so drop them on first load.
+    for (const [cid, tid] of Object.entries(state.kimiSessions)) {
+      if (tid && !String(tid).startsWith('ses_')) {
+        delete state.kimiSessions[cid];
+        delete state.kimiSessionDates[cid];
+      }
+    }
+    for (const [cid, tid] of Object.entries(state.grokSessions)) {
+      if (tid && !String(tid).startsWith('ses_')) {
+        delete state.grokSessions[cid];
+        delete state.grokSessionDates[cid];
+      }
     }
     // Restore persisted chat settings (model choices survive restart)
     if (loaded.chatSettings) {
@@ -108,30 +148,6 @@ if (fs.existsSync(STATE_PATH)) {
 
 function getBackend(chatId) {
   return state.backends[String(chatId)] || config.defaultBackend || 'claude';
-}
-
-function buildFirstRunWelcome() {
-  return [
-    `${AGENT_LABEL} is connected.`,
-    '',
-    'This chat is the main control surface. Tell me who you are, what you want help with, and what apps or tools you eventually want connected.',
-    '',
-    'I can help turn that into durable workspace memory: USER.md for you, MEMORY.md for ongoing context, and TOOLS.md for local tool setup.',
-    '',
-    'Useful commands: /status checks the bridge, /help lists commands, and /claude or /codex switch backends if both are installed.',
-  ].join('\n');
-}
-
-function buildFirstRunPromptContext() {
-  return [
-    '# FIRST-RUN ONBOARDING CONTEXT',
-    '',
-    'This is the user\'s first non-command Telegram message after setup.',
-    'Help them establish durable context. If they introduce themselves, offer to save stable facts to USER.md, MEMORY.md, and TOOLS.md as appropriate.',
-    'Keep the response concise and practical.',
-    '',
-    '# END FIRST-RUN ONBOARDING CONTEXT',
-  ].join('\n');
 }
 
 function getCurrentSessionDay(date = new Date()) {
@@ -159,7 +175,25 @@ function getSessionStores(kind) {
   if (kind === 'codex') {
     return { ids: state.codexSessions, dates: state.codexSessionDates, label: 'Codex thread' };
   }
+  if (kind === 'kimi') {
+    return { ids: state.kimiSessions, dates: state.kimiSessionDates, label: 'Kimi thread' };
+  }
+  if (kind === 'grok') {
+    return { ids: state.grokSessions, dates: state.grokSessionDates, label: 'Grok thread' };
+  }
   return { ids: state.sessions, dates: state.sessionDates, label: 'Claude session' };
+}
+
+function isCodexFamilyBackend(backend) {
+  return backend === 'codex' || backend === 'kimi' || backend === 'grok';
+}
+
+function backendLabel(backend) {
+  if (backend === 'claude') return 'Claude';
+  if (backend === 'codex') return 'Codex';
+  if (backend === 'kimi') return 'Kimi';
+  if (backend === 'grok') return 'Grok';
+  return backend || 'Unknown';
 }
 
 function clearStoredSession(kind, chatId, reason = '') {
@@ -169,9 +203,21 @@ function clearStoredSession(kind, chatId, reason = '') {
   if (reason && id) {
     log(`${label} ${id} cleared for ${key}: ${reason}`);
   }
+  // Stash the ID we are clearing so a future gap-transcript query can still locate
+  // its rollout file even after broken-session recovery. setStoredSessionId clears
+  // this stash when a NEW session is established for the same backend.
+  if (id) {
+    if (!state.recentlyClearedSessions[key]) state.recentlyClearedSessions[key] = {};
+    state.recentlyClearedSessions[key][kind] = id;
+  }
   delete ids[key];
   delete dates[key];
-  clearBackendArrival(chatId, kind);
+  // NOTE: do NOT clear arrivedAt here. Broken-session recovery and same-day rollover
+  // both call this function, and they should preserve the user's arrival boundary
+  // (the time they typed /grok, /kimi, etc.) so the next gap transcript captures
+  // the FULL backend session, not just the post-recovery sliver. Explicit cold
+  // starts (session-audit cron, /reset, /fresh) call clearBackendArrival directly
+  // where the reset is actually wanted.
 }
 
 function getStoredSessionId(kind, chatId) {
@@ -198,6 +244,14 @@ function setStoredSessionId(kind, chatId, id) {
   // with a fresh now() after gap injection if the user is explicitly switching.
   if (!state.arrivedAt[key]) state.arrivedAt[key] = {};
   if (!state.arrivedAt[key][kind]) state.arrivedAt[key][kind] = new Date().toISOString();
+  // A fresh session is now in place; the recently-cleared fallback for this backend
+  // is stale (current session covers events from this point forward).
+  if (state.recentlyClearedSessions[key] && state.recentlyClearedSessions[key][kind]) {
+    delete state.recentlyClearedSessions[key][kind];
+    if (Object.keys(state.recentlyClearedSessions[key]).length === 0) {
+      delete state.recentlyClearedSessions[key];
+    }
+  }
 }
 
 function getBackendArrival(chatId, backend) {
@@ -273,8 +327,16 @@ function nativeClawEnv() {
   return {
     NATIVECLAW_WORKSPACE: process.env.NATIVECLAW_WORKSPACE || WORKSPACE,
     NATIVECLAW_PROJECT_DIR: process.env.NATIVECLAW_PROJECT_DIR || toClaudeProjectDir(WORKSPACE),
-    NATIVECLAW_KEYCHAIN_ACCOUNT: process.env.NATIVECLAW_KEYCHAIN_ACCOUNT || process.env.USER || process.env.USERNAME || 'nativeclaw',
+    NATIVECLAW_KEYCHAIN_ACCOUNT: process.env.NATIVECLAW_KEYCHAIN_ACCOUNT || (config.agentName ? String(config.agentName).toLowerCase() : null) || process.env.USER || process.env.USERNAME || 'nativeclaw',
   };
+}
+
+function readKeychainSecret(service, account = (process.env.NATIVECLAW_KEYCHAIN_ACCOUNT || (config.agentName ? String(config.agentName).toLowerCase() : 'whet'))) {
+  try {
+    return execSync(`/usr/bin/security find-generic-password -a ${JSON.stringify(account)} -s ${JSON.stringify(service)} -w 2>/dev/null`, { encoding: 'utf8' }).trim();
+  } catch {
+    return '';
+  }
 }
 
 // ============================================================
@@ -339,6 +401,25 @@ const CODEX_MODELS = {
   '5.1-codex-mini':  { id: 'gpt-5.1-codex-mini',  display: 'GPT-5.1 Codex Mini' },
 };
 const CODEX_DEFAULT_MODEL = 'gpt-5.5';
+const KIMI_MODEL = 'moonshotai/kimi-k2.6';
+const KIMI_DISPLAY = 'Kimi K2.6 via OpenCode + OpenRouter';
+// Compaction thresholds (absolute tokens). When step_finish.tokens.total
+// reaches the threshold for the active model, the next user message triggers
+// pre-compaction checkpoint + summarization + new session bootstrap.
+// Verified context windows (May 7 2026 via OpenRouter API):
+//   moonshotai/kimi-k2.6:  262_144 ctx → 180k threshold (~68%)
+//   x-ai/grok-4.3:       1_000_000 ctx → 350k threshold (~35%)
+const MODEL_COMPACTION_THRESHOLDS = {
+  'openrouter/moonshotai/kimi-k2.6': 180_000,
+  'openrouter/x-ai/grok-4.3':         350_000,
+};
+const GROK_MODEL = 'x-ai/grok-4.3';
+const GROK_DISPLAY = 'Grok 4.3 via OpenCode + OpenRouter';
+const OPENROUTER_PROVIDER = {
+  name: 'openrouter',
+  baseUrl: 'https://openrouter.ai/api/v1',
+  envKey: 'OPENROUTER_API_KEY',
+};
 const GAP_CAP_CHARS = 50000; // Hard cap on injected backend-switch gap transcript size; oldest events drop first if exceeded.
 
 // Files to inject as standing context on fresh Codex threads.
@@ -575,8 +656,22 @@ function extractCodexTranscriptExchanges(threadId, maxExchanges = 30, sinceISO =
           filtered.push(t);
         }
         if (filtered.length === 0) continue;
-        const joined = filtered.join('\n').trim();
+        let joined = filtered.join('\n').trim();
         if (!joined) continue;
+        // Strip the backend-preamble framing block (e.g., # KIMI BACKEND NOTE,
+        // # CODEX BACKEND, transferContext header, etc.) from user messages so
+        // (a) the dedup key reflects actual user content — bridge prepends
+        // identical preamble to every message, which would otherwise collapse
+        // every same-backend user message into one — and (b) the gap transcript
+        // is cleaner when injected into the other backend.
+        if (role === 'user') {
+          const userMessageMarker = '\n\n# USER MESSAGE\n\n';
+          const markerIdx = joined.lastIndexOf(userMessageMarker);
+          if (markerIdx !== -1) {
+            joined = joined.slice(markerIdx + userMessageMarker.length).trim();
+            if (!joined) continue;
+          }
+        }
         const ts = (typeof ev.timestamp === 'string') ? ev.timestamp : null;
         if (sinceMs && ts && Date.parse(ts) < sinceMs) continue;
         const dedupKey = `${role}:${joined.slice(0, 200)}`;
@@ -593,18 +688,126 @@ function extractCodexTranscriptExchanges(threadId, maxExchanges = 30, sinceISO =
   }
 }
 
+// Extract filtered user/assistant exchanges from an OpenCode session (SQLite-backed).
+// Used for kimi/grok lanes after the May 6 2026 cutover. Reads ~/.local/share/opencode/opencode.db
+// via sqlite3 CLI to avoid adding a node-sqlite dependency to the bridge.
+//
+// Schema (OpenCode 1.14.39, verified May 2026):
+//   message: id, session_id, time_created (ms), time_updated, data (JSON: {role, mode, agent, ...})
+//   part:    id, message_id, session_id, time_created, time_updated, data (JSON: {type: 'text'|'tool'|'reasoning'|'step-start'|'step-finish', ...})
+//
+// We extract user-typed input (role=user, part type=text) and assistant text outputs (role=assistant,
+// part type=text). Tool calls, reasoning, and step markers are skipped.
+function extractOpenCodeTranscriptExchanges(sessionId, maxExchanges = 30, sinceISO = null) {
+  if (!sessionId) return [];
+  const dbPath = path.join(process.env.HOME, '.local/share/opencode/opencode.db');
+  if (!fs.existsSync(dbPath)) return [];
+  const sinceMs = sinceISO ? Date.parse(sinceISO) : null;
+  try {
+    // Read message + part rows, joined, ordered chronologically. Use sqlite3 CLI in -json mode.
+    const sql = `SELECT m.id AS message_id, m.time_created AS msg_time, m.data AS msg_data, ` +
+                `p.data AS part_data, p.time_created AS part_time ` +
+                `FROM message m JOIN part p ON p.message_id = m.id ` +
+                `WHERE m.session_id = '${sessionId.replace(/'/g, "''")}' ` +
+                `ORDER BY m.time_created ASC, p.time_created ASC;`;
+    const json = execSync(`sqlite3 -json "${dbPath}" "${sql.replace(/"/g, '\\"')}"`, {
+      encoding: 'utf8',
+      maxBuffer: 50 * 1024 * 1024,
+    }).trim();
+    if (!json) return [];
+    const rows = JSON.parse(json);
+
+    // Group parts by message and aggregate text content per role
+    const messageMap = new Map();
+    for (const row of rows) {
+      let msgMeta, partMeta;
+      try {
+        msgMeta = JSON.parse(row.msg_data);
+        partMeta = JSON.parse(row.part_data);
+      } catch { continue; }
+      if (partMeta.type !== 'text') continue; // skip tool, reasoning, step-*
+      const role = msgMeta.role;
+      if (role !== 'user' && role !== 'assistant') continue;
+      const text = (partMeta.text || '').trim();
+      if (!text) continue;
+      // Apply same filter as Codex/Claude readers — drop standing context dumps and backend-preamble framing
+      if (
+        text.startsWith('<permissions') ||
+        text.startsWith('<environment') ||
+        text.startsWith('# AGENTS.md instructions') ||
+        text.startsWith('# KIMI BACKEND') ||
+        text.startsWith('# GROK BACKEND') ||
+        text.startsWith('# STANDING CONTEXT') ||
+        text.startsWith('# CONVERSATION RECAP') ||
+        text.startsWith('# HANDOFF BRIEF')
+      ) continue;
+      const existing = messageMap.get(row.message_id);
+      if (existing) {
+        existing.text += '\n' + text;
+      } else {
+        messageMap.set(row.message_id, { role, text, time_created: row.msg_time });
+      }
+    }
+
+    // Convert to exchanges array and apply since-filter, USER MESSAGE marker strip, dedup
+    const exchanges = [];
+    const seen = new Set();
+    for (const entry of messageMap.values()) {
+      if (sinceMs && entry.time_created < sinceMs) continue;
+      let joined = entry.text.trim();
+      if (entry.role === 'user') {
+        const userMessageMarker = '\n\n# USER MESSAGE\n\n';
+        const markerIdx = joined.lastIndexOf(userMessageMarker);
+        if (markerIdx !== -1) {
+          joined = joined.slice(markerIdx + userMessageMarker.length).trim();
+        }
+      }
+      if (!joined) continue;
+      const dedupKey = `${entry.role}:${joined.slice(0, 200)}`;
+      if (seen.has(dedupKey)) continue;
+      seen.add(dedupKey);
+      const ts = new Date(entry.time_created).toISOString();
+      exchanges.push({ role: entry.role, text: joined.slice(0, 4000), timestamp: ts });
+    }
+
+    return exchanges.slice(-maxExchanges);
+  } catch (err) {
+    log(`extractOpenCodeTranscriptExchanges failed: ${err.message}`);
+    return [];
+  }
+}
+
 // Build a gap transcript: filtered + timestamped tail of the source backend's
 // session/thread since the user last arrived at it. Replaces the old summary+replay
 // dual path. Returns formatted block or '' if no events / no session.
-function buildGapTranscript(sourceBackend, sessionKey, sinceISO) {
-  const sessionId = sourceBackend === 'codex'
-    ? getStoredSessionId('codex', sessionKey)
-    : getStoredSessionId('claude', sessionKey);
+function buildGapTranscript(sourceBackend, sessionKey, sinceISO, targetBackend = null) {
+  const sourceKind = isCodexFamilyBackend(sourceBackend) ? sourceBackend : 'claude';
+  let sessionId = getStoredSessionId(sourceKind, sessionKey);
+  // Fallback: if the current session was cleared (e.g., broken-session recovery wiped it
+  // before the user could switch backends), use the most recently cleared ID for this
+  // backend so we can still locate the rollout/transcript file on disk. The arrival
+  // timestamp (since=...) still bounds the window correctly.
+  if (!sessionId) {
+    const stash = state.recentlyClearedSessions && state.recentlyClearedSessions[String(sessionKey)];
+    if (stash && stash[sourceKind]) {
+      sessionId = stash[sourceKind];
+      log(`buildGapTranscript: current ${sourceKind} session is null for ${sessionKey}, falling back to recently-cleared ${sessionId}`);
+    }
+  }
   if (!sessionId) return '';
 
-  const exchanges = sourceBackend === 'codex'
-    ? extractCodexTranscriptExchanges(sessionId, 9999, sinceISO)
-    : extractClaudeTranscriptExchanges(sessionId, 9999, sinceISO);
+  // Dispatch by source backend:
+  //   kimi/grok → OpenCode SQLite reader (post-May-6-2026 cutover)
+  //   codex     → Codex thread JSONL reader
+  //   claude    → Claude session transcript reader
+  let exchanges;
+  if (sourceBackend === 'kimi' || sourceBackend === 'grok') {
+    exchanges = extractOpenCodeTranscriptExchanges(sessionId, 9999, sinceISO);
+  } else if (isCodexFamilyBackend(sourceBackend)) {
+    exchanges = extractCodexTranscriptExchanges(sessionId, 9999, sinceISO);
+  } else {
+    exchanges = extractClaudeTranscriptExchanges(sessionId, 9999, sinceISO);
+  }
   if (exchanges.length === 0) return '';
 
   // Hard cap (oldest drops first) so a heavy session doesn't blow up Claude/Codex
@@ -617,8 +820,8 @@ function buildGapTranscript(sourceBackend, sessionKey, sinceISO) {
     truncated++;
   }
 
-  const sourceLabel = sourceBackend === 'codex' ? 'Codex' : 'Claude';
-  const targetLabel = sourceBackend === 'codex' ? 'Claude' : 'Codex';
+  const sourceLabel = backendLabel(sourceBackend);
+  const targetLabel = backendLabel(targetBackend || (sourceBackend === 'claude' ? 'Codex' : 'Claude'));
 
   const lines = [
     `# GAP TRANSCRIPT (from ${sourceLabel} session, while you were on the other backend)`,
@@ -885,12 +1088,25 @@ async function downloadTelegramFile(fileId, prefix = 'file') {
   return localPath;
 }
 
+let _xaiKeyCache = null;
+function getXaiKey() {
+  if (_xaiKeyCache) return _xaiKeyCache;
+  try {
+    _xaiKeyCache = require('child_process')
+      .execSync('/usr/bin/security find-generic-password -a whet -s XAI_API_KEY -w', { stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString().trim();
+    return _xaiKeyCache;
+  } catch (e) {
+    return null;
+  }
+}
+
 async function transcribeVoice(audioPath) {
   const https = require('https');
-  const openaiKey = config.openaiApiKey;
+  const xaiKey = getXaiKey();
 
-  if (!openaiKey) {
-    throw new Error('No OpenAI API key in config.json — cannot transcribe voice');
+  if (!xaiKey) {
+    throw new Error('No XAI_API_KEY in macOS Keychain (account=whet) — cannot transcribe voice');
   }
 
    return new Promise((resolve, reject) => {
@@ -899,7 +1115,7 @@ async function transcribeVoice(audioPath) {
      const fileName = path.basename(audioPath);
 
      const parts = [];
-     parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\nwhisper-1\r\n`));
+     parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="model"\r\n\r\ngrok-stt\r\n`));
      parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="language"\r\n\r\nen\r\n`));
      parts.push(Buffer.from(`--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${fileName}"\r\nContent-Type: audio/ogg\r\n\r\n`));
      parts.push(audioBuffer);
@@ -910,12 +1126,12 @@ async function transcribeVoice(audioPath) {
      const agent = new https.Agent({ keepAlive: false });
 
      const options = {
-       hostname: 'api.openai.com',
-       path: '/v1/audio/transcriptions',
+       hostname: 'api.x.ai',
+       path: '/v1/stt',
        method: 'POST',
        agent,
        headers: {
-         'Authorization': `Bearer ${openaiKey}`,
+         'Authorization': `Bearer ${xaiKey}`,
          'Content-Type': `multipart/form-data; boundary=${boundary}`,
          'Content-Length': body.length
        }
@@ -927,7 +1143,7 @@ async function transcribeVoice(audioPath) {
      // Hard wall-clock timeout — catches stalled response bodies that fool the socket idle check
      const hardTimer = setTimeout(() => {
        req.destroy();
-       done(reject, new Error('OpenAI Whisper API timeout (45s hard limit)'));
+       done(reject, new Error('Grok STT API timeout (45s hard limit)'));
      }, 45000);
 
      const req = https.request(options, (res) => {
@@ -939,10 +1155,10 @@ async function transcribeVoice(audioPath) {
            if (result.text) {
              done(resolve, result.text.trim());
            } else {
-             done(reject, new Error(result.error?.message || 'No transcript in OpenAI response'));
+             done(reject, new Error(result.error?.message || result.error || 'No transcript in Grok STT response'));
            }
          } catch (e) {
-           done(reject, new Error(`Failed to parse OpenAI response: ${data}`));
+           done(reject, new Error(`Failed to parse Grok STT response: ${data}`));
          }
        });
        res.on('error', err => done(reject, err));
@@ -1284,14 +1500,25 @@ function runCodex(prompt, threadId, options = {}) {
     if (options.codexVerbosity) {
       configFlags.push('-c', `model_verbosity=${JSON.stringify(options.codexVerbosity)}`);
     }
+    if (options.codexProvider === 'openrouter') {
+      configFlags.push('-c', `model_provider=${JSON.stringify(OPENROUTER_PROVIDER.name)}`);
+      configFlags.push('-c', `model_providers.${OPENROUTER_PROVIDER.name}.name=${JSON.stringify(OPENROUTER_PROVIDER.name)}`);
+      configFlags.push('-c', `model_providers.${OPENROUTER_PROVIDER.name}.base_url=${JSON.stringify(OPENROUTER_PROVIDER.baseUrl)}`);
+      configFlags.push('-c', `model_providers.${OPENROUTER_PROVIDER.name}.env_key=${JSON.stringify(OPENROUTER_PROVIDER.envKey)}`);
+    }
 
     if (threadId) {
-      args.push('resume', ...commonFlags, ...configFlags, threadId, prompt);
+      // `codex exec resume` rejects --model, so pass it via -c config override.
+      // Without this, Codex falls back to ~/.codex/config.toml's default model
+      // (gpt-5.5), which silently breaks Kimi/OpenRouter routing — the provider
+      // override worked but the model was wrong, so OpenRouter served GPT-5.5
+      // instead of moonshotai/kimi-k2.6.
+      args.push('resume', ...commonFlags, ...configFlags, '-c', `model=${JSON.stringify(model)}`, threadId, prompt);
     } else {
       args.push(...commonFlags, ...configFlags, '--cd', WORKSPACE, '--model', model, prompt);
     }
 
-    log(`Spawning: codex ${args.slice(0, 2).join(' ')} [${threadId ? 'resume' : 'fresh'}] model=${model} effort=${options.effort || 'default'} verbosity=${options.codexVerbosity || 'default'}`);
+    log(`Spawning: codex ${args.slice(0, 2).join(' ')} [${threadId ? 'resume' : 'fresh'}] model=${model} provider=${options.codexProvider || 'default'} effort=${options.effort || 'default'} verbosity=${options.codexVerbosity || 'default'}`);
 
     // Defensive: clean up orphan MCPs from prior killed subprocesses before spawning
     reapOrphanMCPs();
@@ -1300,6 +1527,10 @@ function runCodex(prompt, threadId, options = {}) {
     delete cleanEnv.CLAUDECODE;
     delete cleanEnv.CLAUDE_CODE_ENTRYPOINT;
     delete cleanEnv.MCP_CLAUDE;
+    if (options.codexProvider === 'openrouter' && !cleanEnv[OPENROUTER_PROVIDER.envKey]) {
+      const openRouterKey = readKeychainSecret(OPENROUTER_PROVIDER.envKey);
+      if (openRouterKey) cleanEnv[OPENROUTER_PROVIDER.envKey] = openRouterKey;
+    }
 
     const proc = spawn('codex', args, {
       cwd: WORKSPACE,
@@ -1325,8 +1556,8 @@ function runCodex(prompt, threadId, options = {}) {
     proc.stdout.on('data', (d) => { stdout += d.toString(); lastDataAt = Date.now(); });
     proc.stderr.on('data', (d) => { stderr += d.toString(); lastDataAt = Date.now(); });
 
-    const timeoutMs = (options.timeout || 300) * 1000;
-    const idleMs = (options.idleTimeout || 180) * 1000;
+    const timeoutMs = (options.timeout || (options.codexProvider === 'openrouter' ? 480 : 300)) * 1000;
+    const idleMs = (options.idleTimeout || (options.codexProvider === 'openrouter' ? 300 : 180)) * 1000;
     const timer = setTimeout(() => {
       log(`Codex subprocess wall-clock timeout after ${timeoutMs}ms, killing tree...`);
       killTree('SIGTERM');
@@ -1420,11 +1651,353 @@ function runCodex(prompt, threadId, options = {}) {
   });
 }
 
+// ============================================================
+// COMPACTION (Phase B, May 7 2026)
+// ============================================================
+//
+// When an OpenCode session approaches model context limit, run a 3-step flow
+// before the user's next message executes:
+//
+//   1. Pre-compaction checkpoint — agent runs AGENTS.md checkpoint discipline
+//      on the current session (curated extraction, NOT raw dump). Writes to
+//      today's daily log + updates MEMORY.md if needed.
+//   2. Sidecar summarizer — separate Kimi call (no MCPs) summarizes prior
+//      history into a structured recap.
+//   3. New session bootstrap — caller starts a fresh OpenCode session with
+//      the recap as the first message; standing context is auto-injected by
+//      buildCodexContext() because session is fresh.
+//
+// runOpenCodeCompaction() handles steps 1+2. Caller (runBackend OpenCode
+// branch) handles step 3 by clearing the session ID before the user turn.
+
+function getMessagesForSummarization(sessionId, keepLast = 10) {
+  // Pull all message+text-parts from OpenCode SQLite, drop the last `keepLast`,
+  // return as plain-text exchanges for the summarizer prompt.
+  const exchanges = extractOpenCodeTranscriptExchanges(sessionId, 9999, null);
+  if (exchanges.length <= keepLast) return [];
+  return exchanges.slice(0, exchanges.length - keepLast);
+}
+
+async function runOpenCodeCompaction(backend, sessionKey, currentSessionId, ocOptions) {
+  const chatId = String(sessionKey);
+  const ocModel = backend === 'kimi'
+    ? 'openrouter/moonshotai/kimi-k2.6'
+    : 'openrouter/x-ai/grok-4.3';
+
+  // Send Telegram "compacting" notice
+  try {
+    await tg('sendMessage', {
+      chat_id: chatId,
+      text: '\u26a1 Compacting context. Running session checkpoint + summarization (~30-45s)...',
+    });
+  } catch (err) {
+    log(`compaction: failed to send pre-notice: ${err.message}`);
+  }
+
+  // Step 1: Pre-compaction checkpoint (agent writes to memory)
+  log(`compaction[${backend}]: step 1 — pre-compaction checkpoint`);
+  const checkpointDirective = [
+    '# CONTEXT-LIMIT CHECKPOINT (PRE-COMPACTION)',
+    '',
+    `Your current OpenCode session is approaching the model context window. Before we compact and start a fresh session, run a session checkpoint NOW per AGENTS.md format:`,
+    '',
+    '- **What we did:** specific actions (files, tools, outcomes)',
+    '- **Decisions made:** what was decided AND why',
+    '- **Open questions:** unresolved items',
+    '- **Next actions:** queued work',
+    '- **Feedback logged:** file path, or "nothing new"',
+    '- **MEMORY.md delta:** what got promoted, or "nothing durable"',
+    '',
+    `Append the checkpoint to today\'s daily log at memory/YYYY-MM-DD.md (use the workspace day-of-week, not UTC). Update MEMORY.md if anything has changed that will matter next week.`,
+    '',
+    'Do NOT respond to the user yet. After writing the checkpoint, return ONLY the literal token "CHECKPOINT_DONE" and nothing else. The bridge will then run summarization and start a fresh session, after which the user\'s real message will be processed.',
+  ].join('\n');
+
+  let checkpointDone = false;
+  try {
+    const ckptResult = await runOpenCode(checkpointDirective, currentSessionId, {
+      ...ocOptions,
+      timeout: 600,
+      idleTimeout: 600,
+    });
+    checkpointDone = (ckptResult.text || '').includes('CHECKPOINT_DONE');
+    log(`compaction[${backend}]: checkpoint ${checkpointDone ? 'completed' : 'completed (no marker, proceeding anyway)'}`);
+  } catch (err) {
+    log(`compaction[${backend}]: checkpoint step failed: ${err.message} — proceeding to summarization anyway`);
+  }
+
+  // Step 2: Sidecar summarizer (separate fresh Kimi call, no MCPs needed)
+  log(`compaction[${backend}]: step 2 — sidecar summarization`);
+  const olderMessages = getMessagesForSummarization(currentSessionId, 10);
+  if (olderMessages.length === 0) {
+    log(`compaction[${backend}]: no older messages to summarize, skipping sidecar`);
+    return null;
+  }
+
+  const transcriptText = olderMessages
+    .map((e) => `[${e.role.toUpperCase()}] ${e.text}`)
+    .join('\n\n---\n\n');
+
+  const summarizerPrompt = [
+    'You are a session summarizer. Summarize the conversation below into the EXACT structured format that follows. Preserve file paths, dates, decisions, and action item assignments verbatim. Drop verification chatter, restated facts, and pleasantries.',
+    '',
+    '## REQUIRED FORMAT',
+    '',
+    '## Decisions Made',
+    '- (bullet list of locked-in choices)',
+    '',
+    '## Action Items (open)',
+    '- (bullet, with owner if assigned)',
+    '',
+    '## Action Items (completed this session)',
+    '- (bullet)',
+    '',
+    '## Files Touched / Changed',
+    '- path/to/file: what changed',
+    '',
+    '## Ongoing Threads',
+    '- topic: 1-2 line state',
+    '',
+    '## Context Worth Carrying Forward',
+    '- (free prose, key technical/personal context)',
+    '',
+    'Length target: 1200 words for prose sections combined; bullet sections can be as long as needed to capture every item. Hard cap 3000 words total.',
+    '',
+    '## CONVERSATION TO SUMMARIZE',
+    '',
+    transcriptText,
+  ].join('\n');
+
+  let summaryText = '';
+  try {
+    const summarizerResult = await runOpenCode(summarizerPrompt, null, {
+      model: ocModel,
+      effort: 'medium',
+      timeout: 600,
+      idleTimeout: 600,
+      workspace: ocOptions.workspace,
+      log,
+      activeRefs: ocOptions.activeRefs,
+      openRouterKey: ocOptions.openRouterKey,
+      configPath: ocOptions.configPath,
+    });
+    summaryText = (summarizerResult.text || '').trim();
+    log(`compaction[${backend}]: summary ${summaryText.length} chars (cost $${(summarizerResult.cost || 0).toFixed(4)})`);
+  } catch (err) {
+    log(`compaction[${backend}]: summarizer failed: ${err.message}`);
+    return null;
+  }
+
+  if (!summaryText) {
+    log(`compaction[${backend}]: summarizer returned empty, abort compaction`);
+    return null;
+  }
+
+  // Send Telegram "compacted" notice
+  try {
+    await tg('sendMessage', {
+      chat_id: chatId,
+      text: `\u2713 Compacted. Saved checkpoint to memory/, summarized ${olderMessages.length} prior messages. Continuing your message in a fresh session...`,
+    });
+  } catch (err) {
+    log(`compaction: failed to send post-notice: ${err.message}`);
+  }
+
+  return {
+    summary: summaryText,
+    olderCount: olderMessages.length,
+    keptCount: 10,
+  };
+}
+
 // Dispatcher — picks the backend runner, builds backend-specific context,
 // and threads through session state.
 async function runBackend(backend, prompt, options, sessionKey) {
-  if (backend === 'codex') {
-    let threadId = getStoredSessionId('codex', sessionKey);
+  // OpenCode path (kimi, grok via OpenRouter) — added 2026-05-06 cutover.
+  // Preempts the codex-family branch below, which now serves only backend === 'codex'.
+  if (backend === 'kimi' || backend === 'grok') {
+    const ocModel = backend === 'kimi'
+      ? 'openrouter/moonshotai/kimi-k2.6'
+      : 'openrouter/x-ai/grok-4.3';
+
+    let ocSessionId = getStoredSessionId(backend, sessionKey);
+    // Defensive: drop any non-OpenCode session ID. Legacy Codex thread IDs are
+    // UUIDs; OpenCode session IDs are 'ses_...'. The startup purge handles the
+    // initial migration; this catches any edge cases (e.g. mid-run state load).
+    if (ocSessionId && !String(ocSessionId).startsWith('ses_')) {
+      log(`Dropping non-OpenCode session ID for ${backend} (${ocSessionId})`);
+      clearStoredSession(backend, sessionKey, 'pre-OpenCode legacy ID');
+      saveState();
+      ocSessionId = null;
+    }
+
+    // === COMPACTION CHECK ===
+    // If session hit threshold last turn, run compaction NOW before processing
+    // the user's new message. Compaction will:
+    //   1. Run pre-compaction checkpoint on the current session (agent writes
+    //      to today's daily log)
+    //   2. Run sidecar summarizer on history minus last 10 messages
+    //   3. Return { summary, olderCount, keptCount } so we can prepend the
+    //      summary to the user's prompt
+    // After compaction completes, ocSessionId is cleared so the user's message
+    // starts a brand-new OpenCode session (fresh standing context auto-injected).
+    let compactionRecap = null;
+    if (state.compactionPending && state.compactionPending[sessionKey] && ocSessionId) {
+      log(`COMPACTION TRIGGERED for ${backend} session ${ocSessionId} (chat ${sessionKey})`);
+      const ocModelForCompaction = backend === 'kimi'
+        ? 'openrouter/moonshotai/kimi-k2.6'
+        : 'openrouter/x-ai/grok-4.3';
+      const ocConfigPathForCompaction = backend === 'grok'
+        ? path.join(process.env.HOME, '.config/opencode/opencode.grok.json')
+        : path.join(process.env.HOME, '.config/opencode/opencode.json');
+      const compactionResult = await runOpenCodeCompaction(backend, sessionKey, ocSessionId, {
+        model: ocModelForCompaction,
+        timeout: options.timeout || 7200,
+        idleTimeout: options.idleTimeout || 900,
+        workspace: WORKSPACE,
+        log,
+        activeRefs: { setSubprocess: (proc) => { activeSubprocess = proc; }, setKillFn: (fn) => { activeKillFn = fn; } },
+        openRouterKey: readKeychainSecret('OPENROUTER_API_KEY'),
+        configPath: ocConfigPathForCompaction,
+      });
+      // Reset session and clear flag regardless of compaction outcome.
+      // If compaction failed, we still want to start fresh next turn (no point
+      // in continuing a session that just hit the limit).
+      clearStoredSession(backend, sessionKey, 'compaction reset');
+      state.sessionTokenTotals[sessionKey] = 0;
+      state.compactionPending[sessionKey] = false;
+      saveState();
+      ocSessionId = null;
+      if (compactionResult) {
+        compactionRecap = compactionResult.summary;
+      }
+    }
+
+    // Build context. Standing context (SOUL/USER/MEMORY/etc.) injected on a
+    // fresh session only — opencode preserves history server-side once a
+    // session exists, just like Codex thread resume.
+    const ocContextParts = [];
+    if (!ocSessionId) {
+      const today = getCurrentSessionDay();
+      const sessionStartDone = state.sessionStartRanToday === today;
+      const standing = buildCodexContext({ sessionStartDone });
+      if (standing) {
+        ocContextParts.push(standing);
+        log(`Fresh ${backendLabel(backend)} session: injecting standing context (${standing.length} chars, sessionStartDone=${sessionStartDone})`);
+      }
+      if (!sessionStartDone) {
+        state.sessionStartRanToday = today;
+        saveState();
+      }
+    }
+    if (options.transferContext) ocContextParts.push(options.transferContext);
+    if (backend === 'kimi') {
+      ocContextParts.push('# KIMI BACKEND NOTE\nYou are running through OpenCode CLI with Kimi K2.6 via OpenRouter. Use the normal NativeClaw tools and rules; OpenCode auto-loads MCPs and skills from the workspace.');
+    } else {
+      ocContextParts.push('# GROK BACKEND NOTE\nYou are running through OpenCode CLI with Grok 4.3 via OpenRouter. Use the normal NativeClaw tools and rules; OpenCode auto-loads MCPs and skills from the workspace.');
+    }
+    // If compaction just ran, prepend the structured recap so the new session
+    // has continuity. Standing context (SOUL/USER/MEMORY/etc.) was already
+    // injected fresh by the !ocSessionId branch above.
+    if (compactionRecap) {
+      ocContextParts.push(`# CONVERSATION RECAP (from prior session, compacted)\n\n${compactionRecap}`);
+    }
+
+    const ocFinalPrompt = ocContextParts.length > 0
+      ? `${ocContextParts.join('\n\n')}\n\n# USER MESSAGE\n\n${prompt}`
+      : prompt;
+
+    // Per-backend OpenCode config: Grok hits xAI's 200-tool cap with the full
+    // 25-MCP set, so route Grok to a trimmed config. Kimi has no tool cap and
+    // uses the full set.
+    const ocConfigPath = backend === 'grok'
+      ? path.join(process.env.HOME, '.config/opencode/opencode.grok.json')
+      : path.join(process.env.HOME, '.config/opencode/opencode.json');
+
+    const ocOptions = {
+      model: ocModel,
+      effort: options.effort,
+      timeout: options.timeout || 7200,
+      idleTimeout: options.idleTimeout || 900,
+      workspace: WORKSPACE,
+      log,
+      configPath: ocConfigPath,
+      activeRefs: {
+        setSubprocess: (proc) => { activeSubprocess = proc; },
+        setKillFn: (fn) => { activeKillFn = fn; },
+      },
+      openRouterKey: readKeychainSecret('OPENROUTER_API_KEY'),
+    };
+
+    let ocResult = await runOpenCode(ocFinalPrompt, ocSessionId, ocOptions);
+    // Persist returned session id for resume on next turn
+    if (ocResult.sessionId && ocResult.sessionId !== ocSessionId) {
+      setStoredSessionId(backend, sessionKey, ocResult.sessionId);
+      saveState();
+    }
+    // === POST-TURN TOKEN TRACKING + THRESHOLD CHECK ===
+    // OpenCode reports per-turn tokens in usage. The .total field is the
+    // closest proxy for "how much context this session is now sitting at"
+    // (it includes input + output + reasoning + cache_read for the turn).
+    // We use the running max across the session as the trigger: once it
+    // breaches the threshold, the NEXT user message will run compaction.
+    if (ocResult.usage && typeof ocResult.usage === 'object') {
+      const turnTotal = (ocResult.usage.inputTokens || 0)
+                      + (ocResult.usage.outputTokens || 0)
+                      + (ocResult.usage.reasoningTokens || 0)
+                      + (ocResult.usage.cachedInputTokens || 0);
+      state.sessionTokenTotals[sessionKey] = Math.max(
+        state.sessionTokenTotals[sessionKey] || 0,
+        turnTotal
+      );
+      const ocModelForCheck = backend === 'kimi'
+        ? 'openrouter/moonshotai/kimi-k2.6'
+        : 'openrouter/x-ai/grok-4.3';
+      const threshold = MODEL_COMPACTION_THRESHOLDS[ocModelForCheck];
+      if (threshold && state.sessionTokenTotals[sessionKey] >= threshold) {
+        if (!state.compactionPending[sessionKey]) {
+          log(`compaction-threshold reached for ${backend} ${sessionKey}: ${state.sessionTokenTotals[sessionKey]} >= ${threshold}; flagging next turn for compaction`);
+        }
+        state.compactionPending[sessionKey] = true;
+      }
+      saveState();
+    }
+
+    // Empty-response retry: clear and try fresh once
+    if (!ocResult.text) {
+      const reason = ocSessionId
+        ? `same-day session ${ocSessionId} returned no agent response`
+        : `fresh ${backendLabel(backend)} turn returned no agent response`;
+      log(`${backendLabel(backend)} empty response for ${sessionKey}: ${reason}`);
+      clearStoredSession(backend, sessionKey, reason);
+      saveState();
+      ocResult = await runOpenCode(ocFinalPrompt, null, ocOptions);
+      if (ocResult.sessionId) {
+        setStoredSessionId(backend, sessionKey, ocResult.sessionId);
+        saveState();
+      }
+      if (!ocResult.text) {
+        throw new Error(`${backendLabel(backend)} returned no response after a fresh retry`);
+      }
+    }
+
+    return ocResult;
+  }
+
+  if (isCodexFamilyBackend(backend)) {
+    const sessionKind = backend;
+    const openRouterModel = backend === 'kimi' ? KIMI_MODEL : (backend === 'grok' ? GROK_MODEL : null);
+    const codexOptions = (backend === 'kimi' || backend === 'grok')
+      ? {
+          ...options,
+          codexModel: openRouterModel,
+          codexProvider: 'openrouter',
+          timeout: Math.min(options.timeout || 480, 480),
+          idleTimeout: Math.min(options.idleTimeout || 300, 300),
+          codexLockLabel: options.codexLockLabel || `${backend}:${sessionKey}`,
+        }
+      : options;
+    let threadId = getStoredSessionId(sessionKind, sessionKey);
     let rolloverNote = null;
 
     // Auto-rollover: rotate to fresh thread if existing rollout is bloated.
@@ -1432,15 +2005,15 @@ async function runBackend(backend, prompt, options, sessionKey) {
     if (threadId) {
       const check = shouldRolloverCodex(threadId);
       if (check.rollover) {
-        log(`Codex thread ${threadId} rollover triggered: ${check.reason}`);
-        clearStoredSession('codex', sessionKey, `rollover: ${check.reason}`);
+        log(`${backendLabel(backend)} thread ${threadId} rollover triggered: ${check.reason}`);
+        clearStoredSession(sessionKind, sessionKey, `rollover: ${check.reason}`);
         saveState();
         threadId = null;
-        rolloverNote = `[System note: Prior Codex thread was auto-rolled over to prevent stall (${check.reason}). If you need conversation history beyond this message, read today's daily log in memory/. If QMD/search_memory is configured, search it for deeper history.]`;
+        rolloverNote = `[System note: Prior ${backendLabel(backend)} thread was auto-rolled over to prevent stall (${check.reason}). If you need conversation history beyond this message, read today's daily log in memory/. If QMD/search_memory is configured, search it for deeper history.]`;
       } else if (check.missing) {
-        log(`Codex thread ${threadId} has no rollout file yet; keeping the same-day thread and skipping rollover`);
+        log(`${backendLabel(backend)} thread ${threadId} has no rollout file yet; keeping the same-day thread and skipping rollover`);
       } else {
-        log(`Codex thread ${threadId} ok: size=${check.size}B entries=${check.entries}`);
+        log(`${backendLabel(backend)} thread ${threadId} ok: size=${check.size}B entries=${check.entries}`);
       }
     }
 
@@ -1456,7 +2029,7 @@ async function runBackend(backend, prompt, options, sessionKey) {
         const standing = buildCodexContext({ sessionStartDone });
         if (standing) {
           contextParts.push(standing);
-          log(`Fresh Codex thread: injecting standing context (${standing.length} chars, sessionStartDone=${sessionStartDone})`);
+          log(`Fresh ${backendLabel(backend)} thread: injecting standing context (${standing.length} chars, sessionStartDone=${sessionStartDone})`);
         }
         if (!sessionStartDone) {
           state.sessionStartRanToday = today;
@@ -1465,7 +2038,13 @@ async function runBackend(backend, prompt, options, sessionKey) {
       }
 
       // Pending cross-backend transfer — one-shot on switch, goes in regardless of thread state
-      if (options.transferContext) contextParts.push(options.transferContext);
+      if (codexOptions.transferContext) contextParts.push(codexOptions.transferContext);
+      if (backend === 'kimi') {
+        contextParts.push('# KIMI BACKEND NOTE\nYou are running through Codex CLI with Kimi K2.6 via OpenRouter. Use the normal NativeClaw tools and rules, answer directly, and avoid long hidden reasoning.');
+      }
+      if (backend === 'grok') {
+        contextParts.push('# GROK BACKEND NOTE\nYou are running through Codex CLI with Grok 4.3 via OpenRouter. Use the normal NativeClaw tools and rules, answer directly, and avoid long hidden reasoning.');
+      }
 
       for (const note of extraNotes) {
         if (note) contextParts.push(note);
@@ -1475,8 +2054,8 @@ async function runBackend(backend, prompt, options, sessionKey) {
         ? `${contextParts.join('\n\n')}\n\n# USER MESSAGE\n\n${prompt}`
         : prompt;
 
-      return withCodexExecutionLock(options.codexLockPriority || 'user', options.codexLockLabel || `telegram:${sessionKey}`, () =>
-        runCodex(finalPrompt, activeThreadId, options)
+      return withCodexExecutionLock(codexOptions.codexLockPriority || 'user', codexOptions.codexLockLabel || `telegram:${sessionKey}`, () =>
+        runCodex(finalPrompt, activeThreadId, codexOptions)
       );
     };
 
@@ -1484,15 +2063,15 @@ async function runBackend(backend, prompt, options, sessionKey) {
     if (!result.text) {
       const retryReason = threadId
         ? `same-day thread ${threadId} returned no agent response`
-        : 'fresh Codex turn returned no agent response';
-      log(`Codex empty response for ${sessionKey}: ${retryReason}`);
-      clearStoredSession('codex', sessionKey, retryReason);
+        : `fresh ${backendLabel(backend)} turn returned no agent response`;
+      log(`${backendLabel(backend)} empty response for ${sessionKey}: ${retryReason}`);
+      clearStoredSession(sessionKind, sessionKey, retryReason);
       saveState();
       result = await executeCodexTurn(null, [
-        '[System note: The previous Codex attempt produced no agent response. Start clean, answer the user directly, and finish the turn normally.]',
+        `[System note: The previous ${backendLabel(backend)} attempt produced no agent response. Start clean, answer the user directly, and finish the turn normally.]`,
       ]);
       if (!result.text) {
-        throw new Error('Codex returned no response after a fresh retry');
+        throw new Error(`${backendLabel(backend)} returned no response after a fresh retry`);
       }
     }
 
@@ -1649,38 +2228,55 @@ function getSettings(chatId) {
 
 // ============================================================
 // USAGE QUERIES (plan / weekly / session limits)
-// Anthropic: api.anthropic.com/api/oauth/usage  (Bearer from OS keychain)
+// Anthropic: api.anthropic.com/api/oauth/usage  (Bearer from macOS Keychain)
 // OpenAI:    chatgpt.com/backend-api/wham/usage (Bearer from ~/.codex/auth.json)
 // ============================================================
 
-async function fetchClaudeUsage() {
-  try {
-    let raw;
-    if (process.platform === 'darwin') {
-      raw = execSync('security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null', { encoding: 'utf8' }).trim();
-    } else {
-      // Linux: Claude credentials path; fall back to ~/.claude/.credentials.json or env
-      const credPath = path.join(HOME_DIR, '.claude', '.credentials.json');
-      if (fs.existsSync(credPath)) {
-        raw = fs.readFileSync(credPath, 'utf8');
-      } else {
-        return { error: 'Claude credentials not found. Run `claude setup-token` to enable.' };
-      }
-    }
-    const creds = JSON.parse(raw)?.claudeAiOauth || {};
-    const token = creds.accessToken;
-    if (!token) return { error: 'Claude credentials missing. Run `claude setup-token` to enable.' };
+function readClaudeUsageCredentials() {
+  const raw = execSync(
+    'security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null',
+    { encoding: 'utf8' }
+  ).trim();
+  return JSON.parse(raw)?.claudeAiOauth || {};
+}
+
+function refreshClaudeUsageCredentials() {
+  execSync('claude -p "/usage" --output-format json', {
+    stdio: 'ignore',
+    timeout: 30000,
+    env: { ...process.env, ...nativeClawEnv() },
+  });
+}
+
+async function requestClaudeUsage(creds) {
+  const token = creds.accessToken;
+  if (!token) return { error: '⚠️ Claude credentials missing. Run `claude setup-token` in your terminal to authenticate.' };
     const res = await fetch('https://api.anthropic.com/api/oauth/usage', {
       headers: {
         'Authorization': `Bearer ${token}`,
         'anthropic-beta': 'oauth-2025-04-20',
-        'User-Agent': 'claude-cli',
+        'User-Agent': 'claude-cli/2.1.123',
       },
     });
-    if (!res.ok) return { error: `Anthropic HTTP ${res.status}` };
+  if (!res.ok) return { error: `Anthropic HTTP ${res.status}`, status: res.status };
     const body = await res.json();
     body._subscriptionType = creds.subscriptionType || 'unknown';
     return body;
+}
+
+async function fetchClaudeUsage() {
+  try {
+    let creds = readClaudeUsageCredentials();
+    let result = await requestClaudeUsage(creds);
+    if (result.status === 401) {
+      try { refreshClaudeUsageCredentials(); } catch (e) {}
+      creds = readClaudeUsageCredentials();
+      result = await requestClaudeUsage(creds);
+      if (result.status === 401) {
+        return { error: '⚠️ Anthropic token expired and auto-refresh failed. Run `claude setup-token` in your terminal to re-authenticate.' };
+      }
+    }
+    return result;
   } catch (e) {
     return { error: e.message || String(e) };
   }
@@ -1689,20 +2285,52 @@ async function fetchClaudeUsage() {
 async function fetchCodexUsage() {
   try {
     const authPath = path.join(HOME_DIR, '.codex', 'auth.json');
-    if (!fs.existsSync(authPath)) return { error: 'Codex not logged in. Run `codex login` to enable.' };
+    if (!fs.existsSync(authPath)) return { error: '⚠️ Codex not logged in. Run `codex login` in your terminal to authenticate.' };
     const auth = JSON.parse(fs.readFileSync(authPath, 'utf8'));
     const token = auth?.tokens?.access_token;
     const acct = auth?.tokens?.account_id;
-    if (!token) return { error: 'Codex token missing. Run `codex login` to refresh.' };
+    if (!token) return { error: '⚠️ Codex token missing. Run `codex login` in your terminal to authenticate.' };
     const res = await fetch('https://chatgpt.com/backend-api/wham/usage', {
       headers: {
         'Authorization': `Bearer ${token}`,
         'ChatGPT-Account-ID': acct || '',
-        'User-Agent': 'codex_cli_rs',
+        'User-Agent': 'codex_cli_rs/0.124.0',
       },
     });
+    if (res.status === 401) {
+      // ChatGPT OAuth token expired — Codex CLI has no programmatic refresh path
+      let detail = '';
+      try {
+        const body = await res.json();
+        if (body?.error?.code === 'token_expired') detail = ' (token_expired)';
+      } catch (e) {}
+      return { error: `⚠️ Codex token expired${detail}. Run \`codex login\` in your terminal to re-authenticate.` };
+    }
     if (!res.ok) return { error: `OpenAI HTTP ${res.status}` };
     return await res.json();
+  } catch (e) {
+    return { error: e.message || String(e) };
+  }
+}
+
+async function fetchOpenRouterUsage() {
+  try {
+    const key = readKeychainSecret('OPENROUTER_API_KEY');
+    if (!key) return { error: '⚠️ OpenRouter key missing in macOS Keychain (account=whet, service=OPENROUTER_API_KEY).' };
+    const res = await fetch('https://openrouter.ai/api/v1/credits', {
+      headers: { 'Authorization': `Bearer ${key}` },
+    });
+    if (!res.ok) return { error: `OpenRouter HTTP ${res.status}` };
+    const body = await res.json();
+    const data = body?.data || {};
+    const total = Number(data.total_credits || 0);
+    const used  = Number(data.total_usage || 0);
+    return {
+      total_credits: total,
+      total_usage:   used,
+      remaining:     Math.max(0, total - used),
+      used_percent:  total > 0 ? Math.min(100, (used / total) * 100) : 0,
+    };
   } catch (e) {
     return { error: e.message || String(e) };
   }
@@ -1719,21 +2347,86 @@ function usageResetLabel(input) {
   if (isNaN(d.getTime())) return 'unknown';
   const now = new Date();
   const tomorrow = new Date(now.getTime() + 86400000);
-  const tz = process.env.TZ || 'America/New_York';
+  const tz = 'America/New_York';
   const time = d.toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: tz });
   const sameDay = d.toLocaleDateString('en-US', { timeZone: tz }) === now.toLocaleDateString('en-US', { timeZone: tz });
   const isTomorrow = d.toLocaleDateString('en-US', { timeZone: tz }) === tomorrow.toLocaleDateString('en-US', { timeZone: tz });
-  if (sameDay) return time;
-  if (isTomorrow) return `tomorrow ${time}`;
+  if (sameDay) return `${time} ET`;
+  if (isTomorrow) return `tomorrow ${time} ET`;
   const day = d.toLocaleString('en-US', { weekday: 'short', timeZone: tz });
-  return `${day} ${time}`;
+  return `${day} ${time} ET`;
 }
 
-function formatUsageReply(claude, codex) {
-  const lines = ['⚡ Usage', ''];
+// ============================================================
+// TRELLO PLANS (personal task board — Today, Tomorrow, etc.)
+// Default routing for "remind me to / I need to" → confirm bucket → add card
+// ============================================================
 
-  // Bars show "% left" — fuel-gauge semantics: full bar = healthy, draining = burning quota.
-  // Both Anthropic (utilization) and OpenAI (used_percent) report % consumed; we invert for display.
+const TRELLO_PLANS_BOARD_ID = '64dc4c454541ef853eb63ae9';
+const TRELLO_PLANS_LIST_ORDER = ['Today', 'Tomorrow', 'In progress', 'This Week', 'Next week', 'This Month', 'Next Month', 'Pending/Misc', 'Done'];
+
+function getTrelloCreds() {
+  try {
+    const cfgPath = path.join(HOME_DIR, '.claude/workspace/.mcp.json');
+    const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+    const env = cfg?.mcpServers?.trello?.env || {};
+    return { key: env.TRELLO_API_KEY, token: env.TRELLO_TOKEN };
+  } catch (e) { return { error: e.message }; }
+}
+
+async function fetchTrelloPlans() {
+  const { key, token, error } = getTrelloCreds();
+  if (error) return { error };
+  if (!key || !token) return { error: 'no Trello creds in .mcp.json' };
+  const url = `https://api.trello.com/1/boards/${TRELLO_PLANS_BOARD_ID}/lists?cards=open&card_fields=name,due,labels,dateLastActivity&key=${key}&token=${token}`;
+  try {
+    const res = await fetch(url);
+    if (!res.ok) return { error: `Trello HTTP ${res.status}` };
+    return await res.json();
+  } catch (e) { return { error: e.message }; }
+}
+
+function formatCardDue(due) {
+  if (!due) return '';
+  const d = new Date(due);
+  if (isNaN(d.getTime())) return '';
+  const now = new Date();
+  const tomorrow = new Date(now.getTime() + 86400000);
+  const tz = 'America/New_York';
+  const sameDay = d.toLocaleDateString('en-US', { timeZone: tz }) === now.toLocaleDateString('en-US', { timeZone: tz });
+  const isTomorrow = d.toLocaleDateString('en-US', { timeZone: tz }) === tomorrow.toLocaleDateString('en-US', { timeZone: tz });
+  const time = d.toLocaleString('en-US', { hour: 'numeric', minute: '2-digit', timeZone: tz });
+  if (sameDay) return ` · due ${time}`;
+  if (isTomorrow) return ` · due tomorrow ${time}`;
+  return ` · due ${d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: tz })}`;
+}
+
+function formatTrelloTodos(lists) {
+  if (!Array.isArray(lists)) {
+    const err = lists?.error || 'unknown error';
+    return `📋 Trello: ⚠️ ${err}`;
+  }
+  const byName = {};
+  for (const l of lists) byName[l.name] = l;
+  const out = ['📋 Plans (Trello)', ''];
+  for (const name of TRELLO_PLANS_LIST_ORDER) {
+    const list = byName[name];
+    if (!list) continue;
+    const cards = list.cards || [];
+    if (name === 'Done' && cards.length === 0) continue;
+    out.push(`${name} (${cards.length})`);
+    const cap = name === 'Done' ? 5 : 20;
+    for (const c of cards.slice(0, cap)) {
+      out.push(`  • ${c.name}${formatCardDue(c.due)}`);
+    }
+    if (cards.length > cap) out.push(`  ... +${cards.length - cap} more`);
+    out.push('');
+  }
+  return out.join('\n').trim();
+}
+
+function formatUsageReply(claude, codex, openrouter) {
+  const lines = ['⚡ Usage', ''];
 
   const claudeLabel = claude.error
     ? 'Claude'
@@ -1767,6 +2460,21 @@ function formatUsageReply(claude, codex) {
     if (pw) { const left = 100 - pw.used_percent; lines.push(`  Session  ${usageBar(left)} ${left}% left   resets ${usageResetLabel(pw.reset_at)}`); }
     if (sw) { const left = 100 - sw.used_percent; lines.push(`  Weekly   ${usageBar(left)} ${left}% left   resets ${usageResetLabel(sw.reset_at)}`); }
     if (rl.limit_reached) lines.push(`  ⚠️ Rate limit reached`);
+  }
+
+  // OpenRouter section — covers Kimi + Grok backends (and any direct OpenRouter usage)
+  if (openrouter) {
+    lines.push('');
+    lines.push('OpenRouter (NJDev — Kimi/Grok/etc.)');
+    if (openrouter.error) {
+      lines.push(`  ⚠️ ${openrouter.error}`);
+    } else {
+      const total = openrouter.total_credits.toFixed(2);
+      const used  = openrouter.total_usage.toFixed(2);
+      const left  = openrouter.remaining.toFixed(2);
+      const pctLeft = Math.max(0, Math.min(100, Math.round(100 - openrouter.used_percent)));
+      lines.push(`  Credits  ${usageBar(pctLeft)} ${pctLeft}% left   $${left} of $${total}   ($${used} used)`);
+    }
   }
 
   return lines.join('\n');
@@ -1832,12 +2540,12 @@ async function handleSlashCommand(chatId, text) {
         const previousBackend = getBackend(chatId);
         const sessionKey = String(chatId);
         let transferContext = null;
-        if (previousBackend === 'claude') {
-          transferContext = buildGapTranscript('claude', sessionKey, null);
+        if (previousBackend !== 'codex') {
+          transferContext = buildGapTranscript(previousBackend, sessionKey, null, 'codex');
           if (transferContext) {
-            log(`Prebuilt claude→codex full gap for ${sessionKey}: ${transferContext.length} chars`);
+            log(`Prebuilt ${previousBackend}→codex full gap for ${sessionKey}: ${transferContext.length} chars`);
           } else {
-            log(`No claude→codex full gap to inject for ${sessionKey} (no Claude session or no extractable events)`);
+            log(`No ${previousBackend}→codex full gap to inject for ${sessionKey} (no source session or no extractable events)`);
           }
         }
         setBackend(chatId, 'codex', transferContext ? { context: transferContext, mode: 'full' } : undefined);
@@ -1855,19 +2563,19 @@ async function handleSlashCommand(chatId, text) {
         return `Unknown Codex model "${arg}". Try /codex help.`;
       }
 
-      // Bare `/codex` → switch to Codex with gap transcript from Claude since user last arrived there.
+      // Bare `/codex` → switch to Codex with gap transcript from the previous backend.
       const previousBackend = getBackend(chatId);
       const sessionKey = String(chatId);
       let transferContext = null;
       let transferMode = null;
-      if (previousBackend === 'claude') {
-        const since = getBackendArrival(sessionKey, 'claude');
-        transferContext = buildGapTranscript('claude', sessionKey, since);
+      if (previousBackend !== 'codex') {
+        const since = getBackendArrival(sessionKey, previousBackend);
+        transferContext = buildGapTranscript(previousBackend, sessionKey, since, 'codex');
         transferMode = 'gap';
         if (transferContext) {
-          log(`Prebuilt claude→codex gap for ${sessionKey}: ${transferContext.length} chars (since=${since || 'beginning-of-session'})`);
+          log(`Prebuilt ${previousBackend}→codex gap for ${sessionKey}: ${transferContext.length} chars (since=${since || 'beginning-of-session'})`);
         } else {
-          log(`No claude→codex gap to inject for ${sessionKey} (since=${since || 'beginning-of-session'}; no events in window or no Claude session)`);
+          log(`No ${previousBackend}→codex gap to inject for ${sessionKey} (since=${since || 'beginning-of-session'}; no events in window or no source session)`);
         }
       }
       setBackend(chatId, 'codex', transferContext ? { context: transferContext, mode: transferMode } : undefined);
@@ -1878,7 +2586,65 @@ async function handleSlashCommand(chatId, text) {
         : 'Next Codex message starts a fresh daily thread.';
       return transferContext
         ? `Backend switched to CODEX (${currentId}). Gap transcript is ready. ${resumeNote}`
-        : `Backend switched to CODEX (${currentId}). No Claude gap context to inject. ${resumeNote}`;
+        : `Backend switched to CODEX (${currentId}). No prior-backend gap context to inject. ${resumeNote}`;
+    }
+
+    case '/kimi': {
+      const sub = arg.toLowerCase();
+      if (sub && sub !== '--full') {
+        return `Unknown Kimi option "${arg}". Use /kimi or /kimi --full.`;
+      }
+      const previousBackend = getBackend(chatId);
+      const sessionKey = String(chatId);
+      let transferContext = null;
+      let transferMode = null;
+      if (previousBackend !== 'kimi') {
+        const since = sub === '--full' ? null : getBackendArrival(sessionKey, previousBackend);
+        transferContext = buildGapTranscript(previousBackend, sessionKey, since, 'kimi');
+        transferMode = sub === '--full' ? 'full' : 'gap';
+        if (transferContext) {
+          log(`Prebuilt ${previousBackend}→kimi ${transferMode} for ${sessionKey}: ${transferContext.length} chars`);
+        } else {
+          log(`No ${previousBackend}→kimi ${transferMode} to inject for ${sessionKey}`);
+        }
+      }
+      setBackend(chatId, 'kimi', transferContext ? { context: transferContext, mode: transferMode } : undefined);
+      markBackendArrival(sessionKey, 'kimi');
+      const resumeNote = getStoredSessionId('kimi', sessionKey)
+        ? "Today's Kimi thread will resume on your next message."
+        : 'Next Kimi message starts a fresh thread.';
+      return transferContext
+        ? `Backend switched to KIMI (${KIMI_MODEL} via OpenRouter). Gap transcript is ready. ${resumeNote}`
+        : `Backend switched to KIMI (${KIMI_MODEL} via OpenRouter). Experimental lane active. ${resumeNote}`;
+    }
+
+    case '/grok': {
+      const sub = arg.toLowerCase();
+      if (sub && sub !== '--full') {
+        return `Unknown Grok option "${arg}". Use /grok or /grok --full.`;
+      }
+      const previousBackend = getBackend(chatId);
+      const sessionKey = String(chatId);
+      let transferContext = null;
+      let transferMode = null;
+      if (previousBackend !== 'grok') {
+        const since = sub === '--full' ? null : getBackendArrival(sessionKey, previousBackend);
+        transferContext = buildGapTranscript(previousBackend, sessionKey, since, 'grok');
+        transferMode = sub === '--full' ? 'full' : 'gap';
+        if (transferContext) {
+          log(`Prebuilt ${previousBackend}→grok ${transferMode} for ${sessionKey}: ${transferContext.length} chars`);
+        } else {
+          log(`No ${previousBackend}→grok ${transferMode} to inject for ${sessionKey}`);
+        }
+      }
+      setBackend(chatId, 'grok', transferContext ? { context: transferContext, mode: transferMode } : undefined);
+      markBackendArrival(sessionKey, 'grok');
+      const resumeNote = getStoredSessionId('grok', sessionKey)
+        ? "Today's Grok thread will resume on your next message."
+        : 'Next Grok message starts a fresh thread.';
+      return transferContext
+        ? `Backend switched to GROK (${GROK_MODEL} via OpenRouter). Gap transcript is ready. ${resumeNote}`
+        : `Backend switched to GROK (${GROK_MODEL} via OpenRouter). ${resumeNote}`;
     }
 
     case '/claude': {
@@ -1892,23 +2658,23 @@ async function handleSlashCommand(chatId, text) {
         return `Unknown Claude option "${arg}". Use /claude or /claude --full.`;
       }
 
-      if (previousBackend === 'codex') {
+      if (isCodexFamilyBackend(previousBackend)) {
         if (sub === '--full') {
-          transferContext = buildGapTranscript('codex', sessionKey, null);
+          transferContext = buildGapTranscript(previousBackend, sessionKey, null, 'claude');
           transferMode = 'full';
           if (transferContext) {
-            log(`Prebuilt codex→claude full gap for ${sessionKey}: ${transferContext.length} chars`);
+            log(`Prebuilt ${previousBackend}→claude full gap for ${sessionKey}: ${transferContext.length} chars`);
           } else {
-            log(`No codex→claude full gap to inject for ${sessionKey} (no Codex thread or no extractable events)`);
+            log(`No ${previousBackend}→claude full gap to inject for ${sessionKey} (no thread or no extractable events)`);
           }
         } else {
-          const since = getBackendArrival(sessionKey, 'codex');
-          transferContext = buildGapTranscript('codex', sessionKey, since);
+          const since = getBackendArrival(sessionKey, previousBackend);
+          transferContext = buildGapTranscript(previousBackend, sessionKey, since, 'claude');
           transferMode = 'gap';
           if (transferContext) {
-            log(`Prebuilt codex→claude gap for ${sessionKey}: ${transferContext.length} chars (since=${since || 'beginning-of-thread'})`);
+            log(`Prebuilt ${previousBackend}→claude gap for ${sessionKey}: ${transferContext.length} chars (since=${since || 'beginning-of-thread'})`);
           } else {
-            log(`No codex→claude gap to inject for ${sessionKey} (since=${since || 'beginning-of-thread'}; no events in window or no Codex thread)`);
+            log(`No ${previousBackend}→claude gap to inject for ${sessionKey} (since=${since || 'beginning-of-thread'}; no events in window or no thread)`);
           }
         }
       }
@@ -2017,19 +2783,28 @@ async function handleSlashCommand(chatId, text) {
     case '/new':
     case '/fresh': {
       const backend = getBackend(chatId);
-      if (backend === 'codex') {
-        clearStoredSession('codex', sessionKey, 'manual reset');
-      } else {
-        clearStoredSession('claude', sessionKey, 'manual reset');
-      }
+      const clearKind = isCodexFamilyBackend(backend) ? backend : 'claude';
+      clearStoredSession(clearKind, sessionKey, 'manual reset');
+      // Cold start: also clear arrival so next switch's gap window starts from now.
+      clearBackendArrival(sessionKey, clearKind);
       delete state.exchangeCount[sessionKey];
       saveState();
       return `${backend.toUpperCase()} session cleared. Next message starts fresh.`;
     }
 
     case '/usage': {
-      const [claude, codex] = await Promise.all([fetchClaudeUsage(), fetchCodexUsage()]);
-      return formatUsageReply(claude, codex);
+      const [claude, codex, openrouter] = await Promise.all([
+        fetchClaudeUsage(),
+        fetchCodexUsage(),
+        fetchOpenRouterUsage(),
+      ]);
+      return formatUsageReply(claude, codex, openrouter);
+    }
+
+    case '/todos':
+    case '/plans': {
+      const lists = await fetchTrelloPlans();
+      return formatTrelloTodos(lists);
     }
 
     case '/stats': {
@@ -2038,11 +2813,11 @@ async function handleSlashCommand(chatId, text) {
       const lines = [
         `Last response stats:`,
         `  Backend: ${(last.backend || 'claude').toUpperCase()}`,
-        `  Model: ${MODEL_DISPLAY[last.model] || last.model}`,
+        `  Model: ${last.model === KIMI_MODEL ? KIMI_DISPLAY : (last.model === GROK_MODEL ? GROK_DISPLAY : (MODEL_DISPLAY[last.model] || last.model))}`,
         `  Duration: ${(last.duration / 1000).toFixed(1)}s`,
         `  Turns: ${last.turns}`,
       ];
-      if (last.backend === 'codex' && last.usage) {
+      if (isCodexFamilyBackend(last.backend) && last.usage) {
         const inTok = last.usage.inputTokens || 0;
         const cached = last.usage.cachedInputTokens || 0;
         const outTok = last.usage.outputTokens || 0;
@@ -2062,7 +2837,7 @@ async function handleSlashCommand(chatId, text) {
 
     case '/session': {
       const backend = getBackend(chatId);
-      const sid = backend === 'codex' ? getStoredSessionId('codex', sessionKey) : getStoredSessionId('claude', sessionKey);
+      const sid = isCodexFamilyBackend(backend) ? getStoredSessionId(backend, sessionKey) : getStoredSessionId('claude', sessionKey);
       return sid
         ? `${backend.toUpperCase()} session: ${sid}\nUse /reset to start fresh.`
         : `No active ${backend.toUpperCase()} session. Next message will start one.`;
@@ -2072,16 +2847,24 @@ async function handleSlashCommand(chatId, text) {
       const bridgePid = fs.existsSync(PID_PATH) ? fs.readFileSync(PID_PATH, 'utf8').trim() : '?';
       const cronCount = cronJobs.length;
       const backend = getBackend(chatId);
-      const currentModel = backend === 'codex'
+      const currentModel = backend === 'kimi'
+        ? KIMI_MODEL
+        : backend === 'grok'
+        ? GROK_MODEL
+        : backend === 'codex'
         ? (settings.codexModel || CODEX_DEFAULT_MODEL)
         : (settings.model || DEFAULT_MODEL);
-      const modelDisplay = backend === 'codex'
+      const modelDisplay = backend === 'kimi'
+        ? KIMI_DISPLAY
+        : backend === 'grok'
+        ? GROK_DISPLAY
+        : backend === 'codex'
         ? currentModel
         : (MODEL_DISPLAY[currentModel] || currentModel);
       const thinking = settings.effort === 'max' ? 'ON' : 'OFF';
       const verbosity = settings.codexVerbosity || 'default';
-      const sid = backend === 'codex'
-        ? (getStoredSessionId('codex', sessionKey) ? 'Active' : 'None')
+      const sid = isCodexFamilyBackend(backend)
+        ? (getStoredSessionId(backend, sessionKey) ? 'Active' : 'None')
         : (getStoredSessionId('claude', sessionKey) ? 'Active' : 'None');
       return [
         'NativeClaw Status:',
@@ -2114,6 +2897,10 @@ async function handleSlashCommand(chatId, text) {
         '/codex — Use Codex (GPT) backend, resuming today\'s Codex thread if it exists',
         '/codex --full — Use Codex with raw Claude replay',
         '/codex help — List GPT models',
+        '/kimi — Experimental Kimi K2.6 backend via OpenRouter',
+        '/kimi --full — Use Kimi with raw previous-backend replay',
+        '/grok — Grok 4.3 backend via OpenRouter',
+        '/grok --full — Use Grok with raw previous-backend replay',
         '',
         '— Claude models —',
         '/opus — Opus 4.7',
@@ -2134,7 +2921,8 @@ async function handleSlashCommand(chatId, text) {
         '/session — Show session info',
         '/catchup — Pull context from the OTHER backend into this one (use if a handoff was lost to rate-limit or crash)',
         '/stats — Last response stats (cached %, cumulative warning)',
-        '/usage — Plan usage: 5-hour + 7-day windows for Claude and Codex',
+        '/usage — Plan usage (5h + 7d) for Claude and Codex',
+        '/todos — Plans Trello (Today, Tomorrow, This Week, etc.) — alias /plans',
         '/effort <low|medium|high|xhigh|max> — Set Claude/Codex thinking effort',
         '/think — Alias/toggle for /effort max',
         '/verbosity <default|low|medium|high> — Set Codex answer verbosity',
@@ -2174,15 +2962,6 @@ async function handleTelegramMessage(item) {
     // null = unknown command or /search, pass through to Claude
   }
 
-  let firstRunPromptContext = '';
-  if (config.firstRunOnboarding !== false && !text.startsWith('/') && !state.firstRun[sessionKey]) {
-    state.firstRun[sessionKey] = { greetedAt: new Date().toISOString() };
-    saveState();
-    await sendMessage(chatId, buildFirstRunWelcome());
-    firstRunPromptContext = buildFirstRunPromptContext();
-    log(`First-run onboarding shown for ${sessionKey}`);
-  }
-
   // Typing indicator — repeat every 4s since Telegram's indicator expires after 5s
   tg('sendChatAction', { chat_id: chatId, action: 'typing' }).catch(() => {});
   const typingInterval = setInterval(() => {
@@ -2197,9 +2976,6 @@ async function handleTelegramMessage(item) {
 
   // Build prompt — for /search, wrap with QMD instruction
   let prompt = text;
-  if (firstRunPromptContext) {
-    prompt = `${firstRunPromptContext}\n\n# USER MESSAGE\n\n${prompt}`;
-  }
   if (text.startsWith('/search ')) {
     prompt = `Search memory using the QMD search_memory tool for: ${text.slice(8)}. Return the results.`;
   }
@@ -2232,23 +3008,23 @@ async function handleTelegramMessage(item) {
     if (pending.context) {
       transferContext = pending.context;
       log(`Transfer ${pending.from}→${pending.to} (${pending.mode || 'prebuilt'}) for ${sessionKey}: ${transferContext.length} chars`);
-    } else if (pending.from === 'claude' && backend === 'codex') {
+    } else if (pending.from === 'claude' && isCodexFamilyBackend(backend)) {
       const sinceClaude = getBackendArrival(sessionKey, 'claude');
       const useFullSession = settings.transferMode === 'full';
-      transferContext = buildGapTranscript('claude', sessionKey, useFullSession ? null : sinceClaude);
+      transferContext = buildGapTranscript('claude', sessionKey, useFullSession ? null : sinceClaude, backend);
       if (useFullSession) delete settings.transferMode;
       if (transferContext) {
-        log(`Transfer claude→codex gap for ${sessionKey}: ${transferContext.length} chars (mode=${useFullSession ? 'full' : 'gap'})`);
+        log(`Transfer claude→${backend} gap for ${sessionKey}: ${transferContext.length} chars (mode=${useFullSession ? 'full' : 'gap'})`);
       } else {
-        log(`Transfer claude→codex gap empty for ${sessionKey} (no Claude session or no events in window)`);
+        log(`Transfer claude→${backend} gap empty for ${sessionKey} (no Claude session or no events in window)`);
       }
-    } else if (pending.from === 'codex' && backend === 'claude') {
-      const sinceCodex = getBackendArrival(sessionKey, 'codex');
-      transferContext = buildGapTranscript('codex', sessionKey, sinceCodex);
+    } else if (isCodexFamilyBackend(pending.from) && backend === 'claude') {
+      const sinceCodex = getBackendArrival(sessionKey, pending.from);
+      transferContext = buildGapTranscript(pending.from, sessionKey, sinceCodex, 'claude');
       if (transferContext) {
-        log(`Transfer codex→claude gap for ${sessionKey}: ${transferContext.length} chars`);
+        log(`Transfer ${pending.from}→claude gap for ${sessionKey}: ${transferContext.length} chars`);
       } else {
-        log(`Transfer codex→claude gap empty for ${sessionKey} (no Codex thread or no events in window)`);
+        log(`Transfer ${pending.from}→claude gap empty for ${sessionKey} (no thread or no events in window)`);
       }
     }
     delete state.pendingTransfer[sessionKey];
@@ -2257,7 +3033,8 @@ async function handleTelegramMessage(item) {
 
   // Backend-specific options
   const claudeModel = settings.model || DEFAULT_MODEL;
-  const codexModel = settings.codexModel || CODEX_DEFAULT_MODEL;
+  const codexModel = backend === 'kimi' ? KIMI_MODEL : (backend === 'grok' ? GROK_MODEL : (settings.codexModel || CODEX_DEFAULT_MODEL));
+  const codexProvider = (backend === 'kimi' || backend === 'grok') ? 'openrouter' : null;
   const effort = settings.effort || 'xhigh';
   const codexVerbosity = settings.codexVerbosity || null;
 
@@ -2288,8 +3065,10 @@ async function handleTelegramMessage(item) {
   try {
     const result = await runBackend(backend, prompt, {
       timeout: 7200,
+      idleTimeout: (backend === 'kimi' || backend === 'grok') ? 900 : undefined,
       model: claudeModel,
       codexModel: codexModel,
+      codexProvider: codexProvider,
       effort: effort,
       codexVerbosity: codexVerbosity,
       appendSystemPrompt: appendSystemPrompt,
@@ -2301,7 +3080,7 @@ async function handleTelegramMessage(item) {
     // Save stats for /stats command
     settings.lastResult = {
       backend: backend,
-      model: backend === 'codex' ? codexModel : claudeModel,
+      model: isCodexFamilyBackend(backend) ? codexModel : claudeModel,
       duration: result.duration || 0,
       turns: result.turns,
       cost: result.cost,
@@ -2313,15 +3092,15 @@ async function handleTelegramMessage(item) {
       // Persist session ID on the correct backend's slot only after we have
       // a real assistant message for the user.
       if (result.sessionId) {
-        if (backend === 'codex') {
-          setStoredSessionId('codex', sessionKey, result.sessionId);
+        if (isCodexFamilyBackend(backend)) {
+          setStoredSessionId(backend, sessionKey, result.sessionId);
         } else {
           setStoredSessionId('claude', sessionKey, result.sessionId);
         }
         saveState();
       }
       const sendResult = await sendMessage(chatId, result.text);
-      const costStr = backend === 'codex'
+      const costStr = isCodexFamilyBackend(backend)
         ? `tokens in=${result.usage?.inputTokens || 0}/out=${result.usage?.outputTokens || 0}`
         : `$${result.cost}`;
       if (sendResult.failed > 0) {
@@ -2340,16 +3119,18 @@ async function handleTelegramMessage(item) {
     clearInterval(typingInterval);
     log(`ERROR responding to ${name} [${backend}]: ${err.message}`);
     const errMsg = err.message.toLowerCase();
-    const isRateLimit = errMsg.includes('rate limit') || errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('overloaded');
+    const isRateLimit = errMsg.includes('rate limit') || errMsg.includes('429') || errMsg.includes('quota') || errMsg.includes('overloaded') || errMsg.includes('high demand');
     const rateLimitHint = (isRateLimit && backend === 'claude')
       ? '\n\nClaude is rate-limited. Run /codex to switch to the Codex backend.'
+      : (backend === 'kimi')
+        ? '\n\nKimi via OpenRouter occasionally hangs on long reasoning turns. Run /claude or /codex if this keeps happening.'
       : '';
     await sendMessage(chatId, `Something went wrong: ${err.message.slice(0, 200)}${rateLimitHint}`);
 
     // If session/thread is broken, clear the active backend's session so next message starts fresh
     if (err.message.includes('session') || err.message.includes('resume') || err.message.includes('thread') || err.message.includes('no response')) {
-      if (backend === 'codex') {
-        clearStoredSession('codex', sessionKey, err.message);
+      if (isCodexFamilyBackend(backend)) {
+        clearStoredSession(backend, sessionKey, err.message);
       } else {
         clearStoredSession('claude', sessionKey, err.message);
       }
@@ -2487,6 +3268,7 @@ async function handleCronJob(item) {
         if (state.sessions[key]) {
           log(`Session-audit: clearing Claude session ${state.sessions[key]} for chat ${key}`);
           clearStoredSession('claude', key);
+          clearBackendArrival(key, 'claude');
           state.exchangeCount[key] = 0;
         }
       }
@@ -2494,6 +3276,21 @@ async function handleCronJob(item) {
         if (state.codexSessions[key]) {
           log(`Session-audit: clearing Codex thread ${state.codexSessions[key]} for chat ${key}`);
           clearStoredSession('codex', key);
+          clearBackendArrival(key, 'codex');
+        }
+      }
+      for (const key of Object.keys(state.grokSessions || {})) {
+        if (state.grokSessions[key]) {
+          log(`Session-audit: clearing Grok thread ${state.grokSessions[key]} for chat ${key}`);
+          clearStoredSession('grok', key);
+          clearBackendArrival(key, 'grok');
+        }
+      }
+      for (const key of Object.keys(state.kimiSessions || {})) {
+        if (state.kimiSessions[key]) {
+          log(`Session-audit: clearing Kimi thread ${state.kimiSessions[key]} for chat ${key}`);
+          clearStoredSession('kimi', key);
+          clearBackendArrival(key, 'kimi');
         }
       }
       saveState();

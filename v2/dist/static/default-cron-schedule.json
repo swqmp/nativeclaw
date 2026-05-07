@@ -1,0 +1,49 @@
+{
+    "description": "NativeClaw v2.0 Cron Schedule — Default jobs after install.",
+    "timezone": "America/New_York",
+    "crons": [
+        {
+            "name": "session-audit",
+            "schedule": "10 5 * * *",
+            "timeout": 480,
+            "prompt": "Daily session audit. Read state.json. Check sessions. Write checkpoint."
+        },
+        {
+            "name": "morning-brief",
+            "schedule": "30 5 * * *",
+            "timeout": 300,
+            "prompt": "Morning brief: calendar, reminders, homework, daily log carryover."
+        },
+        {
+            "name": "heartbeat",
+            "schedule": "*/30 * * * *",
+            "timeout": 120,
+            "prompt": "Heartbeat check. Read HEARTBEAT.md. Alert only if needed. Quiet hours 9:15 PM - 5:15 AM."
+        },
+        {
+            "name": "task-queue-recovery",
+            "schedule": "20 * * * *",
+            "timeout": 120,
+            "prompt": "Retry any pending/rate-limited tasks in queue.json."
+        },
+        {
+            "name": "qmd-reindex",
+            "schedule": "0 * * * *",
+            "timeout": 300,
+            "prompt": "Reindex QMD memory files. Pull shared-memory updates."
+        },
+        {
+            "name": "daily-newsletter",
+            "schedule": "0 6 * * *",
+            "timeout": 1500,
+            "prompt": "Generate and send Whet's Daily newsletter."
+        },
+        {
+            "name": "mcp-probe",
+            "schedule": "*/30 * * * *",
+            "timeout": 60,
+            "command": "node ./system/mcp-health/probe.js"
+        }
+    ],
+    "jobs": []
+}

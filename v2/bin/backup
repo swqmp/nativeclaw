@@ -1,0 +1,91 @@
+#!/usr/bin/env node
+
+/**
+ * NativeClaw Backup / Restore
+ * Creates or restores a zip archive of the workspace.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+
+const HOME = process.env.HOME || process.env.USERPROFILE;
+const WORKSPACE = path.join(HOME, '.claude', 'workspace');
+const STATE_DIR = path.join(HOME, '.claude', 'telegram-bridge');
+const BACKUP_DIR = path.join(HOME, '.claude', 'backups');
+
+const EXCLUDE_ALWAYS = [
+  '.mcp.json',
+  'telegram-bridge/config.json',
+  'telegram-bridge/state.json',
+  'telegram-bridge/bridge.pid',
+];
+
+function ensureDir(dir) {
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+}
+
+function getTimestamp() {
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+}
+
+async function runZip(args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn('zip', args, { stdio: 'pipe' });
+    let out = '';
+    child.stdout.on('data', (d) => { out += d.toString(); });
+    child.stderr.on('data', (d) => { out += d.toString(); });
+    child.on('close', (code) => {
+      if (code !== 0) reject(new Error(`zip exited ${code}: ${out}`));
+      else resolve(out);
+    });
+  });
+}
+
+async function createBackup(excludeSecrets = true) {
+  ensureDir(BACKUP_DIR);
+  const name = `nativeclaw-backup-${getTimestamp()}.zip`;
+  const outPath = path.join(BACKUP_DIR, name);
+
+  const excludes = excludeSecrets ? EXCLUDE_ALWAYS : [];
+  const excludeArgs = excludes.flatMap(e => ['-x', e]);
+  const args = ['-r', outPath, WORKSPACE, ...excludeArgs];
+
+  console.log(`Creating backup: ${outPath}…`);
+  await runZip(args);
+  console.log(`✅ Backup created: ${outPath}`);
+}
+
+async function restoreBackup(zipPath) {
+  if (!fs.existsSync(zipPath)) {
+    console.error(`Archive not found: ${zipPath}`);
+    process.exit(1);
+  }
+  console.log(`Restoring from: ${zipPath}…`);
+  const child = spawn('unzip', ['-o', zipPath, '-d', path.dirname(WORKSPACE)], { stdio: 'inherit' });
+  child.on('close', (code) => {
+    if (code !== 0) {
+      console.error('Restore failed.');
+      process.exit(1);
+    }
+    console.log('✅ Restore complete.');
+  });
+}
+
+async function main() {
+  const [, , cmd, arg] = process.argv;
+  if (cmd === 'create' || cmd === 'backup') {
+    await createBackup(arg !== '--include-secrets');
+  } else if (cmd === 'restore') {
+    if (!arg) { console.error('Usage: nativeclaw restore <path-to-zip>'); process.exit(1); }
+    await restoreBackup(arg);
+  } else {
+    console.log(`Usage: nativeclaw backup <create [--include-secrets] | restore <zip>>`);
+  }
+}
+
+main().catch((err) => {
+  console.error('Error:', err.message);
+  process.exit(1);
+});

@@ -1,0 +1,111 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>NativeClaw Settings</title>
+  <style>
+    * { margin:0;padding:0;box-sizing:border-box;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif }
+    body { background:#0f1117;color:#e6e6e6;line-height:1.5 }
+    .container { max-width:900px;margin:0 auto;padding:24px }
+    h1 { color:#00d4ff;margin-bottom:8px;font-size:24px }
+    .subtitle { color:#8b949e;font-size:13px;margin-bottom:24px }
+    .tabs { display:flex;gap:4px;border-bottom:1px solid #30363d;margin-bottom:24px;overflow-x:auto }
+    .tab { background:transparent;border:none;color:#8b949e;padding:10px 16px;cursor:pointer;font-size:14px;white-space:nowrap }
+    .tab.active { color:#00d4ff;border-bottom:2px solid #00d4ff }
+    .panel { display:none }
+    .panel.active { display:block }
+    .card { background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px;margin-bottom:18px }
+    .card h2 { font-size:16px;color:#c9d1d9;margin-bottom:12px }
+    .field { margin-bottom:14px }
+    .field label { display:block;font-size:13px;color:#8b949e;margin-bottom:6px }
+    .field input, .field select, .field textarea { width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 10px;color:#e6e6e6;font-size:14px }
+    .field input:focus, .field select:focus, .field textarea:focus { outline:none;border-color:#00d4ff }
+    .field .help { font-size:12px;color:#6e7681;margin-top:4px }
+    .btn { background:#00d4ff;color:#0f1117;border:none;border-radius:6px;padding:8px 14px;font-weight:600;cursor:pointer;font-size:14px }
+    .btn:hover { opacity:.9 }
+    .btn.secondary { background:#21262d;color:#c9d1d9 }
+    .status-badge { display:inline-block;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:600 }
+    .status-ok { background:#238636;color:#fff }
+    .status-warn { background:#9e6a03;color:#fff }
+    .status-err { background:#da3633;color:#fff }
+    table { width:100%;border-collapse:collapse;font-size:13px }
+    th, td { text-align:left;padding:8px;border-bottom:1px solid #30363d }
+    th { color:#8b949e;font-weight:500 }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>⚙ NativeClaw Settings</h1>
+    <div class="subtitle">v2.0 — Edit config, manage MCPs, view logs, and more.</div>
+    <div class="tabs">
+      <button class="tab active" data-tab="status">Status</button>
+      <button class="tab" data-tab="config">Config</button>
+      <button class="tab" data-tab="mcps">MCP Servers</button>
+      <button class="tab" data-tab="cron">Cron Schedule</button>
+      <button class="tab" data-tab="connections">Connections</button>
+      <button class="tab" data-tab="logs">Logs</button>
+      <button class="tab" data-tab="backup">Backup / Restore</button>
+    </div>
+
+    <div id="status" class="panel active">
+      <div class="card"><h2>Bridge Health</h2><div id="bridge-status">Loading…</div></div>
+      <div class="card"><h2>MCP Servers</h2><div id="mcp-status">Loading…</div></div>
+      <div class="card"><h2>Last Cron Runs</h2><div id="cron-status">Loading…</div></div>
+    </div>
+
+    <div id="config" class="panel">
+      <div class="card">
+        <h2>General Config</h2>
+        <div class="field"><label>Agent name</label><input id="agentName" /></div>
+        <div class="field"><label>User name</label><input id="userName" /></div>
+        <div class="field"><label>Default model</label><select id="defaultModel"><option value="sonnet">Claude Sonnet 4.6</option><option value="opus">Claude Opus 4.6</option><option value="haiku">Claude Haiku 4.5</option></select></div>
+        <div class="field"><label>Default backend</label><select id="defaultBackend"><option value="claude">Claude</option><option value="codex">Codex (OpenAI)</option><option value="kimi">Kimi (OpenRouter)</option><option value="grok">Grok (OpenRouter)</option></select></div>
+        <button class="btn" id="save-config">Save Config</button>
+      </div>
+    </div>
+
+    <div id="mcps" class="panel"><div class="card"><h2>MCP Server Toggles</h2><div id="mcp-list">Loading…</div></div></div>
+
+    <div id="cron" class="panel"><div class="card"><h2>Cron Jobs</h2><div id="cron-list">Loading…</div></div></div>
+
+    <div id="connections" class="panel">
+      <div class="card">
+        <h2>Telegram</h2>
+        <div class="field"><label>Bot token</label><input id="botToken" type="password" /><div class="help">Stored in config.json; never logged.</div></div>
+        <h2>Voice Transcription</h2>
+        <div class="field"><label>Provider</label><select id="voiceProvider"><option value="groq">Groq Whisper (default)</option><option value="openai">OpenAI Whisper</option><option value="local">Local whisper.cpp</option></select></div>
+      </div>
+    </div>
+
+    <div id="logs" class="panel">
+      <div class="card"><h2>Bridge Log (last 200 lines)</h2><pre id="log-tail" style="background:#0d1117;padding:12px;border-radius:6px;max-height:400px;overflow:auto;font-size:12px">Loading…</pre><button class="btn" id="export-diag" style="margin-top:12px">Export Diagnostic Bundle</button></div>
+    </div>
+
+    <div id="backup" class="panel">
+      <div class="card">
+        <h2>Backup</h2>
+        <button class="btn" id="create-backup">Create Backup Archive</button>
+        <div class="field" style="margin-top:12px"><label>Restore from archive</label><input type="file" id="restore-file" accept=".zip" /></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const token = '{{TOKEN}}';
+    async function api(path, opts={}) {
+      const r = await fetch(path, {...opts, headers: {...(opts.headers||{}), 'x-nativeclaw-token': token}});
+      if (!r.ok) throw new Error(await r.text());
+      return r.json();
+    }
+    document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
+      document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active', x===t));
+      document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active', p.id===t.dataset.tab));
+    }));
+    (async()=>{
+      try { const s = await api('/api/status'); document.getElementById('bridge-status').innerHTML = '<span class="status-badge '+(s.bridgeAlive?'status-ok':'status-err')+'">'+(s.bridgeAlive?'Alive':'Dead')+'</span> last msg '+s.lastMsgTime; } catch(e){ document.getElementById('bridge-status').textContent='Error: '+e.message; }
+      try { const c = await api('/api/config'); document.getElementById('agentName').value=c.agentName||''; document.getElementById('userName').value=c.userName||''; document.getElementById('defaultModel').value=c.model||'sonnet'; document.getElementById('defaultBackend').value=c.defaultBackend||'claude'; } catch{}
+    })();
+  </script>
+</body>
+</html>

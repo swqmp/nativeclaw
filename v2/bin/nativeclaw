@@ -1,0 +1,85 @@
+#!/usr/bin/env node
+
+/**
+ * NativeClaw v2.0 CLI Entry Point
+ * Dispatches: setup, settings, backup, doctor, status, logs
+ */
+
+const path = require('path');
+const { spawn } = require('child_process');
+const fs = require('fs');
+
+const HOME = process.env.HOME || process.env.USERPROFILE;
+// Use the directory containing this script to find sibling commands.
+// Works both when symlinked and when run directly from the repo.
+const THIS_DIR = __dirname;
+const BIN_ROOT = THIS_DIR;
+const NATIVECLAW_ROOT = path.dirname(BIN_ROOT);
+
+const COMMANDS = {
+  setup: path.join(BIN_ROOT, 'setup'),
+  settings: path.join(BIN_ROOT, 'settings'),
+  backup: path.join(BIN_ROOT, 'backup'),
+  doctor: path.join(BIN_ROOT, 'doctor'),
+  status: path.join(BIN_ROOT, 'status'),
+  logs: path.join(BIN_ROOT, 'logs'),
+};
+
+function printUsage() {
+  console.log(`
+NativeClaw v2.0
+Usage: nativeclaw <command> [options]
+
+Commands:
+  setup      Run the setup wizard (web or terminal)
+  settings   Open the settings UI control panel
+  backup     Create a backup archive of this install
+  doctor     Run diagnostic dump for support
+  status     Show bridge/cron/MCP health snapshot
+  logs       Tail the bridge log (default 50 lines)
+  help       Show this help message
+
+Environment:
+  NATIVECLAW_WORKSPACE   Path to workspace (default: ~/.claude)
+  NATIVECLAW_BACKEND   Default backend (claude|codex|kimi|grok)
+  NODE_ENV             development | production
+`);
+}
+
+async function main() {
+  const [, , rawCommand] = process.argv;
+  const command = (rawCommand || 'help').toLowerCase();
+
+  if (command === 'help' || command === '--help' || command === '-h') {
+    printUsage();
+    process.exit(0);
+  }
+
+  const script = COMMANDS[command];
+  if (!script) {
+    console.error(`Unknown command: ${rawCommand}`);
+    printUsage();
+    process.exit(1);
+  }
+
+  if (!fs.existsSync(script)) {
+    console.error(`Command script not found: ${script}`);
+    console.error('NativeClaw v2 may not be fully installed. Run: nativeclaw setup');
+    process.exit(1);
+  }
+
+  const proc = spawn('node', [script, ...process.argv.slice(3)], {
+    stdio: 'inherit',
+    cwd: HOME,
+    env: { ...process.env, NATIVECLAW_ROOT },
+  });
+
+  proc.on('close', (code) => {
+    process.exit(code ?? 0);
+  });
+}
+
+main().catch((err) => {
+  console.error('Fatal error:', err.message);
+  process.exit(1);
+});

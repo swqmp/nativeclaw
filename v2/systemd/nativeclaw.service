@@ -1,0 +1,17 @@
+[Unit]
+Description=NativeClaw AI Agent Bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=30
+WorkingDirectory=%h/.claude/workspace
+ExecStart=/usr/bin/node %h/.claude/telegram-bridge/bridge.js
+StandardOutput=append:%h/.claude/logs/nativeclaw.log
+StandardError=append:%h/.claude/logs/nativeclaw-error.log
+Environment="MCP_CLAUDE=1"
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,92 @@
+#!/usr/bin/env node
+
+/**
+ * NativeClaw Doctor — Diagnostic Dump
+ * Bundles logs, state (sanitized), health probes, and system info into a zip.
+ */
+
+const fs = require('fs');
+const path = require('path');
+const { spawn, execSync } = require('child_process');
+
+const HOME = process.env.HOME || process.env.USERPROFILE;
+const LOG_DIR = path.join(HOME, '.claude', 'logs');
+const STATE_PATH = path.join(HOME, '.claude', 'telegram-bridge', 'state.json');
+const HEALTH_DIR = path.join(HOME, '.claude', 'workspace', 'system', 'mcp-health');
+const BACKUP_DIR = path.join(HOME, '.claude', 'backups');
+
+function getTimestamp() {
+  const now = new Date();
+  const d = `${now.getFullYear()}-${String(now.getMonth()+1).padStart(2,'0')}-${String(now.getDate()).padStart(2,'0')}`;
+  const t = `${String(now.getHours()).padStart(2,'0')}${String(now.getMinutes()).padStart(2,'0')}`;
+  return `${d}-${t}`;
+}
+
+function tailFile(filePath, lines) {
+  try {
+    const all = fs.readFileSync(filePath, 'utf8').split('\n');
+    return all.slice(-lines).join('\n');
+  } catch {
+    return `[Could not read ${filePath}]`;
+  }
+}
+
+function sanitizeState(raw) {
+  try {
+    const obj = JSON.parse(raw);
+    // redact session IDs
+    ['sessions', 'codexSessions', 'kimiSessions', 'grokSessions'].forEach((k) => {
+      if (obj[k]) obj[k] = '<redacted>';
+    });
+    return JSON.stringify(obj, null, 2);
+  } catch {
+    return '[invalid state.json]';
+  }
+}
+
+function gather() {
+  const out = {};
+
+  out['01-bridge-log.txt'] = tailFile(path.join(LOG_DIR, 'telegram-bridge.log'), 200);
+  out['02-state-sanitized.json'] = fs.existsSync(STATE_PATH) ? sanitizeState(fs.readFileSync(STATE_PATH, 'utf8')) : '[missing]';
+  out['03-mcp-health.json'] = fs.existsSync(path.join(HEALTH_DIR, 'last-probe.json')) ? fs.readFileSync(path.join(HEALTH_DIR, 'last-probe.json'), 'utf8') : '[missing]';
+  out['04-node-version.txt'] = (() => { try { return execSync('node -v', { encoding: 'utf8' }); } catch(e) { return `Error: ${e.message}`; } })();
+  out['05-os-info.txt'] = (() => { try { return `${process.platform} ${process.arch}`; } catch(e) { return `Error: ${e.message}`; } })();
+
+  return out;
+}
+
+async function main() {
+  if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+
+  const name = `nativeclaw-diag-${getTimestamp()}.zip`;
+  const outPath = path.join(BACKUP_DIR, name);
+  const tmpDir = path.join(BACKUP_DIR, `.diag-${Date.now()}`);
+  fs.mkdirSync(tmpDir, { recursive: true });
+
+  const files = gather();
+  for (const [fname, content] of Object.entries(files)) {
+    fs.writeFileSync(path.join(tmpDir, fname), content);
+  }
+
+  // zip it
+  await new Promise((resolve, reject) => {
+    const child = spawn('zip', ['-r', outPath, '.'], { cwd: tmpDir, stdio: 'pipe' });
+    let err = '';
+    child.stderr.on('data', (d) => { err += d.toString(); });
+    child.on('close', (code) => {
+      if (code !== 0) reject(new Error(`zip failed: ${err}`));
+      else resolve();
+    });
+  });
+
+  // cleanup
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+  console.log(`✅ Diagnostic bundle: ${outPath}`);
+  console.log('Attach this zip when requesting support.');
+}
+
+main().catch((err) => {
+  console.error('Doctor error:', err.message);
+  process.exit(1);
+});

@@ -1,0 +1,23 @@
+// NativeClaw v2.0 — Default Telegram Bridge Config Skeleton
+// Written by setup wizard to ~/.claude/telegram-bridge/config.json
+{
+  "botToken": "",
+  "allowedChatIds": [],
+  "workspace": "~/.claude/workspace",
+  "model": "sonnet",
+  "defaultBackend": "claude",
+  "agentName": "Whet",
+  "userName": "User",
+  "mcpConfig": "~/.claude/.mcp.json",
+  "cronSchedule": "~/.claude/cron-schedule.json",
+  "compactionThresholds": {
+    "openrouter/moonshotai/kimi-k2.6": 180000,
+    "openrouter/x-ai/grok-4.3": 350000,
+    "openrouter/anthropic/claude-haiku-4.5": 100000,
+    "claude-sonnet-4.6": 140000
+  },
+  "voiceProvider": "groq",
+  "voiceModel": "whisper-large-v3",
+  "debugLogging": false,
+  "version": "2.0.0"
+}

@@ -1,0 +1,668 @@
+#!/usr/bin/env node
+
+/**
+ * NativeClaw Settings UI — On-Demand Local Server
+ * Starts a lightweight HTTP server at 127.0.0.1:9292 (auto-picks next if taken).
+ * Auto-shutdown after 30 minutes idle.
+ */
+
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const { execFile } = require('child_process');
+const crypto = require('crypto');
+
+const HOME = process.env.HOME || process.env.USERPROFILE;
+const SETTINGS_DIR = path.join(HOME, '.claude', 'nativeclaw-settings');
+const TOKEN_FILE = path.join(SETTINGS_DIR, '.token');
+const LAST_PING_FILE = path.join(SETTINGS_DIR, '.last-ping');
+const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
+const BASE_PORT = 9292;
+const HOST = '127.0.0.1';
+
+const CONFIG_PATH = path.join(HOME, '.claude', 'telegram-bridge', 'config.json');
+const MCP_PATH = path.join(HOME, '.claude', 'workspace', '.mcp.json');
+const MCP_DISABLED_PATH = path.join(HOME, '.claude', 'workspace', '.mcp.disabled.json');
+const CRON_PATH = path.join(HOME, '.claude', 'cron-schedule.json');
+const LOG_PATH = path.join(HOME, '.claude', 'logs', 'telegram-bridge.log');
+const PID_PATH = path.join(HOME, '.claude', 'telegram-bridge', 'bridge.pid');
+
+const SECRET_FIELDS = ['botToken', 'openaiApiKey', 'anthropicApiKey', 'xaiApiKey'];
+
+function generateToken() { return crypto.randomBytes(32).toString('hex'); }
+
+function readToken() {
+  try { return fs.readFileSync(TOKEN_FILE, 'utf8').trim(); } catch { return null; }
+}
+
+function getAuthToken() {
+  let token = readToken();
+  if (!token) {
+    token = generateToken();
+    fs.mkdirSync(SETTINGS_DIR, { recursive: true });
+    fs.writeFileSync(TOKEN_FILE, token);
+    fs.chmodSync(TOKEN_FILE, 0o600);
+  }
+  return token;
+}
+
+function updatePing() { fs.writeFileSync(LAST_PING_FILE, String(Date.now())); }
+function getLastPing() {
+  try { return parseInt(fs.readFileSync(LAST_PING_FILE, 'utf8'), 10) || Date.now(); } catch { return Date.now(); }
+}
+
+function readConfig() {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    const safe = { ...cfg };
+    for (const k of SECRET_FIELDS) {
+      if (safe[k]) safe[k] = '••• set •••';
+    }
+    return safe;
+  } catch { return {}; }
+}
+
+function writeConfig(updates) {
+  const cur = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+  for (const [k, v] of Object.entries(updates)) {
+    // Don't overwrite secrets with the masked placeholder
+    if (SECRET_FIELDS.includes(k) && v === '••• set •••') continue;
+    if (v === '' || v === null || v === undefined) continue;
+    cur[k] = v;
+  }
+  // Atomic write
+  const tmp = CONFIG_PATH + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(cur, null, 2));
+  fs.renameSync(tmp, CONFIG_PATH);
+  return { saved: Object.keys(updates).filter(k => updates[k] !== '••• set •••') };
+}
+
+function readMcpServers() {
+  let active = {}, disabled = {};
+  try { active = JSON.parse(fs.readFileSync(MCP_PATH, 'utf8')).mcpServers || {}; } catch {}
+  try { disabled = JSON.parse(fs.readFileSync(MCP_DISABLED_PATH, 'utf8')).mcpServers || {}; } catch {}
+  const out = [];
+  for (const name of Object.keys(active).sort()) out.push({ name, enabled: true });
+  for (const name of Object.keys(disabled).sort()) out.push({ name, enabled: false });
+  return out;
+}
+
+function toggleMcp(name, enabled) {
+  let active = { mcpServers: {} }, disabled = { mcpServers: {} };
+  try { active = JSON.parse(fs.readFileSync(MCP_PATH, 'utf8')); } catch {}
+  try { disabled = JSON.parse(fs.readFileSync(MCP_DISABLED_PATH, 'utf8')); } catch {}
+  active.mcpServers = active.mcpServers || {};
+  disabled.mcpServers = disabled.mcpServers || {};
+
+  if (enabled) {
+    if (disabled.mcpServers[name]) {
+      active.mcpServers[name] = disabled.mcpServers[name];
+      delete disabled.mcpServers[name];
+    }
+  } else {
+    if (active.mcpServers[name]) {
+      disabled.mcpServers[name] = active.mcpServers[name];
+      delete active.mcpServers[name];
+    }
+  }
+  fs.writeFileSync(MCP_PATH + '.tmp', JSON.stringify(active, null, 2));
+  fs.renameSync(MCP_PATH + '.tmp', MCP_PATH);
+  fs.writeFileSync(MCP_DISABLED_PATH + '.tmp', JSON.stringify(disabled, null, 2));
+  fs.renameSync(MCP_DISABLED_PATH + '.tmp', MCP_DISABLED_PATH);
+  return { name, enabled };
+}
+
+function readCronJobs() {
+  try {
+    const cron = JSON.parse(fs.readFileSync(CRON_PATH, 'utf8'));
+    return (cron.crons || cron.jobs || []).map(j => ({
+      name: j.name,
+      schedule: j.schedule,
+      enabled: j.enabled !== false,
+      timeout: j.timeout || null,
+      promptPreview: (j.prompt || '').slice(0, 120),
+    }));
+  } catch { return []; }
+}
+
+function writeCronJobs(updates) {
+  const cron = JSON.parse(fs.readFileSync(CRON_PATH, 'utf8'));
+  const list = cron.crons || cron.jobs || [];
+  for (const upd of updates) {
+    const idx = list.findIndex(j => j.name === upd.name);
+    if (idx >= 0) {
+      if (upd.delete) {
+        list.splice(idx, 1);
+      } else {
+        Object.assign(list[idx], upd);
+        if ('delete' in list[idx]) delete list[idx].delete;
+      }
+    } else if (!upd.delete && upd.schedule && upd.prompt) {
+      list.push({
+        name: upd.name,
+        schedule: upd.schedule,
+        enabled: upd.enabled !== false,
+        timeout: upd.timeout || 300,
+        prompt: upd.prompt,
+      });
+    }
+  }
+  if (cron.crons) cron.crons = list; else cron.jobs = list;
+  fs.writeFileSync(CRON_PATH + '.tmp', JSON.stringify(cron, null, 2));
+  fs.renameSync(CRON_PATH + '.tmp', CRON_PATH);
+  return { updated: updates.length };
+}
+
+function tailLog(n) {
+  try {
+    const data = fs.readFileSync(LOG_PATH, 'utf8');
+    return data.split('\n').slice(-n).join('\n');
+  } catch (err) { return `[Could not read log: ${err.message}]`; }
+}
+
+function runCli(binName, args) {
+  return new Promise((resolve, reject) => {
+    const binPath = path.join(__dirname, binName);
+    execFile('node', [binPath, ...args], { timeout: 600_000 }, (err, stdout, stderr) => {
+      if (err) reject(new Error(stderr || err.message));
+      else resolve({ stdout: stdout.trim(), stderr: stderr.trim() });
+    });
+  });
+}
+
+async function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    req.on('data', c => chunks.push(c));
+    req.on('end', () => {
+      try {
+        const raw = Buffer.concat(chunks).toString('utf8');
+        resolve(raw ? JSON.parse(raw) : {});
+      } catch (e) { reject(e); }
+    });
+    req.on('error', reject);
+  });
+}
+
+function buildHTML(token, port) {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>NativeClaw Settings</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  body{background:#0f1117;color:#e6e6e6;line-height:1.5}
+  .container{max-width:960px;margin:0 auto;padding:24px}
+  h1{color:#00d4ff;margin-bottom:8px;font-size:24px}
+  h2{font-size:16px;color:#c9d1d9;margin-bottom:12px}
+  .subtitle{color:#8b949e;font-size:13px;margin-bottom:24px}
+  .tabs{display:flex;gap:4px;border-bottom:1px solid #30363d;margin-bottom:24px;overflow-x:auto}
+  .tab{background:transparent;border:none;color:#8b949e;padding:10px 16px;cursor:pointer;font-size:14px;white-space:nowrap}
+  .tab.active{color:#00d4ff;border-bottom:2px solid #00d4ff}
+  .panel{display:none}
+  .panel.active{display:block}
+  .card{background:#161b22;border:1px solid #30363d;border-radius:10px;padding:18px;margin-bottom:18px}
+  .field{margin-bottom:14px}
+  .field label{display:block;font-size:13px;color:#8b949e;margin-bottom:6px}
+  .field input,.field select,.field textarea{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px 10px;color:#e6e6e6;font-size:14px}
+  .field textarea{font-family:ui-monospace,monospace;min-height:80px}
+  .field input:focus,.field select:focus,.field textarea:focus{outline:none;border-color:#00d4ff}
+  .field .help{font-size:12px;color:#6e7681;margin-top:4px}
+  .field .help a{color:#58a6ff}
+  .btn{background:#00d4ff;color:#0f1117;border:none;border-radius:6px;padding:8px 14px;font-weight:600;cursor:pointer;font-size:14px}
+  .btn:hover{opacity:.9}
+  .btn:disabled{opacity:.5;cursor:not-allowed}
+  .btn.secondary{background:#21262d;color:#c9d1d9}
+  .btn.danger{background:#da3633;color:#fff}
+  .btn.small{padding:4px 10px;font-size:12px}
+  .status-badge{display:inline-block;padding:2px 8px;border-radius:12px;font-size:12px;font-weight:600}
+  .status-ok{background:#238636;color:#fff}
+  .status-warn{background:#9e6a03;color:#fff}
+  .status-err{background:#da3633;color:#fff}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:8px;border-bottom:1px solid #30363d;vertical-align:middle}
+  th{color:#8b949e;font-weight:500}
+  .toast{position:fixed;bottom:20px;right:20px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 18px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:1000}
+  .toast.show{opacity:1}
+  .toast.ok{border-color:#238636}
+  .toast.err{border-color:#da3633}
+  .switch{position:relative;display:inline-block;width:36px;height:20px}
+  .switch input{opacity:0;width:0;height:0}
+  .slider{position:absolute;cursor:pointer;top:0;left:0;right:0;bottom:0;background:#30363d;border-radius:20px;transition:.2s}
+  .slider:before{position:absolute;content:"";height:14px;width:14px;left:3px;bottom:3px;background:#fff;border-radius:50%;transition:.2s}
+  .switch input:checked+.slider{background:#00d4ff}
+  .switch input:checked+.slider:before{transform:translateX(16px)}
+  code{background:#0d1117;padding:2px 6px;border-radius:4px;font-size:12px}
+</style>
+</head>
+<body>
+<div class="container">
+  <h1>⚡ NativeClaw Settings</h1>
+  <div class="subtitle">v2.0 — Edit config, manage MCPs, view logs, trigger backups.</div>
+  <div class="tabs">
+    <button class="tab active" data-tab="status">Status</button>
+    <button class="tab" data-tab="config">Config</button>
+    <button class="tab" data-tab="mcps">MCP Servers</button>
+    <button class="tab" data-tab="cron">Cron Schedule</button>
+    <button class="tab" data-tab="connections">Connections</button>
+    <button class="tab" data-tab="logs">Logs</button>
+    <button class="tab" data-tab="backup">Backup / Restore</button>
+  </div>
+
+  <div id="status" class="panel active">
+    <div class="card"><h2>Bridge Health</h2><div id="bridge-status">Loading…</div></div>
+    <div class="card"><h2>MCP Servers</h2><div id="mcp-status">Loading…</div></div>
+    <div class="card"><h2>Cron Jobs</h2><div id="cron-status">Loading…</div></div>
+  </div>
+
+  <div id="config" class="panel">
+    <div class="card">
+      <h2>General Config</h2>
+      <div class="field"><label>Agent name</label><input id="agentName" /><div class="help">Shown in greetings, prompt primer, /stats output.</div></div>
+      <div class="field"><label>User name</label><input id="userName" /></div>
+      <div class="field"><label>Default model (Claude lane)</label>
+        <select id="defaultModel">
+          <option value="claude-sonnet-4-6">Claude Sonnet 4.6</option>
+          <option value="claude-opus-4-7">Claude Opus 4.7</option>
+          <option value="claude-haiku-4-5">Claude Haiku 4.5</option>
+        </select></div>
+      <div class="field"><label>Default backend</label>
+        <select id="defaultBackend">
+          <option value="claude">Claude</option>
+          <option value="codex">Codex (OpenAI)</option>
+          <option value="kimi">Kimi (OpenRouter, experimental)</option>
+          <option value="grok">Grok (OpenRouter)</option>
+        </select></div>
+      <div class="field"><label>Default effort</label>
+        <select id="defaultEffort">
+          <option value="low">low</option>
+          <option value="medium">medium</option>
+          <option value="high">high</option>
+          <option value="xhigh">xhigh</option>
+          <option value="max">max</option>
+        </select></div>
+      <button class="btn" id="save-config">Save Config</button>
+    </div>
+  </div>
+
+  <div id="mcps" class="panel">
+    <div class="card"><h2>MCP Server Toggles</h2>
+      <p class="help" style="margin-bottom:12px">Disabled servers are moved to <code>.mcp.disabled.json</code> and reloaded on next bridge restart.</p>
+      <div id="mcp-list">Loading…</div>
+    </div>
+  </div>
+
+  <div id="cron" class="panel">
+    <div class="card"><h2>Cron Jobs</h2>
+      <div id="cron-edit-list">Loading…</div>
+      <button class="btn" id="add-cron" style="margin-top:8px">+ Add Job</button>
+      <button class="btn" id="save-cron" style="margin-top:8px;margin-left:8px">Save Cron Schedule</button>
+    </div>
+  </div>
+
+  <div id="connections" class="panel">
+    <div class="card">
+      <h2>Telegram</h2>
+      <div class="field"><label>Bot token</label><input id="botToken" type="password" placeholder="Leave blank to keep current" /><div class="help">Stored in config.json; never logged. Get one from @BotFather on Telegram.</div></div>
+      <div class="field"><label>Allowed chat IDs (comma-separated)</label><input id="allowedChatIds" placeholder="e.g. 123456789, -1001234567890" /></div>
+      <h2 style="margin-top:18px">Voice Transcription</h2>
+      <div class="field">
+        <label>Provider</label>
+        <select id="voiceProvider">
+          <option value="xai">xAI Grok STT (default, fastest)</option>
+          <option value="openai">OpenAI Whisper API</option>
+          <option value="local">Local whisper.cpp</option>
+        </select>
+        <div class="help">For xAI: get a key at <a href="https://console.x.ai" target="_blank">console.x.ai</a> and store with <code>security add-generic-password -a whet -s XAI_API_KEY -w &lt;key&gt;</code>.</div>
+      </div>
+      <h2 style="margin-top:18px">Google Workspace (Option B — user-owned OAuth)</h2>
+      <div class="field"><label>credentials.json path</label><input id="googleCredsPath" placeholder="~/.config/nativeclaw/google-credentials.json" /><div class="help">Walk-through guide: <a href="#" id="open-google-guide">how to create your own OAuth client</a>.</div></div>
+      <button class="btn" id="save-connections">Save Connections</button>
+    </div>
+  </div>
+
+  <div id="logs" class="panel">
+    <div class="card">
+      <h2>Bridge Log (last 200 lines)</h2>
+      <pre id="log-tail" style="background:#0d1117;padding:12px;border-radius:6px;max-height:400px;overflow:auto;font-size:12px">Loading…</pre>
+      <button class="btn" id="refresh-log" style="margin-top:12px">Refresh</button>
+      <button class="btn secondary" id="export-diag" style="margin-top:12px">Export Diagnostic Bundle</button>
+    </div>
+  </div>
+
+  <div id="backup" class="panel">
+    <div class="card">
+      <h2>Backup</h2>
+      <p class="help" style="margin-bottom:12px">Creates a zip of <code>~/.claude/workspace</code>. Excludes secrets by default.</p>
+      <button class="btn" id="create-backup">Create Backup Archive</button>
+      <div id="backup-result" style="margin-top:12px"></div>
+    </div>
+    <div class="card">
+      <h2>Restore</h2>
+      <p class="help" style="margin-bottom:12px">Restore a workspace from a backup zip. Use <code>nativeclaw restore &lt;path&gt;</code> from the terminal — UI restore is not yet wired (avoids accidental overwrites).</p>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+const token = '${token}';
+async function api(path, opts={}) {
+  const r = await fetch(path, {...opts, headers: {...(opts.headers||{}), 'x-nativeclaw-token': token, 'Content-Type': 'application/json'}});
+  const text = await r.text();
+  if (!r.ok) throw new Error(text || r.statusText);
+  return text ? JSON.parse(text) : {};
+}
+function toast(msg, kind='ok') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.className = 'toast show ' + kind;
+  setTimeout(()=>{ el.className = 'toast ' + kind; }, 2400);
+}
+function escapeHtml(s) {
+  return String(s||'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+document.querySelectorAll('.tab').forEach(t=>t.addEventListener('click',()=>{
+  document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('active', x===t));
+  document.querySelectorAll('.panel').forEach(p=>p.classList.toggle('active', p.id===t.dataset.tab));
+}));
+
+let cronJobs = [];
+let mcpServers = [];
+
+async function loadStatus() {
+  try {
+    const s = await api('/api/status');
+    const badge = s.bridgeAlive?'status-ok':'status-err';
+    document.getElementById('bridge-status').innerHTML =
+      '<span class="status-badge '+badge+'">'+(s.bridgeAlive?'Alive (PID '+s.pid+')':'Dead')+'</span> '+
+      (s.lastLogTime?' last log '+new Date(s.lastLogTime).toLocaleString():'');
+  } catch(e){ document.getElementById('bridge-status').textContent='Error: '+e.message; }
+}
+
+async function loadConfig() {
+  try {
+    const c = await api('/api/config');
+    document.getElementById('agentName').value = c.agentName || '';
+    document.getElementById('userName').value = c.userName || '';
+    document.getElementById('defaultModel').value = c.model || 'claude-sonnet-4-6';
+    document.getElementById('defaultBackend').value = c.defaultBackend || 'claude';
+    document.getElementById('defaultEffort').value = c.effort || 'medium';
+    document.getElementById('voiceProvider').value = c.voiceProvider || 'xai';
+    document.getElementById('botToken').placeholder = c.botToken === '••• set •••' ? 'Bot token set — leave blank to keep' : 'Paste bot token';
+    document.getElementById('allowedChatIds').value = (c.allowedChatIds || []).join(', ');
+    document.getElementById('googleCredsPath').value = c.googleCredsPath || '';
+  } catch(e){ /* defaults */ }
+}
+
+async function loadMcps() {
+  try {
+    mcpServers = (await api('/api/mcps')).mcps;
+    const enabled = mcpServers.filter(m=>m.enabled).length;
+    const total = mcpServers.length;
+    document.getElementById('mcp-status').innerHTML =
+      '<strong>'+enabled+' enabled</strong> of '+total+' total. ' +
+      '<a href="#" onclick="document.querySelector(\\'.tab[data-tab=mcps]\\').click();return false">Manage →</a>';
+    const rows = mcpServers.map(m =>
+      '<tr><td>'+escapeHtml(m.name)+'</td>' +
+      '<td><label class="switch"><input type="checkbox" data-mcp="'+escapeHtml(m.name)+'" '+(m.enabled?'checked':'')+'/><span class="slider"></span></label></td></tr>'
+    ).join('');
+    document.getElementById('mcp-list').innerHTML = '<table><tr><th>Server</th><th>Enabled</th></tr>'+rows+'</table>';
+    document.querySelectorAll('input[data-mcp]').forEach(inp => {
+      inp.addEventListener('change', async e => {
+        const name = e.target.dataset.mcp;
+        const enabled = e.target.checked;
+        try {
+          await api('/api/mcps/toggle', { method:'POST', body: JSON.stringify({name, enabled}) });
+          toast(name + (enabled?' enabled':' disabled'));
+          loadMcps();
+        } catch(err) { toast('Failed: '+err.message, 'err'); e.target.checked = !enabled; }
+      });
+    });
+  } catch(e) { document.getElementById('mcp-list').textContent = 'Error: '+e.message; }
+}
+
+async function loadCron() {
+  try {
+    cronJobs = (await api('/api/cron')).jobs;
+    document.getElementById('cron-status').innerHTML = '<strong>'+cronJobs.length+'</strong> jobs configured ('+cronJobs.filter(j=>j.enabled).length+' enabled).';
+    renderCronEditor();
+  } catch(e) { document.getElementById('cron-edit-list').textContent = 'Error: '+e.message; }
+}
+
+function renderCronEditor() {
+  const html = cronJobs.map((j, idx) => \`
+    <div class="card" style="background:#0d1117">
+      <div class="field"><label>Name</label><input value="\${escapeHtml(j.name)}" data-cron-field="name" data-idx="\${idx}" /></div>
+      <div class="field"><label>Schedule (cron expression)</label><input value="\${escapeHtml(j.schedule)}" data-cron-field="schedule" data-idx="\${idx}" placeholder="*/30 * * * *" /></div>
+      <div class="field"><label>Enabled</label><label class="switch"><input type="checkbox" \${j.enabled?'checked':''} data-cron-field="enabled" data-idx="\${idx}" /><span class="slider"></span></label></div>
+      <div class="field"><label>Prompt (preview)</label><textarea data-cron-field="prompt" data-idx="\${idx}" placeholder="Cron prompt body…">\${escapeHtml(j.prompt || j.promptPreview || '')}</textarea></div>
+      <button class="btn danger small" data-cron-delete="\${idx}">Delete</button>
+    </div>
+  \`).join('');
+  document.getElementById('cron-edit-list').innerHTML = html || '<p class="help">No jobs configured.</p>';
+  document.querySelectorAll('[data-cron-field]').forEach(el => {
+    el.addEventListener('input', e => {
+      const idx = parseInt(e.target.dataset.idx, 10);
+      const field = e.target.dataset.cronField;
+      cronJobs[idx][field] = field === 'enabled' ? e.target.checked : e.target.value;
+      cronJobs[idx]._dirty = true;
+    });
+  });
+  document.querySelectorAll('[data-cron-delete]').forEach(el => {
+    el.addEventListener('click', e => {
+      const idx = parseInt(e.target.dataset.cronDelete, 10);
+      cronJobs[idx]._delete = true;
+      e.target.closest('.card').style.opacity = 0.4;
+      e.target.disabled = true;
+    });
+  });
+}
+
+document.getElementById('add-cron').addEventListener('click', () => {
+  cronJobs.push({ name: 'new-job', schedule: '*/30 * * * *', enabled: true, prompt: '' , _dirty: true });
+  renderCronEditor();
+});
+
+document.getElementById('save-cron').addEventListener('click', async () => {
+  const updates = cronJobs
+    .filter(j => j._dirty || j._delete)
+    .map(j => ({ name: j.name, schedule: j.schedule, enabled: j.enabled, prompt: j.prompt, delete: !!j._delete }));
+  if (!updates.length) return toast('No changes to save', 'ok');
+  try {
+    await api('/api/cron', { method:'POST', body: JSON.stringify({ jobs: updates }) });
+    toast('Cron schedule saved (' + updates.length + ' updates)');
+    loadCron();
+  } catch(e) { toast('Save failed: ' + e.message, 'err'); }
+});
+
+document.getElementById('save-config').addEventListener('click', async () => {
+  const updates = {
+    agentName: document.getElementById('agentName').value.trim(),
+    userName: document.getElementById('userName').value.trim(),
+    model: document.getElementById('defaultModel').value,
+    defaultBackend: document.getElementById('defaultBackend').value,
+    effort: document.getElementById('defaultEffort').value,
+  };
+  try {
+    await api('/api/config', { method:'POST', body: JSON.stringify(updates) });
+    toast('Config saved');
+  } catch(e) { toast('Save failed: ' + e.message, 'err'); }
+});
+
+document.getElementById('save-connections').addEventListener('click', async () => {
+  const updates = {
+    voiceProvider: document.getElementById('voiceProvider').value,
+    googleCredsPath: document.getElementById('googleCredsPath').value.trim(),
+  };
+  const botToken = document.getElementById('botToken').value.trim();
+  if (botToken) updates.botToken = botToken;
+  const chatIds = document.getElementById('allowedChatIds').value.split(',').map(s=>s.trim()).filter(Boolean).map(Number);
+  if (chatIds.length) updates.allowedChatIds = chatIds;
+  try {
+    await api('/api/config', { method:'POST', body: JSON.stringify(updates) });
+    toast('Connections saved');
+    document.getElementById('botToken').value = '';
+    loadConfig();
+  } catch(e) { toast('Save failed: ' + e.message, 'err'); }
+});
+
+document.getElementById('refresh-log').addEventListener('click', async () => {
+  try { document.getElementById('log-tail').textContent = (await api('/api/logs')).log; toast('Log refreshed'); }
+  catch(e) { toast('Refresh failed: '+e.message, 'err'); }
+});
+
+document.getElementById('export-diag').addEventListener('click', async () => {
+  const btn = document.getElementById('export-diag');
+  btn.disabled = true; btn.textContent = 'Building bundle…';
+  try {
+    const r = await api('/api/diagnostic', { method:'POST', body: '{}' });
+    toast('Diagnostic bundle saved');
+    document.getElementById('log-tail').textContent = 'Diagnostic exported to: '+r.path+'\\n\\n'+document.getElementById('log-tail').textContent;
+  } catch(e) { toast('Export failed: '+e.message, 'err'); }
+  finally { btn.disabled = false; btn.textContent = 'Export Diagnostic Bundle'; }
+});
+
+document.getElementById('create-backup').addEventListener('click', async () => {
+  const btn = document.getElementById('create-backup');
+  btn.disabled = true; btn.textContent = 'Creating backup…';
+  try {
+    const r = await api('/api/backup', { method:'POST', body: '{}' });
+    document.getElementById('backup-result').innerHTML = '<span class="status-badge status-ok">Saved</span> '+escapeHtml(r.path);
+    toast('Backup created');
+  } catch(e) {
+    document.getElementById('backup-result').innerHTML = '<span class="status-badge status-err">Failed</span> '+escapeHtml(e.message);
+    toast('Backup failed', 'err');
+  } finally { btn.disabled = false; btn.textContent = 'Create Backup Archive'; }
+});
+
+document.getElementById('open-google-guide').addEventListener('click', async (e) => {
+  e.preventDefault();
+  const w = window.open('', '_blank');
+  w.document.write('<pre style="font-family:system-ui;padding:24px;line-height:1.6;max-width:720px;margin:auto"><h2>Google Workspace OAuth — User-Owned Setup</h2>1. Go to <a href="https://console.cloud.google.com/projectcreate" target="_blank">console.cloud.google.com</a> → create a new project (call it "nativeclaw" or anything you want).\\n2. APIs &amp; Services → Library → enable: Drive, Sheets, Docs, Calendar, Gmail (only what you actually use).\\n3. APIs &amp; Services → OAuth consent screen → External, add your email as a test user.\\n4. APIs &amp; Services → Credentials → Create Credentials → OAuth client ID → Desktop App → name it.\\n5. Click Download JSON → save as <code>~/.config/nativeclaw/google-credentials.json</code>.\\n6. Paste the path into the Connections tab and Save.\\n7. First Google tool call will open a browser for one-time authorization.</pre>');
+});
+
+(async () => {
+  await loadStatus();
+  await loadConfig();
+  await loadMcps();
+  await loadCron();
+  try { document.getElementById('log-tail').textContent = (await api('/api/logs')).log; }
+  catch(e){ document.getElementById('log-tail').textContent='Error: '+e.message; }
+})();
+</script>
+</body>
+</html>`;
+}
+
+function findPort(start, cb) {
+  const server = http.createServer();
+  server.listen(start, HOST, () => {
+    const port = (server.address()).port;
+    server.close(() => cb(port));
+  });
+  server.on('error', () => findPort(start + 1, cb));
+}
+
+function main() {
+  const token = getAuthToken();
+  findPort(BASE_PORT, (port) => {
+    console.log(`⚡ NativeClaw Settings — http://${HOST}:${port}/?token=${token}`);
+    console.log('Opening browser…');
+    require('child_process').exec(`open "http://${HOST}:${port}/?token=${token}"`);
+
+    const server = http.createServer(async (req, res) => {
+      updatePing();
+      const u = new URL(req.url || '/', `http://${req.headers.host}`);
+      const pathname = u.pathname;
+      const query = Object.fromEntries(u.searchParams);
+      const providedToken = query.token || req.headers['x-nativeclaw-token'];
+
+      if (providedToken !== token) {
+        res.writeHead(403); res.end('Forbidden: invalid or missing token'); return;
+      }
+
+      const json = (status, body) => {
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(body));
+      };
+      const error = (status, msg) => {
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: msg }));
+      };
+
+      try {
+        // GET routes
+        if (req.method === 'GET' && (pathname === '/' || pathname === '/index.html')) {
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          return res.end(buildHTML(token, port));
+        }
+        if (req.method === 'GET' && pathname === '/api/status') {
+          const cfg = readConfig();
+          let bridgeAlive = false, pid = null;
+          try {
+            pid = parseInt(fs.readFileSync(PID_PATH, 'utf8'), 10);
+            process.kill(pid, 0);
+            bridgeAlive = true;
+          } catch {}
+          let lastLogTime = null;
+          try { lastLogTime = fs.statSync(LOG_PATH).mtime.toISOString(); } catch {}
+          return json(200, { bridgeAlive, pid, lastLogTime, agentName: cfg.agentName || null, userName: cfg.userName || null });
+        }
+        if (req.method === 'GET' && pathname === '/api/config') return json(200, readConfig());
+        if (req.method === 'GET' && pathname === '/api/mcps')   return json(200, { mcps: readMcpServers() });
+        if (req.method === 'GET' && pathname === '/api/cron')   return json(200, { jobs: readCronJobs() });
+        if (req.method === 'GET' && pathname === '/api/logs')   return json(200, { log: tailLog(200) });
+
+        // POST routes
+        if (req.method === 'POST' && pathname === '/api/config') {
+          const body = await readBody(req);
+          return json(200, writeConfig(body));
+        }
+        if (req.method === 'POST' && pathname === '/api/cron') {
+          const body = await readBody(req);
+          if (!Array.isArray(body.jobs)) return error(400, 'Expected { jobs: [...] }');
+          return json(200, writeCronJobs(body.jobs));
+        }
+        if (req.method === 'POST' && pathname === '/api/mcps/toggle') {
+          const body = await readBody(req);
+          if (!body.name) return error(400, 'Expected { name, enabled }');
+          return json(200, toggleMcp(body.name, !!body.enabled));
+        }
+        if (req.method === 'POST' && pathname === '/api/backup') {
+          const r = await runCli('backup', []);
+          const match = r.stdout.match(/(?:Saved|Created|→)[: ]+([^\n]+\.zip)/);
+          return json(200, { path: match ? match[1].trim() : r.stdout.split('\n').pop(), stdout: r.stdout });
+        }
+        if (req.method === 'POST' && pathname === '/api/diagnostic') {
+          const r = await runCli('doctor', []);
+          const match = r.stdout.match(/(?:Saved|Created|→)[: ]+([^\n]+\.zip)/);
+          return json(200, { path: match ? match[1].trim() : r.stdout.split('\n').pop(), stdout: r.stdout });
+        }
+
+        res.writeHead(404); res.end('Not found');
+      } catch (err) {
+        console.error('handler error:', err);
+        error(500, err.message);
+      }
+    });
+
+    server.listen(port, HOST, () => {
+      console.log(`Server running. Auto-shutdown in ${IDLE_TIMEOUT_MS / 60000} min idle.`);
+    });
+
+    setInterval(() => {
+      const idle = Date.now() - getLastPing();
+      if (idle > IDLE_TIMEOUT_MS) {
+        console.log('Idle timeout reached. Shutting down.');
+        server.close(() => process.exit(0));
+      }
+    }, 60000);
+  });
+}
+
+main();
