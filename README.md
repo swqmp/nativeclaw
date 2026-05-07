@@ -2,17 +2,20 @@
 
 NativeClaw is a personal AI agent that runs as a managed background service on macOS, Linux, or Windows and talks to you through Telegram.
 
-It started as a Claude Code bridge. Current NativeClaw can run either Claude or Codex as the active backend, keep persistent workspace memory, run scheduled jobs, handle common media inputs, and survive service restarts.
+It started as a Claude Code bridge. Current NativeClaw can run Claude, Codex (OpenAI CLI), Kimi (via OpenRouter), or Grok (via OpenRouter) as the active backend, keep persistent workspace memory, run scheduled jobs, handle common media inputs, and survive service restarts.
 
 ## What It Does
 
-- Responds to Telegram messages through Claude Code or Codex CLI
-- Switches backends with `/claude` and `/codex`
+- Responds to Telegram messages through Claude Code, Codex CLI, or OpenCode (for Kimi & Grok via OpenRouter)
+- Switches backends with `/claude`, `/codex`, `/kimi`, and `/grok`
 - Preserves backend-switch continuity with raw gap transcripts
+- Auto-compacts long sessions on Kimi (~180k) and Grok (~150k) lanes; `/compact` triggers manual compaction across all four backends
+- Shows live context-window usage per backend with `/stats` (per-message JSONL accuracy across multi-tool turns)
 - Runs bridge-level scheduled jobs such as briefs, audits, queue recovery, and heartbeats
 - Keeps durable memory in workspace files instead of relying on chat history
 - Supports images, voice notes, audio files, and document attachments
 - Uses launchd, systemd, or Windows Task Scheduler so the bridge survives reboot/crash cycles
+- Ships a visual setup wizard and an on-demand control panel at `127.0.0.1:9292` (no terminal required after install)
 
 ## What's Current
 
@@ -47,10 +50,15 @@ See **[v2/CHANGELOG.md](v2/CHANGELOG.md)** for v2.0 changes and **[CHANGELOG.md]
 - macOS, Linux, or Windows
 - Node.js 18+
 - Telegram account and bot token from [@BotFather](https://t.me/BotFather)
-- Claude Code CLI (`claude`) with an active Claude subscription, Codex CLI (`codex`), or both
-- OpenAI API key if you want voice/audio transcription through Whisper API
+- At least one backend installed:
+  - Claude Code CLI (`claude`) with an active Claude subscription, **or**
+  - Codex CLI (`codex`) with an active ChatGPT/OpenAI account, **or**
+  - OpenCode CLI (`opencode`) for Kimi and/or Grok via OpenRouter
+  - Any combination is supported.
+- **xAI API key** for voice transcription via Grok STT (OpenAI Whisper supported as fallback)
+- **OpenRouter API key** if using Kimi or Grok backends
 
-Windows users should run `setup.sh` in Git Bash or MSYS2, not Command Prompt or PowerShell.
+> **Note on Kimi:** Kimi K2.6 is shipped as a first-class backend but is still stabilizing under heavy load. The bridge runs it with shorter timeout/idle limits than Claude/Codex. Stable fallbacks: `/claude` and `/codex`.
 
 Before running PowerShell scripts on Windows, open PowerShell as Administrator and run:
 
@@ -60,27 +68,46 @@ Set-ExecutionPolicy RemoteSigned -Scope CurrentUser
 
 ## Quick Start
 
+**One-line install (macOS / Linux):**
+
 ```bash
-git clone https://github.com/YOUR_USERNAME/nativeclaw.git
-cd nativeclaw
-bash setup.sh
+bash <(curl -fsSL https://install.nativeclaw.dev)
 ```
 
-The setup wizard will:
-1. Check Node.js and available backend CLIs
-2. Walk you through Telegram bot setup
-3. Ask what your agent should be called and what it should call you
-4. Let you choose Claude-only, Codex-only, or Claude + Codex
-5. Install bridge, scripts, workspace templates, skills, hooks, and cron schedule
-6. Store optional OpenAI API key for voice transcription
-7. Offer optional Nano Banana image generation (Google Gemini)
-8. Offer optional QMD semantic memory search (Google Gemini; key stored in your OS keychain)
-9. Offer to wire memory-check + feedback-check prompt hooks into `~/.claude/settings.json`
-10. Install and optionally start the service
+**One-line install (Windows PowerShell, as Administrator):**
+
+```powershell
+iwr -useb https://install.nativeclaw.dev/install.ps1 | iex
+```
+
+**Or clone and run locally:**
+
+```bash
+git clone https://github.com/swqmp/nativeclaw.git
+cd nativeclaw
+bash v2/install/install.sh
+```
+
+After install, run the setup wizard:
+
+```bash
+nativeclaw setup
+```
+
+The wizard runs as a browser flow at `127.0.0.1:9292` (or terminal TUI mode if you prefer). Six steps with retry/skip/edit recovery on each:
+
+1. **Welcome** — quick orientation
+2. **Prereq** — checks Node.js and available backend CLIs (Claude / Codex / OpenCode); installs missing pieces with SSE-streamed progress
+3. **Backend** — choose any combination: Claude, Codex, Kimi, Grok
+4. **Identity** — what your agent should be called, what it should call you
+5. **Telegram** — paste your bot token from @BotFather
+6. **Features** — optional: xAI voice key, OpenRouter API key, Nano Banana image gen, QMD semantic memory, prompt hooks
+7. **Install** — wires bridge, scripts, workspace templates, skills, hooks, cron schedule, and the platform service manager
+8. **Done** — service starts; first Telegram message activates the agent
 
 ## What You Get Out of the Box
 
-Beyond the core bridge, v1.10 ships an **agent reliability stack** so your agent behaves well from day one:
+Beyond the core bridge, v2.0 ships an **agent reliability stack** so your agent behaves well from day one:
 
 **Memory that learns**
 - `feedback/` — per-task correction logs the agent reads before repeatable output
@@ -103,9 +130,9 @@ Beyond the core bridge, v1.10 ships an **agent reliability stack** so your agent
 **Quality of life**
 - `system/scripts/video-extract.sh` — YouTube/Instagram/TikTok caption + Whisper transcription
 - `system/PLATFORM_FORMATTING.md` — Discord/WhatsApp/group-chat formatting rules
-- `skills/` — 14 bundled skills (design, document handling, testing, brainstorming) plus `SKILL_INDEX.md`
+- `skills/` — bundled skills (design, document handling, testing, brainstorming) plus `SKILL_INDEX.md`
 
-All optional pieces (QMD, hooks, image gen) can be skipped during setup and enabled later. See [OPERATIONS.md](OPERATIONS.md).
+All optional pieces (QMD, hooks, image gen) can be skipped during setup and enabled later through `nativeclaw settings`. See [OPERATIONS.md](OPERATIONS.md).
 
 ## First-Run Experience
 
@@ -116,30 +143,37 @@ NativeClaw is designed so setup is the only terminal-heavy part. After the bridg
 3. Run `/status` to confirm the bridge is alive.
 4. Tell the agent who you are and what you want help with.
 5. Let the agent write durable context into `USER.md`, `MEMORY.md`, and `TOOLS.md`.
-6. Use `/claude` and `/codex` only if you installed both backends and want to switch models.
+6. Use `/claude`, `/codex`, `/kimi`, or `/grok` to switch between any backends you installed.
 
 Set `"firstRunOnboarding": false` in `config.json` if you want to skip the Telegram welcome.
 
 Plain-English concepts:
 - **Telegram bot:** the private chat surface where you talk to your agent.
 - **Bot token:** the secret Telegram gives NativeClaw so it can receive and send bot messages.
-- **Backend:** the model CLI that answers messages. Claude and Codex are both supported; either can be the only backend.
-- **MCP:** a tool connector. MCP servers let the agent talk to apps and data sources such as calendars, files, GitHub, or custom APIs.
+- **Backend:** the model CLI that answers messages. Claude, Codex, Kimi, and Grok are all supported; you can install any combination. Kimi and Grok run through OpenCode + OpenRouter, so they share an `OPENROUTER_API_KEY`.
+- **MCP:** a tool connector. MCP servers let the agent talk to apps and data sources such as calendars, files, GitHub, or custom APIs. Edit them through the Settings UI MCP tab or by hand in `.mcp.json`.
 - **QMD:** optional semantic memory search. It embeds memory files with Google's Gemini embedding API so the agent can search past decisions by meaning, not just exact keywords.
 
 ## Architecture
 
 ```text
 User (Telegram) -> Bridge (Node.js) -> Active Backend -> Response -> Telegram
-                                      ├─ Claude Code CLI
-                                      └─ Codex CLI
-                    ↓
-             Bridge Cron Scheduler -> active backend or command-only cron
+                          ├─ Claude Code CLI
+                          ├─ Codex CLI
+                          ├─ OpenCode (Kimi via OpenRouter)
+                          └─ OpenCode (Grok via OpenRouter)
+                          ↓
+                Bridge Cron Scheduler -> active backend or command-only cron
+                          ↓
+                Setup Wizard / Settings UI (127.0.0.1:9292, on-demand)
 ```
 
 Important files after install:
 
 ```text
+~/.nativeclaw/
+└── bin/nativeclaw         (CLI: setup / settings / backup / restore / doctor / status)
+
 ~/.claude/
 ├── telegram-bridge/
 │   ├── bridge.js
@@ -170,11 +204,16 @@ Important files after install:
 | Command | What It Does |
 |---|---|
 | `/claude` | Use Claude backend |
-| `/claude --full` | Use Claude and force raw Codex gap transcript injection |
+| `/claude --full` | Use Claude and force raw gap transcript injection from previous backend |
 | `/codex` | Use Codex backend |
-| `/codex --full` | Use Codex and force raw Claude gap transcript injection |
+| `/codex --full` | Use Codex and force raw gap transcript injection from previous backend |
 | `/codex help` | List Codex model shortcuts |
-| `/5.4`, `/5.4-mini`, `/5.3-codex`, `/5.2`, `/5.2-codex`, `/5.1-codex-max`, `/5.1-codex-mini` | Set Codex model |
+| `/kimi` | Use Kimi backend (Kimi K2.6 via OpenRouter) |
+| `/kimi --full` | Use Kimi and force raw gap transcript injection from previous backend |
+| `/grok` | Use Grok backend (Grok 4.3 via OpenRouter) |
+| `/grok --full` | Use Grok and force raw gap transcript injection from previous backend |
+| `/catchup` | Pull recent context from the OTHER backend without switching backends |
+| `/5.5`, `/5.4`, `/5.4-mini`, `/5.3-codex`, `/5.2`, `/5.2-codex`, `/5.1-codex-max`, `/5.1-codex-mini` | Set Codex model |
 | `/opus` | Switch Claude model to Opus 4.7 |
 | `/opus4.6` | Switch Claude model to Opus 4.6 |
 | `/sonnet` | Switch Claude model to Sonnet 4.6 |
@@ -182,15 +221,29 @@ Important files after install:
 | `/effort <low|medium|high|xhigh|max>` | Set Claude/Codex reasoning effort |
 | `/think` | Compatibility toggle for max effort |
 | `/verbosity <default|low|medium|high>` | Set Codex verbosity |
+| `/compact` | Manually compact the active backend's context window |
 | `/stop` | Abort the running task and clear queue |
 | `/reset` | Clear current backend session/thread |
 | `/fresh` | Alias for `/reset` |
-| `/stats` | Show last response stats |
-| `/usage` | Plan usage: 5-hour + 7-day windows for Claude and Codex (Codex line requires `codex login` first; otherwise shows `Codex not logged in`) |
+| `/stats` | Last response stats + per-backend context window (e.g. `Context: 1M (134k filled)`) |
+| `/usage` | Plan usage: 5-hour + 7-day windows for Claude and Codex (Codex line requires `codex login` first) |
 | `/session` | Show session/thread info |
 | `/status` | Show backend/model/session state |
 | `/restart` | Ask the service manager to restart the bridge |
 | `/help` | Show commands |
+
+## NativeClaw CLI
+
+After install, the `nativeclaw` command exposes the management surface:
+
+| Command | What It Does |
+|---|---|
+| `nativeclaw setup` | First-time setup wizard (browser at `127.0.0.1:9292` or terminal TUI) |
+| `nativeclaw settings` | Open the on-demand control panel at `127.0.0.1:9292` (auto-shutdown after 30 min idle) |
+| `nativeclaw status` | Bridge health snapshot (PID, backend, last activity) |
+| `nativeclaw backup` | Archive workspace to a zip (excludes secrets by default; `--include-secrets` opts in) |
+| `nativeclaw restore <zip>` | Restore from a backup on a fresh machine |
+| `nativeclaw doctor` | Bundle logs, sanitized state, MCP health, and system info into a diagnostic zip |
 
 ## Service Commands
 
@@ -220,17 +273,21 @@ schtasks /end /tn "NativeClaw"
 schtasks /delete /tn "NativeClaw" /f
 ```
 
-## Codex Setup Notes
+Cross-platform shortcut: `nativeclaw status` works on all three OSes.
 
-The bridge can launch Codex without extra repo files if `codex` is on PATH. For MCP access, mirror your MCP servers into `~/.codex/config.toml`. NativeClaw's Codex preamble expects that config path.
+## Backend Setup Notes
 
-Recommended smoke test:
+**Codex:** The bridge can launch Codex without extra repo files if `codex` is on PATH. For MCP access, mirror your MCP servers into `~/.codex/config.toml`. NativeClaw's Codex preamble expects that config path.
+
+Smoke test:
 
 ```bash
 codex exec "Say OK" -c model_reasoning_effort='"xhigh"' -c model_verbosity='"low"'
 ```
 
-Then run the bridge eval:
+**Kimi & Grok:** Both run through OpenCode (`opencode` CLI on PATH) using OpenRouter as the upstream. The bridge reads `OPENROUTER_API_KEY` from your OS keychain. MCP servers configured in `.mcp.json` are loaded automatically by OpenCode at runtime; you can also edit them from the Settings UI MCP tab.
+
+**Bridge eval harness** (validates all slash commands across all backends):
 
 ```bash
 node ~/.claude/telegram-bridge/eval-slash-commands.js
@@ -242,7 +299,7 @@ node ~/.claude/telegram-bridge/eval-slash-commands.js
 |---|---|
 | Text | Sent directly to the active backend |
 | Images | Downloaded and passed for visual analysis |
-| Voice messages | Transcribed with OpenAI Whisper API, then sent as text |
+| Voice messages | Transcribed with xAI Grok STT (OpenAI Whisper supported as fallback), then sent as text |
 | Audio files | Same as voice messages |
 | Files | Downloaded and passed with the prompt/caption |
 
@@ -255,11 +312,11 @@ NativeClaw is meant to be heavily personalized:
 - `MEMORY.md` stores durable context
 - `USER.md` stores durable user facts
 - `TOOLS.md` documents available tools and local setup
-- `cron-schedule.json` defines scheduled jobs
-- `.mcp.json` defines Claude MCP servers
+- `cron-schedule.json` defines scheduled jobs (also editable from Settings UI Cron tab)
+- `.mcp.json` defines MCP servers (also editable from Settings UI MCP tab)
 
 See [OPERATIONS.md](OPERATIONS.md) for maintenance details.
 
 ## License
 
-Private. Do not distribute unless you know this repo is intentionally being shared.
+MIT © Jamiah Bartlett
