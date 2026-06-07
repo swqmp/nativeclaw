@@ -1,13 +1,10 @@
-// bridge-opencode.js — staged OpenCode subprocess runner for the kimi/grok lanes.
-//
-// This file is NOT YET WIRED INTO bridge.js. It is staged here for review and
-// dropped into the live bridge during Phase E cutover (see PLAN.md).
+// bridge-opencode.js - OpenCode subprocess runner for OpenRouter profiles.
 //
 // Drop-in shape: runOpenCode(prompt, sessionId, options) -> Promise<{
 //   text, sessionId, cost, turns, duration, usage, isError
 // }>
 // Same output shape as runCodex() in bridge.js, so runBackend() can route
-// kimi/grok through this with no changes to downstream Telegram-reply code.
+// OpenRouter profiles through this with no changes to downstream Telegram-reply code.
 //
 // Key differences from runCodex:
 //   - Spawns `opencode run --format json` instead of `codex exec --json`
@@ -16,8 +13,8 @@
 //   - Reasoning effort via `--variant high|max|minimal` instead of -c flags
 //   - OPENCODE_CONFIG env var points at our staged opencode.json (with MCPs)
 //   - Reasoning event arrives buffered at end of reasoning phase — same idle-
-//     timeout risk class as Codex; bridge MUST keep the 900s idle bump for
-//     kimi/grok to survive xhigh-effort reasoning windows.
+//     timeout risk class as Codex; bridge keeps the idle bump for long
+//     OpenRouter-profile reasoning windows.
 
 const { spawn } = require('child_process');
 const path = require('path');
@@ -39,16 +36,16 @@ const OPENCODE_VARIANT = {
   minimal: 'minimal',
 };
 
-// runOpenCode — drop-in replacement for runCodex when backend is kimi or grok.
+// runOpenCode - drop-in runner for OpenRouter-profile turns.
 //
 // args:
 //   prompt    — string, user message + injected context
 //   sessionId — string|null, opencode session id to resume; null = fresh
 //   options   — {
-//     model:        'openrouter/moonshotai/kimi-k2.6' or 'openrouter/x-ai/grok-4.3'
+//     model:        any OpenRouter model id with openrouter/ prefix
 //     effort:       low|medium|high|xhigh|max
 //     timeout:      seconds (wall-clock); bridge passes 7200
-//     idleTimeout:  seconds (no-stdout); bridge passes 900 for kimi/grok
+//     idleTimeout:  seconds (no-stdout); bridge passes 900 for profile turns
 //     workspace:    cwd for the subprocess; defaults to process.cwd()
 //     log:          function(msg) for log output; defaults to console.log
 //     activeRefs:   { setSubprocess, setKillFn } — for /stop SIGTERM hook
@@ -83,8 +80,8 @@ function runOpenCode(prompt, sessionId, options = {}) {
     if (!cleanEnv.OPENROUTER_API_KEY && options.openRouterKey) {
       cleanEnv.OPENROUTER_API_KEY = options.openRouterKey;
     }
-    // Per-spawn config override (lets bridge route Grok to a trimmed MCP set
-    // because xAI enforces a 200-tool cap that the full 25-MCP set blows past).
+    // Per-spawn config override (lets bridge apply profile-specific provider
+    // routing and MCP trims when a provider needs them).
     const cfgPath = options.configPath || OPENCODE_CONFIG_PATH;
     if (fs.existsSync(cfgPath)) {
       cleanEnv.OPENCODE_CONFIG = cfgPath;

@@ -3,6 +3,20 @@
 
 
 
+## v2.1.0 — Reliable stop + OpenRouter profiles (final bridge release)
+
+> **Deprecation:** The Telegram bridge is deprecated as of 2026-06-15 (Claude Agent SDK / `claude -p` moves to metered credits). This is the final feature release. Existing installs keep working; no further development is planned.
+
+### What's new
+- **Reliable `/stop`.** Tree-kills the active task so a wedged `claude` (plus its MCP child processes) or a hung cron command actually dies, instead of orphaning children when only the parent was signalled. Previously `/stop` could report success while the real work kept running.
+- **Robust command matching.** `/stop` and `/restart` now normalize casing, trailing whitespace, and the `@botname` suffix, so `/stop@YourBot` and `/STOP ` both work.
+- **Out-of-band kill switches.** When the bot is network-deaf and can't receive a Telegram command, stop the active task without a full restart via `kill -USR2 $(cat bridge.pid)` or `touch <bridge-dir>/STOP`. Both clear the queue and notify the primary chat.
+- **Cleaner stop.** `/stop` now also clears pending debounce timers so a buffered message can't spawn a new task right after a stop. Shutdown tree-kills the active child so detached work doesn't orphan on restart.
+- **OpenRouter profiles.** Generalized the Kimi/Grok backends into named OpenRouter profiles (`/or list`, `/or profile <name>`, `/or set`, `/or providers`), with convenience aliases `/kimi`, `/minimax`, `/grok`, and per-profile MCP tool-pack support.
+
+### Fixed
+- A received `/stop` no longer leaves orphaned `node`/MCP processes from `bash -lc "..."` cron commands.
+
 ## v1.10.4 — Agent-driven update flow
 
 Adds a conversational upgrade path: the agent inside your install can detect newer releases, walk you through the changes, and merge selectively without ever overwriting your custom files.

@@ -14,6 +14,8 @@ const { spawn, execSync } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const { runOpenCode } = require('./bridge-opencode');
+const OpenRouterProfiles = require('./openrouter-profiles');
+const Stats = require('./stats-format');
 
 // ============================================================
 // CONFIG & STATE
@@ -70,14 +72,17 @@ let state = {
   codexSessionDates: {},// { chatId: "YYYY-MM-DD" } — day bound for Codex sessions
   kimiSessions: {},     // { chatId: string } — Kimi/OpenRouter Codex thread IDs
   kimiSessionDates: {}, // { chatId: "YYYY-MM-DD" } — day bound for Kimi threads
-  grokSessions: {},     // { chatId: string } — Grok/OpenRouter Codex thread IDs
-  grokSessionDates: {}, // { chatId: "YYYY-MM-DD" } — day bound for Grok threads
-  recentlyClearedSessions: {}, // { chatId: { claude?, codex?, kimi?, grok?: thread/session ID } }
+  minimaxSessions: {},     // { chatId: string } — MiniMax/OpenRouter session IDs
+  minimaxSessionDates: {}, // { chatId: "YYYY-MM-DD" } — day bound for MiniMax sessions
+  openrouterSessions: {},     // { chatId: string } — active generic OpenRouter/OpenCode session IDs
+  openrouterSessionDates: {}, // { chatId: "YYYY-MM-DD" } — day bound for generic OpenRouter sessions
+  openRouterSessionProfiles: {}, // { chatId: profileName } — profile bound to the active OpenRouter session
+  recentlyClearedSessions: {}, // { chatId: { claude?, codex?, kimi?, minimax?, openrouter?: thread/session ID } }
                                 // — last cleared ID per backend, used as gap-transcript
                                 //   fallback when current session is null (e.g., after
                                 //   broken-session recovery wiped the thread but we still
                                 //   want to recover the old rollout's events).
-  backends: {},         // { chatId: "claude" | "codex" | "kimi" | "grok" }
+  backends: {},         // { chatId: "claude" | "codex" | "kimi" | "minimax" | "openrouter" }
   pendingTransfer: {},  // { chatId: {from, to, context?} } — one-shot flag to inject cross-backend context on next message
   sessionStartRanToday: '',  // YYYY-MM-DD — set once SESSION START ran today on either backend; implicitly cleared when day rolls (5 AM ET anchor)
   arrivedAt: {},        // { chatId: { claude: ISO, codex: ISO } } — when the user most recently arrived at each backend; gap-transcript boundary
@@ -94,8 +99,11 @@ if (fs.existsSync(STATE_PATH)) {
     if (!state.codexSessionDates) state.codexSessionDates = {};
     if (!state.kimiSessions) state.kimiSessions = {};
     if (!state.kimiSessionDates) state.kimiSessionDates = {};
-    if (!state.grokSessions) state.grokSessions = {};
-    if (!state.grokSessionDates) state.grokSessionDates = {};
+    if (!state.minimaxSessions) state.minimaxSessions = {};
+    if (!state.minimaxSessionDates) state.minimaxSessionDates = {};
+    if (!state.openrouterSessions) state.openrouterSessions = {};
+    if (!state.openrouterSessionDates) state.openrouterSessionDates = {};
+    if (!state.openRouterSessionProfiles) state.openRouterSessionProfiles = {};
     if (!state.recentlyClearedSessions) state.recentlyClearedSessions = {};
     if (!state.backends) state.backends = {};
     if (!state.pendingTransfer) state.pendingTransfer = {};
@@ -116,11 +124,14 @@ if (fs.existsSync(STATE_PATH)) {
     for (const [cid, tid] of Object.entries(state.kimiSessions)) {
       if (tid && !state.kimiSessionDates[cid]) state.kimiSessionDates[cid] = today;
     }
-    for (const [cid, tid] of Object.entries(state.grokSessions)) {
-      if (tid && !state.grokSessionDates[cid]) state.grokSessionDates[cid] = today;
+    for (const [cid, tid] of Object.entries(state.minimaxSessions)) {
+      if (tid && !state.minimaxSessionDates[cid]) state.minimaxSessionDates[cid] = today;
+    }
+    for (const [cid, tid] of Object.entries(state.openrouterSessions)) {
+      if (tid && !state.openrouterSessionDates[cid]) state.openrouterSessionDates[cid] = today;
     }
     // Post-OpenCode-cutover (May 6, 2026): purge legacy Codex thread IDs that
-    // pre-date the kimi/grok migration to OpenCode. OpenCode session IDs are
+    // pre-date the kimi/minimax migration to OpenCode. OpenCode session IDs are
     // 'ses_...' format; legacy Codex thread IDs are UUIDs. Resuming a Codex
     // thread ID through OpenCode would error, so drop them on first load.
     for (const [cid, tid] of Object.entries(state.kimiSessions)) {
@@ -129,10 +140,17 @@ if (fs.existsSync(STATE_PATH)) {
         delete state.kimiSessionDates[cid];
       }
     }
-    for (const [cid, tid] of Object.entries(state.grokSessions)) {
+    for (const [cid, tid] of Object.entries(state.minimaxSessions)) {
       if (tid && !String(tid).startsWith('ses_')) {
-        delete state.grokSessions[cid];
-        delete state.grokSessionDates[cid];
+        delete state.minimaxSessions[cid];
+        delete state.minimaxSessionDates[cid];
+      }
+    }
+    for (const [cid, tid] of Object.entries(state.openrouterSessions)) {
+      if (tid && !String(tid).startsWith('ses_')) {
+        delete state.openrouterSessions[cid];
+        delete state.openrouterSessionDates[cid];
+        delete state.openRouterSessionProfiles[cid];
       }
     }
     // Restore persisted chat settings (model choices survive restart)
@@ -178,21 +196,25 @@ function getSessionStores(kind) {
   if (kind === 'kimi') {
     return { ids: state.kimiSessions, dates: state.kimiSessionDates, label: 'Kimi thread' };
   }
-  if (kind === 'grok') {
-    return { ids: state.grokSessions, dates: state.grokSessionDates, label: 'Grok thread' };
+  if (kind === 'minimax') {
+    return { ids: state.minimaxSessions, dates: state.minimaxSessionDates, label: 'MiniMax thread' };
+  }
+  if (kind === 'openrouter') {
+    return { ids: state.openrouterSessions, dates: state.openrouterSessionDates, label: 'OpenRouter session' };
   }
   return { ids: state.sessions, dates: state.sessionDates, label: 'Claude session' };
 }
 
 function isCodexFamilyBackend(backend) {
-  return backend === 'codex' || backend === 'kimi' || backend === 'grok';
+  return backend === 'codex' || backend === 'kimi' || backend === 'minimax' || backend === 'openrouter';
 }
 
 function backendLabel(backend) {
   if (backend === 'claude') return 'Claude';
   if (backend === 'codex') return 'Codex';
   if (backend === 'kimi') return 'Kimi';
-  if (backend === 'grok') return 'Grok';
+  if (backend === 'minimax') return 'MiniMax';
+  if (backend === 'openrouter') return 'OpenRouter';
   return backend || 'Unknown';
 }
 
@@ -212,9 +234,10 @@ function clearStoredSession(kind, chatId, reason = '') {
   }
   delete ids[key];
   delete dates[key];
+  if (kind === 'openrouter') delete state.openRouterSessionProfiles[key];
   // NOTE: do NOT clear arrivedAt here. Broken-session recovery and same-day rollover
   // both call this function, and they should preserve the user's arrival boundary
-  // (the time they typed /grok, /kimi, etc.) so the next gap transcript captures
+  // (the time they typed /minimax, /kimi, etc.) so the next gap transcript captures
   // the FULL backend session, not just the post-recovery sliver. Explicit cold
   // starts (session-audit cron, /reset, /fresh) call clearBackendArrival directly
   // where the reset is actually wanted.
@@ -310,6 +333,15 @@ function setBackend(chatId, backend, transfer = undefined) {
 // Checkpoint enforcement: track exchanges per session
 const CHECKPOINT_THRESHOLD = 8;
 const MEMORY_DIR = path.join(WORKSPACE, 'memory');
+const CHECKPOINT_HEADER_RE = /^##\s+(?:\d{1,2}:\d{2}\s+)?Checkpoint\b/gim;
+function countCheckpointHeaders() {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+    const txt = fs.readFileSync(path.join(MEMORY_DIR, `${today}.md`), 'utf8');
+    const m = txt.match(CHECKPOINT_HEADER_RE);
+    return m ? m.length : 0;
+  } catch { return 0; }
+}
 
 // Write PID file for restart script
 fs.writeFileSync(PID_PATH, String(process.pid));
@@ -407,20 +439,134 @@ const KIMI_DISPLAY = 'Kimi K2.6 via OpenCode + OpenRouter';
 // reaches the threshold for the active model, the next user message triggers
 // pre-compaction checkpoint + summarization + new session bootstrap.
 // Verified context windows (May 7 2026 via OpenRouter API):
-//   moonshotai/kimi-k2.6:  262_144 ctx → 180k threshold (~68%)
-//   x-ai/grok-4.3:       1_000_000 ctx → 350k threshold (~35%)
+//   moonshotai/kimi-k2.6:  262,144 ctx → 210k threshold (~80%)
+//   minimax/minimax-m2.7:  197,000 ctx → 160k threshold (~81%)
 const MODEL_COMPACTION_THRESHOLDS = {
-  'openrouter/moonshotai/kimi-k2.6': 180_000,
-  'openrouter/x-ai/grok-4.3':         350_000,
+  'openrouter/moonshotai/kimi-k2.6': 210_000,
+  'openrouter/minimax/minimax-m2.7': 160_000,
 };
-const GROK_MODEL = 'x-ai/grok-4.3';
-const GROK_DISPLAY = 'Grok 4.3 via OpenCode + OpenRouter';
+
+// Per-backend compaction thresholds (total context tokens: input + cache + output).
+// Triggers a Haiku-based summarization on the next turn after threshold breach.
+//   claude: 1M Opus 4.8  → 350k threshold (~35%)
+//   codex:  400k CLI cap  → 250k (under 272k pricing breakpoint, stays in 1x tier)
+const BACKEND_COMPACTION_THRESHOLDS = {
+  claude: 350_000,
+  codex:  250_000,
+};
+const MINIMAX_MODEL = 'minimax/minimax-m2.7';
+const MINIMAX_DISPLAY = 'MiniMax M2.7 via OpenCode + OpenRouter';
 const OPENROUTER_PROVIDER = {
   name: 'openrouter',
   baseUrl: 'https://openrouter.ai/api/v1',
   envKey: 'OPENROUTER_API_KEY',
 };
+const OPENROUTER_DEFAULT_PROFILE = config.defaultOpenRouterProfile || 'kimi';
+const OPENROUTER_PROFILE_CONFIG_DIR = path.join(HOME_DIR, '.claude', 'telegram-bridge', 'opencode-profiles');
+const OPENCODE_WHET_CONFIG_DIR = path.join(HOME_DIR, '.claude', 'workspace', 'projects', 'opencode-migration');
+const OPENROUTER_TOOL_PACK_CONFIGS = {
+  core: path.join(OPENCODE_WHET_CONFIG_DIR, 'opencode.json'),
+  browser: path.join(OPENCODE_WHET_CONFIG_DIR, 'opencode-packs', 'browser.json'),
+  'google-full': path.join(OPENCODE_WHET_CONFIG_DIR, 'opencode-packs', 'google-full.json'),
+  marketing: path.join(OPENCODE_WHET_CONFIG_DIR, 'opencode-packs', 'marketing.json'),
+  automation: path.join(OPENCODE_WHET_CONFIG_DIR, 'opencode-packs', 'automation.json'),
+  creative: path.join(OPENCODE_WHET_CONFIG_DIR, 'opencode-packs', 'creative.json'),
+  'legacy-research': path.join(OPENCODE_WHET_CONFIG_DIR, 'opencode-packs', 'legacy-research.json'),
+  full: path.join(OPENCODE_WHET_CONFIG_DIR, 'opencode-packs', 'full.json'),
+};
 const GAP_CAP_CHARS = 50000; // Hard cap on injected backend-switch gap transcript size; oldest events drop first if exceeded.
+
+function expandHomePath(p) {
+  if (!p) return p;
+  return String(p).replace(/^~(?=\/|\\|$)/, HOME_DIR);
+}
+
+function getOpenRouterProfilesConfig(settings = {}) {
+  return {
+    defaultOpenRouterProfile: settings.openRouterProfile || config.defaultOpenRouterProfile || OPENROUTER_DEFAULT_PROFILE,
+    openRouterProfiles: {
+      ...(config.openRouterProfiles || {}),
+      ...(settings.openRouterProfiles || {}),
+    },
+  };
+}
+
+function resolveActiveOpenRouterProfile(settings = {}) {
+  return OpenRouterProfiles.resolveOpenRouterProfile(
+    settings.openRouterProfile || config.defaultOpenRouterProfile || OPENROUTER_DEFAULT_PROFILE,
+    getOpenRouterProfilesConfig(settings)
+  );
+}
+
+function resolveNamedOpenRouterProfile(settings = {}, name = null) {
+  return OpenRouterProfiles.resolveOpenRouterProfile(
+    name || settings.openRouterProfile || config.defaultOpenRouterProfile || OPENROUTER_DEFAULT_PROFILE,
+    getOpenRouterProfilesConfig(settings)
+  );
+}
+
+function openRouterProfileDisplay(profile) {
+  return `${profile.display || profile.name} (${profile.model} via OpenRouter)`;
+}
+
+function normalizeOpenRouterToolPack(pack = 'core') {
+  const name = String(pack || 'core').trim().toLowerCase();
+  if (!OPENROUTER_TOOL_PACK_CONFIGS[name]) {
+    throw new Error(`Unknown tool pack "${pack}". Valid packs: ${Object.keys(OPENROUTER_TOOL_PACK_CONFIGS).join(', ')}`);
+  }
+  return name;
+}
+
+function openRouterConfigPathForProfile(profile) {
+  if (profile.configPath) return expandHomePath(profile.configPath);
+  if (!fs.existsSync(OPENROUTER_PROFILE_CONFIG_DIR)) {
+    fs.mkdirSync(OPENROUTER_PROFILE_CONFIG_DIR, { recursive: true });
+  }
+  const pack = normalizeOpenRouterToolPack(profile.toolPack || 'core');
+  const basePath = OPENROUTER_TOOL_PACK_CONFIGS[pack];
+  let cfg = {};
+  try {
+    if (fs.existsSync(basePath)) cfg = JSON.parse(fs.readFileSync(basePath, 'utf8'));
+  } catch (err) {
+    log(`OpenRouter profile config: failed reading ${basePath}: ${err.message}`);
+  }
+  cfg.provider = cfg.provider || {};
+  cfg.provider.openrouter = cfg.provider.openrouter || {};
+  cfg.provider.openrouter.models = cfg.provider.openrouter.models || {};
+  if (profile.provider && Object.keys(profile.provider).length > 0) {
+    cfg.provider.openrouter.models[profile.model] = {
+      ...(cfg.provider.openrouter.models[profile.model] || {}),
+      options: {
+        ...((cfg.provider.openrouter.models[profile.model] || {}).options || {}),
+        provider: profile.provider,
+      },
+    };
+  }
+  const outPath = path.join(OPENROUTER_PROFILE_CONFIG_DIR, `${profile.name}.json`);
+  try {
+    fs.writeFileSync(outPath, JSON.stringify(cfg, null, 2));
+    return outPath;
+  } catch (err) {
+    log(`OpenRouter profile config: failed writing ${outPath}: ${err.message}`);
+    return basePath;
+  }
+}
+
+function openRouterBackendNote(profile) {
+  return [
+    `# OPENROUTER BACKEND NOTE`,
+    `You are running through OpenCode CLI with the "${profile.name}" OpenRouter profile.`,
+    `Model: ${profile.model}.`,
+    `Tool pack: ${profile.toolPack || 'core'}.`,
+    'Use the normal NativeClaw tools and rules; OpenCode auto-loads MCPs and skills from the workspace.',
+  ].join('\n');
+}
+
+function openRouterThreshold(profile) {
+  if (Number.isFinite(Number(profile.compactionThreshold))) return Number(profile.compactionThreshold);
+  if (Number.isFinite(Number(profile.contextWindow))) return Math.floor(Number(profile.contextWindow) * 0.8);
+  return MODEL_COMPACTION_THRESHOLDS[profile.modelWithProvider] || 180_000;
+}
 
 // Files to inject as standing context on fresh Codex threads.
 // AGENTS.md is excluded because Codex auto-loads it from the workspace.
@@ -689,7 +835,7 @@ function extractCodexTranscriptExchanges(threadId, maxExchanges = 30, sinceISO =
 }
 
 // Extract filtered user/assistant exchanges from an OpenCode session (SQLite-backed).
-// Used for kimi/grok lanes after the May 6 2026 cutover. Reads ~/.local/share/opencode/opencode.db
+// Used for kimi/minimax lanes after the May 6 2026 cutover. Reads ~/.local/share/opencode/opencode.db
 // via sqlite3 CLI to avoid adding a node-sqlite dependency to the bridge.
 //
 // Schema (OpenCode 1.14.39, verified May 2026):
@@ -736,7 +882,8 @@ function extractOpenCodeTranscriptExchanges(sessionId, maxExchanges = 30, sinceI
         text.startsWith('<environment') ||
         text.startsWith('# AGENTS.md instructions') ||
         text.startsWith('# KIMI BACKEND') ||
-        text.startsWith('# GROK BACKEND') ||
+        text.startsWith('# MINIMAX BACKEND') ||
+        text.startsWith('# OPENROUTER BACKEND') ||
         text.startsWith('# STANDING CONTEXT') ||
         text.startsWith('# CONVERSATION RECAP') ||
         text.startsWith('# HANDOFF BRIEF')
@@ -797,11 +944,11 @@ function buildGapTranscript(sourceBackend, sessionKey, sinceISO, targetBackend =
   if (!sessionId) return '';
 
   // Dispatch by source backend:
-  //   kimi/grok → OpenCode SQLite reader (post-May-6-2026 cutover)
+  //   openrouter/kimi/minimax → OpenCode SQLite reader (post-May-6-2026 cutover)
   //   codex     → Codex thread JSONL reader
   //   claude    → Claude session transcript reader
   let exchanges;
-  if (sourceBackend === 'kimi' || sourceBackend === 'grok') {
+  if (sourceBackend === 'openrouter' || sourceBackend === 'kimi' || sourceBackend === 'minimax') {
     exchanges = extractOpenCodeTranscriptExchanges(sessionId, 9999, sinceISO);
   } else if (isCodexFamilyBackend(sourceBackend)) {
     exchanges = extractCodexTranscriptExchanges(sessionId, 9999, sinceISO);
@@ -1143,7 +1290,7 @@ async function transcribeVoice(audioPath) {
      // Hard wall-clock timeout — catches stalled response bodies that fool the socket idle check
      const hardTimer = setTimeout(() => {
        req.destroy();
-       done(reject, new Error('Grok STT API timeout (45s hard limit)'));
+       done(reject, new Error('xAI STT API timeout (45s hard limit)'));
      }, 45000);
 
      const req = https.request(options, (res) => {
@@ -1155,10 +1302,10 @@ async function transcribeVoice(audioPath) {
            if (result.text) {
              done(resolve, result.text.trim());
            } else {
-             done(reject, new Error(result.error?.message || result.error || 'No transcript in Grok STT response'));
+             done(reject, new Error(result.error?.message || result.error || 'No transcript in xAI STT response'));
            }
          } catch (e) {
-           done(reject, new Error(`Failed to parse Grok STT response: ${data}`));
+           done(reject, new Error(`Failed to parse xAI STT response: ${data}`));
          }
        });
        res.on('error', err => done(reject, err));
@@ -1231,6 +1378,133 @@ function extractFullResponseFromSession(sessionId) {
     return textBlocks.join('\n\n');
   } catch (err) {
     log(`extractFullResponseFromSession error: ${err.message}`);
+    return null;
+  }
+}
+
+// Read the last assistant entry's message.usage from session JSONL.
+// `claude -p` result.usage is SUMMED across internal sub-turns when tool use happens
+// (num_turns > 1), which makes cache_read balloon to many multiples of the actual
+// context size. The session JSONL stores per-message usage — the last assistant
+// message is the true snapshot of current context window utilization.
+// Extract user + assistant text content from a Claude session JSONL for compaction summarization.
+// Returns array of {role, text} entries, capped at last N items to keep summary call cheap.
+function extractClaudeMessagesForSummary(sessionId, maxItems = 200) {
+  if (!sessionId) return [];
+  try {
+    const transcriptPath = path.join(toClaudeProjectDir(WORKSPACE), `${sessionId}.jsonl`);
+    if (!fs.existsSync(transcriptPath)) return [];
+    const items = [];
+    for (const line of fs.readFileSync(transcriptPath, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const e = JSON.parse(line);
+        if (e.type === 'user' && !e.isCompactSummary && typeof e.message?.content === 'string') {
+          items.push({ role: 'USER', text: e.message.content.slice(0, 800) });
+        } else if (e.type === 'assistant' && Array.isArray(e.message?.content)) {
+          for (const c of e.message.content) {
+            if (c.type === 'text' && c.text && c.text.trim()) {
+              items.push({ role: 'ASSISTANT', text: c.text.slice(0, 800) });
+            }
+          }
+        }
+      } catch {}
+    }
+    return items.slice(-maxItems);
+  } catch (err) {
+    log(`extractClaudeMessagesForSummary error: ${err.message}`);
+    return [];
+  }
+}
+
+// Extract user + agent text from a Codex rollout JSONL for compaction summarization.
+function extractCodexMessagesForSummary(threadId, maxItems = 200) {
+  if (!threadId) return [];
+  try {
+    const rolloutPath = findCodexRollout(threadId);
+    if (!rolloutPath || !fs.existsSync(rolloutPath)) return [];
+    const items = [];
+    for (const line of fs.readFileSync(rolloutPath, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const e = JSON.parse(line);
+        if (e.type === 'user_message' && typeof e.text === 'string') {
+          items.push({ role: 'USER', text: e.text.slice(0, 800) });
+        } else if (e.type === 'agent_message' && typeof e.text === 'string') {
+          items.push({ role: 'ASSISTANT', text: e.text.slice(0, 800) });
+        } else if (e.type === 'item.completed' && e.item?.type === 'agent_message' && e.item.text) {
+          items.push({ role: 'ASSISTANT', text: e.item.text.slice(0, 800) });
+        }
+      } catch {}
+    }
+    return items.slice(-maxItems);
+  } catch (err) {
+    log(`extractCodexMessagesForSummary error: ${err.message}`);
+    return [];
+  }
+}
+
+// Spawn a quick Haiku call to summarize a list of {role, text} items.
+// Returns the summary string or null on failure. Used for Claude AND Codex compaction.
+function runHaikuSummary(items, contextLabel = 'session') {
+  if (!items || items.length < 4) return Promise.resolve(null);
+  const text = items.map(i => `${i.role}: ${i.text}`).join('\n');
+  const prompt = `Summarize this ${contextLabel} into 3-4 paragraphs. Focus on: key decisions made, open questions, current state of ongoing tasks/builds, important context the next session must know. Be factual and concise. Skip pleasantries.\n\nCONVERSATION:\n${text}`;
+  return new Promise((resolve) => {
+    const proc = spawn('claude', [
+      '-p', prompt,
+      '--output-format', 'json',
+      '--dangerously-skip-permissions',
+      '--model', 'claude-haiku-4-5',
+      '--max-turns', '1',
+    ], {
+      env: { ...process.env, ...nativeClawEnv() },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let stdout = '';
+    proc.stdout.on('data', d => { stdout += d.toString(); });
+    const timer = setTimeout(() => { try { proc.kill('SIGTERM'); } catch {} }, 90_000);
+    proc.on('close', () => {
+      clearTimeout(timer);
+      try {
+        const lines = stdout.trim().split('\n');
+        for (let i = lines.length - 1; i >= 0; i--) {
+          try {
+            const parsed = JSON.parse(lines[i]);
+            if (parsed.type === 'result' && parsed.result) return resolve(parsed.result);
+          } catch {}
+        }
+        resolve(null);
+      } catch { resolve(null); }
+    });
+    proc.on('error', () => { clearTimeout(timer); resolve(null); });
+  });
+}
+
+function extractLastUsageFromSession(sessionId) {
+  if (!sessionId) return null;
+  try {
+    const transcriptDir = toClaudeProjectDir(WORKSPACE);
+    const transcriptPath = path.join(transcriptDir, `${sessionId}.jsonl`);
+    if (!fs.existsSync(transcriptPath)) return null;
+
+    const lines = fs.readFileSync(transcriptPath, 'utf8').trim().split('\n');
+    for (let i = lines.length - 1; i >= 0; i--) {
+      try {
+        const entry = JSON.parse(lines[i]);
+        const u = entry.type === 'assistant' && entry.message && entry.message.usage;
+        if (u && (u.input_tokens != null || u.cache_read_input_tokens != null)) {
+          return {
+            inputTokens: (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0),
+            outputTokens: u.output_tokens || 0,
+            cachedInputTokens: u.cache_read_input_tokens || 0,
+          };
+        }
+      } catch {}
+    }
+    return null;
+  } catch (err) {
+    log(`extractLastUsageFromSession error: ${err.message}`);
     return null;
   }
 }
@@ -1335,10 +1609,18 @@ function runClaude(prompt, sessionId, options = {}) {
       cwd: cwd,
       env: cleanEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true, // own process group → tree-kill via negative PID cascades to MCP children
     });
 
+    // Tree-kill helper: signal the whole process group so a wedged claude AND its MCP
+    // subprocesses die, instead of orphaning children when only the parent is signalled.
+    const killTree = (signal) => {
+      try { process.kill(-proc.pid, signal); }
+      catch { try { proc.kill(signal); } catch { /* gone */ } }
+    };
+
     activeSubprocess = proc;
-    activeKillFn = (sig) => proc.kill(sig);
+    activeKillFn = killTree;
 
     let stdout = '';
     let stderr = '';
@@ -1349,9 +1631,9 @@ function runClaude(prompt, sessionId, options = {}) {
     // Timeout safety net
     const timeoutMs = (options.timeout || 300) * 1000;
     const timer = setTimeout(() => {
-      log(`Claude subprocess timed out after ${timeoutMs}ms, killing...`);
-      proc.kill('SIGTERM');
-      setTimeout(() => proc.kill('SIGKILL'), 5000);
+      log(`Claude subprocess timed out after ${timeoutMs}ms, killing tree...`);
+      killTree('SIGTERM');
+      setTimeout(() => killTree('SIGKILL'), 5000);
     }, timeoutMs);
 
     proc.on('close', (code) => {
@@ -1396,6 +1678,23 @@ function runClaude(prompt, sessionId, options = {}) {
         const fullText = sid ? extractFullResponseFromSession(sid) : null;
         const responseText = fullText || result.result || result.message || '';
 
+        // Pull usage from session JSONL's last assistant entry (true per-message snapshot).
+        // Fallback to result.usage / num_turns if JSONL unavailable, since result.usage is
+        // summed across internal sub-turns when tool use happens (num_turns > 1).
+        const sessUsage = sid ? extractLastUsageFromSession(sid) : null;
+        let usage;
+        if (sessUsage) {
+          usage = sessUsage;
+        } else {
+          const u = result.usage || {};
+          const turns = Math.max(1, result.num_turns || 1);
+          usage = {
+            inputTokens: Math.round(((u.input_tokens || 0) + (u.cache_creation_input_tokens || 0)) / turns),
+            outputTokens: Math.round((u.output_tokens || 0) / turns),
+            cachedInputTokens: Math.round((u.cache_read_input_tokens || 0) / turns),
+          };
+        }
+
         resolve({
           text: responseText,
           sessionId: sid,
@@ -1403,6 +1702,7 @@ function runClaude(prompt, sessionId, options = {}) {
           turns: result.num_turns || 0,
           duration: result.duration_ms || 0,
           isError: result.is_error || false,
+          usage,
         });
       } catch (e) {
         resolve({ text: stdout.trim(), sessionId: null, cost: 0, turns: 0 });
@@ -1419,8 +1719,8 @@ function runClaude(prompt, sessionId, options = {}) {
 // Codex thread rollover thresholds — relaxed so a single daily thread survives
 // normal use. Safety valve only, not normal flow. Failure case (Apr 18 2026):
 // 1.65MB / 771-entry rollout caused Codex to stall silently.
-const CODEX_ROLLOVER_BYTES = 1536 * 1024;
-const CODEX_ROLLOVER_ENTRIES = 250;
+const CODEX_ROLLOVER_BYTES = 8 * 1024 * 1024;
+const CODEX_ROLLOVER_ENTRIES = 2000;
 
 function findCodexRollout(threadId) {
   if (!threadId) return null;
@@ -1451,16 +1751,54 @@ function shouldRolloverCodex(threadId) {
   if (!filePath) return { rollover: false, reason: 'rollout file not found', missing: true };
   try {
     const stat = fs.statSync(filePath);
+    const entries = fs.readFileSync(filePath, 'utf8').split('\n').filter(l => l.trim()).length;
+    const snapshot = readCodexLatestTokenSnapshot(threadId);
+    const actualFilled = contextTokensFromUsage(snapshot?.usage, 'codex');
+    const threshold = BACKEND_COMPACTION_THRESHOLDS.codex;
+    if (actualFilled > 0 && threshold && actualFilled < threshold) {
+      return { rollover: false, size: stat.size, entries, actualFilled, path: filePath };
+    }
     if (stat.size > CODEX_ROLLOVER_BYTES) {
       return { rollover: true, reason: `size=${stat.size}B > ${CODEX_ROLLOVER_BYTES}B`, path: filePath };
     }
-    const entries = fs.readFileSync(filePath, 'utf8').split('\n').filter(l => l.trim()).length;
     if (entries > CODEX_ROLLOVER_ENTRIES) {
       return { rollover: true, reason: `entries=${entries} > ${CODEX_ROLLOVER_ENTRIES}`, path: filePath };
     }
-    return { rollover: false, size: stat.size, entries, path: filePath };
+    return { rollover: false, size: stat.size, entries, actualFilled, path: filePath };
   } catch (err) {
     return { rollover: true, reason: `stat error: ${err.message}` };
+  }
+}
+
+function normalizeCodexTokenInfo(info) {
+  return Stats.normalizeCodexTokenInfo(info);
+}
+
+function readCodexLatestTokenSnapshot(threadId) {
+  const filePath = findCodexRollout(threadId);
+  if (!filePath || !fs.existsSync(filePath)) return null;
+  try {
+    let usage = null;
+    let contextWindow = null;
+    for (const line of fs.readFileSync(filePath, 'utf8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const ev = JSON.parse(line);
+        if (ev.type === 'event_msg' && ev.payload?.type === 'task_started' && typeof ev.payload.model_context_window === 'number') {
+          contextWindow = ev.payload.model_context_window;
+        }
+        if (ev.type === 'event_msg' && ev.payload?.type === 'token_count' && ev.payload.info) {
+          usage = normalizeCodexTokenInfo(ev.payload.info) || usage;
+          if (typeof ev.payload.info.model_context_window === 'number') {
+            contextWindow = ev.payload.info.model_context_window;
+          }
+        }
+      } catch {}
+    }
+    return usage || contextWindow ? { usage, contextWindow } : null;
+  } catch (err) {
+    log(`readCodexLatestTokenSnapshot error: ${err.message}`);
+    return null;
   }
 }
 
@@ -1588,9 +1926,18 @@ function runCodex(prompt, threadId, options = {}) {
       let inputTokens = 0;
       let outputTokens = 0;
       let cachedInputTokens = 0;
+      let reasoningTokens = 0;
+      let contextTokens = 0;
+      let totalInputTokens = 0;
+      let totalOutputTokens = 0;
+      let totalCachedInputTokens = 0;
+      let totalReasoningTokens = 0;
+      let totalTokens = 0;
+      let contextWindow = 0;
       let turns = 0;
       let latestAgentText = '';
       let errorMsg = null;
+      let sawTokenCountInfo = false;
 
       for (const line of stdout.split('\n')) {
         const trimmed = line.trim();
@@ -1598,6 +1945,45 @@ function runCodex(prompt, threadId, options = {}) {
         try {
           const ev = JSON.parse(trimmed);
           switch (ev.type) {
+            case 'event_msg': {
+              const payload = ev.payload || {};
+              if (payload.type === 'task_started') {
+                if (turns === 0) turns = 1;
+                if (typeof payload.model_context_window === 'number') {
+                  contextWindow = payload.model_context_window;
+                }
+              } else if (payload.type === 'agent_message' && typeof payload.message === 'string') {
+                latestAgentText = payload.message;
+              } else if (payload.type === 'token_count' && payload.info) {
+                const normalized = normalizeCodexTokenInfo(payload.info);
+                if (normalized) {
+                  sawTokenCountInfo = true;
+                  inputTokens = normalized.inputTokens;
+                  outputTokens = normalized.outputTokens;
+                  cachedInputTokens = normalized.cachedInputTokens;
+                  reasoningTokens = normalized.reasoningTokens;
+                  contextTokens = normalized.contextTokens;
+                  totalInputTokens = normalized.totalInputTokens;
+                  totalOutputTokens = normalized.totalOutputTokens;
+                  totalCachedInputTokens = normalized.totalCachedInputTokens;
+                  totalReasoningTokens = normalized.totalReasoningTokens;
+                  totalTokens = normalized.totalTokens;
+                }
+                if (typeof payload.info.model_context_window === 'number') {
+                  contextWindow = payload.info.model_context_window;
+                }
+              }
+              break;
+            }
+            case 'response_item':
+              if (ev.payload?.type === 'message' && ev.payload.role === 'assistant' && Array.isArray(ev.payload.content)) {
+                const text = ev.payload.content
+                  .map(c => c.type === 'output_text' || c.type === 'text' ? c.text || '' : '')
+                  .join('')
+                  .trim();
+                if (text) latestAgentText = text;
+              }
+              break;
             case 'thread.started':
               outThreadId = ev.thread_id || null;
               break;
@@ -1610,12 +1996,14 @@ function runCodex(prompt, threadId, options = {}) {
               }
               break;
             case 'turn.completed':
-              if (ev.usage) {
-                // Use = not += — resume sessions emit cumulative per-turn history;
-                // last turn's usage reflects only the new response, not all prior context.
+              if (ev.usage && !sawTokenCountInfo) {
+                // Use this only as fallback. Codex token_count.info exposes both
+                // current context and command totals; turn.completed can be cumulative.
                 inputTokens = ev.usage.input_tokens || 0;
                 outputTokens = ev.usage.output_tokens || 0;
                 cachedInputTokens = ev.usage.cached_input_tokens || 0;
+                reasoningTokens = ev.usage.reasoning_output_tokens || 0;
+                contextTokens = ev.usage.total_tokens || (inputTokens + outputTokens + cachedInputTokens);
               }
               break;
             case 'error':
@@ -1638,7 +2026,19 @@ function runCodex(prompt, threadId, options = {}) {
         cost: 0,
         turns: turns,
         duration: Date.now() - startTime,
-        usage: { inputTokens, outputTokens, cachedInputTokens },
+        contextWindow,
+        usage: {
+          inputTokens,
+          outputTokens,
+          cachedInputTokens,
+          reasoningTokens,
+          contextTokens,
+          totalInputTokens,
+          totalOutputTokens,
+          totalCachedInputTokens,
+          totalReasoningTokens,
+          totalTokens,
+        },
         isError: !!errorMsg,
       });
     });
@@ -1680,9 +2080,9 @@ function getMessagesForSummarization(sessionId, keepLast = 10) {
 
 async function runOpenCodeCompaction(backend, sessionKey, currentSessionId, ocOptions) {
   const chatId = String(sessionKey);
-  const ocModel = backend === 'kimi'
+  const ocModel = ocOptions.model || (backend === 'kimi'
     ? 'openrouter/moonshotai/kimi-k2.6'
-    : 'openrouter/x-ai/grok-4.3';
+    : 'openrouter/minimax/minimax-m2.7');
 
   // Send Telegram "compacting" notice
   try {
@@ -1813,22 +2213,34 @@ async function runOpenCodeCompaction(backend, sessionKey, currentSessionId, ocOp
 // Dispatcher — picks the backend runner, builds backend-specific context,
 // and threads through session state.
 async function runBackend(backend, prompt, options, sessionKey) {
-  // OpenCode path (kimi, grok via OpenRouter) — added 2026-05-06 cutover.
+  // OpenCode path (generic OpenRouter profiles; legacy kimi/minimax aliases preserved).
   // Preempts the codex-family branch below, which now serves only backend === 'codex'.
-  if (backend === 'kimi' || backend === 'grok') {
-    const ocModel = backend === 'kimi'
-      ? 'openrouter/moonshotai/kimi-k2.6'
-      : 'openrouter/x-ai/grok-4.3';
+  if (backend === 'openrouter' || backend === 'kimi' || backend === 'minimax') {
+    const settings = getSettings(sessionKey);
+    const profileName = backend === 'kimi' ? 'kimi' : backend === 'minimax' ? 'minimax' : settings.openRouterProfile;
+    const openRouterProfile = resolveNamedOpenRouterProfile(settings, profileName);
+    const ocModel = openRouterProfile.modelWithProvider;
+    const sessionKind = backend === 'openrouter' ? 'openrouter' : backend;
 
-    let ocSessionId = getStoredSessionId(backend, sessionKey);
+    let ocSessionId = getStoredSessionId(sessionKind, sessionKey);
     // Defensive: drop any non-OpenCode session ID. Legacy Codex thread IDs are
     // UUIDs; OpenCode session IDs are 'ses_...'. The startup purge handles the
     // initial migration; this catches any edge cases (e.g. mid-run state load).
     if (ocSessionId && !String(ocSessionId).startsWith('ses_')) {
       log(`Dropping non-OpenCode session ID for ${backend} (${ocSessionId})`);
-      clearStoredSession(backend, sessionKey, 'pre-OpenCode legacy ID');
+      clearStoredSession(sessionKind, sessionKey, 'pre-OpenCode legacy ID');
       saveState();
       ocSessionId = null;
+    }
+    if (sessionKind === 'openrouter') {
+      const boundProfile = state.openRouterSessionProfiles[sessionKey];
+      if (ocSessionId && boundProfile && boundProfile !== openRouterProfile.name) {
+        log(`OpenRouter profile changed for ${sessionKey}: ${boundProfile} → ${openRouterProfile.name}; starting fresh session`);
+        clearStoredSession('openrouter', sessionKey, `profile changed ${boundProfile} to ${openRouterProfile.name}`);
+        ocSessionId = null;
+      }
+      state.openRouterSessionProfiles[sessionKey] = openRouterProfile.name;
+      saveState();
     }
 
     // === COMPACTION CHECK ===
@@ -1844,12 +2256,8 @@ async function runBackend(backend, prompt, options, sessionKey) {
     let compactionRecap = null;
     if (state.compactionPending && state.compactionPending[sessionKey] && ocSessionId) {
       log(`COMPACTION TRIGGERED for ${backend} session ${ocSessionId} (chat ${sessionKey})`);
-      const ocModelForCompaction = backend === 'kimi'
-        ? 'openrouter/moonshotai/kimi-k2.6'
-        : 'openrouter/x-ai/grok-4.3';
-      const ocConfigPathForCompaction = backend === 'grok'
-        ? path.join(process.env.HOME, '.config/opencode/opencode.grok.json')
-        : path.join(process.env.HOME, '.config/opencode/opencode.json');
+      const ocModelForCompaction = ocModel;
+      const ocConfigPathForCompaction = openRouterConfigPathForProfile(openRouterProfile);
       const compactionResult = await runOpenCodeCompaction(backend, sessionKey, ocSessionId, {
         model: ocModelForCompaction,
         timeout: options.timeout || 7200,
@@ -1863,7 +2271,7 @@ async function runBackend(backend, prompt, options, sessionKey) {
       // Reset session and clear flag regardless of compaction outcome.
       // If compaction failed, we still want to start fresh next turn (no point
       // in continuing a session that just hit the limit).
-      clearStoredSession(backend, sessionKey, 'compaction reset');
+      clearStoredSession(sessionKind, sessionKey, 'compaction reset');
       state.sessionTokenTotals[sessionKey] = 0;
       state.compactionPending[sessionKey] = false;
       saveState();
@@ -1891,11 +2299,7 @@ async function runBackend(backend, prompt, options, sessionKey) {
       }
     }
     if (options.transferContext) ocContextParts.push(options.transferContext);
-    if (backend === 'kimi') {
-      ocContextParts.push('# KIMI BACKEND NOTE\nYou are running through OpenCode CLI with Kimi K2.6 via OpenRouter. Use the normal NativeClaw tools and rules; OpenCode auto-loads MCPs and skills from the workspace.');
-    } else {
-      ocContextParts.push('# GROK BACKEND NOTE\nYou are running through OpenCode CLI with Grok 4.3 via OpenRouter. Use the normal NativeClaw tools and rules; OpenCode auto-loads MCPs and skills from the workspace.');
-    }
+    ocContextParts.push(openRouterBackendNote(openRouterProfile));
     // If compaction just ran, prepend the structured recap so the new session
     // has continuity. Standing context (SOUL/USER/MEMORY/etc.) was already
     // injected fresh by the !ocSessionId branch above.
@@ -1907,12 +2311,7 @@ async function runBackend(backend, prompt, options, sessionKey) {
       ? `${ocContextParts.join('\n\n')}\n\n# USER MESSAGE\n\n${prompt}`
       : prompt;
 
-    // Per-backend OpenCode config: Grok hits xAI's 200-tool cap with the full
-    // 25-MCP set, so route Grok to a trimmed config. Kimi has no tool cap and
-    // uses the full set.
-    const ocConfigPath = backend === 'grok'
-      ? path.join(process.env.HOME, '.config/opencode/opencode.grok.json')
-      : path.join(process.env.HOME, '.config/opencode/opencode.json');
+    const ocConfigPath = openRouterConfigPathForProfile(openRouterProfile);
 
     const ocOptions = {
       model: ocModel,
@@ -1932,7 +2331,8 @@ async function runBackend(backend, prompt, options, sessionKey) {
     let ocResult = await runOpenCode(ocFinalPrompt, ocSessionId, ocOptions);
     // Persist returned session id for resume on next turn
     if (ocResult.sessionId && ocResult.sessionId !== ocSessionId) {
-      setStoredSessionId(backend, sessionKey, ocResult.sessionId);
+      setStoredSessionId(sessionKind, sessionKey, ocResult.sessionId);
+      if (sessionKind === 'openrouter') state.openRouterSessionProfiles[sessionKey] = openRouterProfile.name;
       saveState();
     }
     // === POST-TURN TOKEN TRACKING + THRESHOLD CHECK ===
@@ -1950,10 +2350,7 @@ async function runBackend(backend, prompt, options, sessionKey) {
         state.sessionTokenTotals[sessionKey] || 0,
         turnTotal
       );
-      const ocModelForCheck = backend === 'kimi'
-        ? 'openrouter/moonshotai/kimi-k2.6'
-        : 'openrouter/x-ai/grok-4.3';
-      const threshold = MODEL_COMPACTION_THRESHOLDS[ocModelForCheck];
+      const threshold = openRouterThreshold(openRouterProfile);
       if (threshold && state.sessionTokenTotals[sessionKey] >= threshold) {
         if (!state.compactionPending[sessionKey]) {
           log(`compaction-threshold reached for ${backend} ${sessionKey}: ${state.sessionTokenTotals[sessionKey]} >= ${threshold}; flagging next turn for compaction`);
@@ -1969,11 +2366,12 @@ async function runBackend(backend, prompt, options, sessionKey) {
         ? `same-day session ${ocSessionId} returned no agent response`
         : `fresh ${backendLabel(backend)} turn returned no agent response`;
       log(`${backendLabel(backend)} empty response for ${sessionKey}: ${reason}`);
-      clearStoredSession(backend, sessionKey, reason);
+      clearStoredSession(sessionKind, sessionKey, reason);
       saveState();
       ocResult = await runOpenCode(ocFinalPrompt, null, ocOptions);
       if (ocResult.sessionId) {
-        setStoredSessionId(backend, sessionKey, ocResult.sessionId);
+        setStoredSessionId(sessionKind, sessionKey, ocResult.sessionId);
+        if (sessionKind === 'openrouter') state.openRouterSessionProfiles[sessionKey] = openRouterProfile.name;
         saveState();
       }
       if (!ocResult.text) {
@@ -1986,8 +2384,8 @@ async function runBackend(backend, prompt, options, sessionKey) {
 
   if (isCodexFamilyBackend(backend)) {
     const sessionKind = backend;
-    const openRouterModel = backend === 'kimi' ? KIMI_MODEL : (backend === 'grok' ? GROK_MODEL : null);
-    const codexOptions = (backend === 'kimi' || backend === 'grok')
+    const openRouterModel = backend === 'kimi' ? KIMI_MODEL : (backend === 'minimax' ? MINIMAX_MODEL : null);
+    const codexOptions = (backend === 'kimi' || backend === 'minimax')
       ? {
           ...options,
           codexModel: openRouterModel,
@@ -2042,8 +2440,8 @@ async function runBackend(backend, prompt, options, sessionKey) {
       if (backend === 'kimi') {
         contextParts.push('# KIMI BACKEND NOTE\nYou are running through Codex CLI with Kimi K2.6 via OpenRouter. Use the normal NativeClaw tools and rules, answer directly, and avoid long hidden reasoning.');
       }
-      if (backend === 'grok') {
-        contextParts.push('# GROK BACKEND NOTE\nYou are running through Codex CLI with Grok 4.3 via OpenRouter. Use the normal NativeClaw tools and rules, answer directly, and avoid long hidden reasoning.');
+      if (backend === 'minimax') {
+        contextParts.push('# MINIMAX BACKEND NOTE\nYou are running through Codex CLI with MiniMax M2.7 via OpenRouter. Use the normal NativeClaw tools and rules, answer directly, and avoid long hidden reasoning.');
       }
 
       for (const note of extraNotes) {
@@ -2121,6 +2519,28 @@ function hasPendingTelegramWork() {
   return processingTelegram || telegramQueue.length > 0 || Object.keys(chatDebounceTimers).length > 0;
 }
 
+// Stop the currently-running task from any trigger (Telegram /stop, SIGUSR2, STOP sentinel file).
+// activeKillFn is backend-specific and now tree-kills everywhere, so a wedged claude/cron + its
+// child processes (MCP servers, orphaned node) actually die. Returns true if something was killed.
+function stopActiveTask(reason) {
+  // Clear any pending debounce timers so buffered chunks don't fire a new task right after a stop
+  for (const cid of Object.keys(chatDebounceTimers)) {
+    clearTimeout(chatDebounceTimers[cid]);
+    delete chatDebounceTimers[cid];
+  }
+  telegramQueue.length = 0;
+  if (activeSubprocess && activeKillFn) {
+    const pid = activeSubprocess.pid;
+    const killFn = activeKillFn; // capture before the close handler nulls it
+    log(`Stop requested (${reason}) — killing active subprocess tree (PID ${pid})`);
+    try { killFn('SIGTERM'); } catch (e) { log(`stop SIGTERM failed: ${e.message}`); }
+    setTimeout(() => { try { killFn('SIGKILL'); } catch { /* gone */ } }, 5000);
+    return true;
+  }
+  log(`Stop requested (${reason}) — nothing running`);
+  return false;
+}
+
 async function processTelegramQueue() {
   if (processingTelegram || telegramQueue.length === 0) return;
   processingTelegram = true;
@@ -2177,7 +2597,9 @@ async function processCronQueue() {
 // ============================================================
 
 const MODEL_ALIASES = {
-  'opus': 'claude-opus-4-7',
+  'opus': 'claude-opus-4-8',
+  'opus4.8': 'claude-opus-4-8',
+  'opus-4.8': 'claude-opus-4-8',
   'opus4.7': 'claude-opus-4-7',
   'opus-4.7': 'claude-opus-4-7',
   'opus4.6': 'opus',
@@ -2193,6 +2615,7 @@ const MODEL_ALIASES = {
 };
 
 const MODEL_DISPLAY = {
+  'claude-opus-4-8': 'Opus 4.8',
   'claude-opus-4-7': 'Opus 4.7',
   'opus': 'Opus 4.6',
   'sonnet': 'Sonnet 4.6',
@@ -2211,10 +2634,16 @@ const CODEX_REASONING_EFFORT = {
 
 function getSettings(chatId) {
   if (!chatSettings[chatId]) {
-    chatSettings[chatId] = { model: null, codexModel: null, effort: 'xhigh', codexVerbosity: null, thinking: false, lastResult: null };
+    chatSettings[chatId] = { model: null, codexModel: null, openRouterProfile: null, openRouterProfiles: {}, effort: 'xhigh', codexVerbosity: null, thinking: false, lastResult: null };
   }
   if (chatSettings[chatId].codexModel === undefined) {
     chatSettings[chatId].codexModel = null;
+  }
+  if (!chatSettings[chatId].openRouterProfile) {
+    chatSettings[chatId].openRouterProfile = config.defaultOpenRouterProfile || OPENROUTER_DEFAULT_PROFILE;
+  }
+  if (!chatSettings[chatId].openRouterProfiles || typeof chatSettings[chatId].openRouterProfiles !== 'object') {
+    chatSettings[chatId].openRouterProfiles = {};
   }
   if (!chatSettings[chatId].effort) {
     chatSettings[chatId].effort = chatSettings[chatId].thinking ? 'max' : 'xhigh';
@@ -2425,6 +2854,18 @@ function formatTrelloTodos(lists) {
   return out.join('\n').trim();
 }
 
+function formatTokenAmount(tokens) {
+  return Stats.formatTokenAmount(tokens);
+}
+
+function getContextWindow(model, backend, reportedWindow) {
+  return formatTokenAmount(Stats.getContextWindowTokens(model, backend, reportedWindow));
+}
+
+function contextTokensFromUsage(usage, backend) {
+  return Stats.contextTokensFromUsage(usage, backend);
+}
+
 function formatUsageReply(claude, codex, openrouter) {
   const lines = ['⚡ Usage', ''];
 
@@ -2462,10 +2903,10 @@ function formatUsageReply(claude, codex, openrouter) {
     if (rl.limit_reached) lines.push(`  ⚠️ Rate limit reached`);
   }
 
-  // OpenRouter section — covers Kimi + Grok backends (and any direct OpenRouter usage)
+  // OpenRouter section covers profile-backed models such as Kimi, MiniMax, Grok, and custom IDs.
   if (openrouter) {
     lines.push('');
-    lines.push('OpenRouter (NJDev — Kimi/Grok/etc.)');
+    lines.push('OpenRouter profiles');
     if (openrouter.error) {
       lines.push(`  ⚠️ ${openrouter.error}`);
     } else {
@@ -2478,6 +2919,54 @@ function formatUsageReply(claude, codex, openrouter) {
   }
 
   return lines.join('\n');
+}
+
+function formatOpenRouterProfileList(settings) {
+  const profiles = OpenRouterProfiles.listOpenRouterProfiles(getOpenRouterProfilesConfig(settings));
+  const current = settings.openRouterProfile || OPENROUTER_DEFAULT_PROFILE;
+  const lines = ['OpenRouter profiles:'];
+  for (const p of profiles) {
+    const marker = p.name === current ? '*' : ' ';
+    const providers = p.provider?.order?.length ? ` providers=${p.provider.order.join(',')}` : '';
+    const fallbacks = typeof p.provider?.allow_fallbacks === 'boolean' ? ` fallbacks=${p.provider.allow_fallbacks ? 'on' : 'off'}` : '';
+    const pack = ` pack=${p.toolPack || 'core'}`;
+    lines.push(`${marker} ${p.name}: ${p.model}${providers}${fallbacks}${pack}`);
+  }
+  return lines.join('\n');
+}
+
+function switchToOpenRouterProfile(chatId, settings, profileName, full = false) {
+  const sessionKey = String(chatId);
+  const previousBackend = getBackend(chatId);
+  const profile = resolveNamedOpenRouterProfile(settings, profileName);
+  settings.openRouterProfile = profile.name;
+  if (state.openRouterSessionProfiles[sessionKey] && state.openRouterSessionProfiles[sessionKey] !== profile.name) {
+    clearStoredSession('openrouter', sessionKey, `profile switch to ${profile.name}`);
+  }
+  state.openRouterSessionProfiles[sessionKey] = profile.name;
+
+  let transferContext = null;
+  let transferMode = null;
+  if (previousBackend !== 'openrouter') {
+    const since = full ? null : getBackendArrival(sessionKey, previousBackend);
+    transferContext = buildGapTranscript(previousBackend, sessionKey, since, 'openrouter');
+    transferMode = full ? 'full' : 'gap';
+    if (transferContext) {
+      log(`Prebuilt ${previousBackend}→openrouter:${profile.name} ${transferMode} for ${sessionKey}: ${transferContext.length} chars`);
+    } else {
+      log(`No ${previousBackend}→openrouter:${profile.name} ${transferMode} to inject for ${sessionKey}`);
+    }
+  }
+
+  setBackend(chatId, 'openrouter', transferContext ? { context: transferContext, mode: transferMode } : undefined);
+  markBackendArrival(sessionKey, 'openrouter');
+  saveState();
+  const resumeNote = getStoredSessionId('openrouter', sessionKey)
+    ? `Today's OpenRouter ${profile.name} session will resume on your next message.`
+    : `Next OpenRouter message starts a fresh ${profile.name} session.`;
+  return transferContext
+    ? `Backend switched to OPENROUTER profile ${profile.name} (${profile.model}). Gap transcript is ready. ${resumeNote}`
+    : `Backend switched to OPENROUTER profile ${profile.name} (${profile.model}). ${resumeNote}`;
 }
 
 async function handleSlashCommand(chatId, text) {
@@ -2507,8 +2996,8 @@ async function handleSlashCommand(chatId, text) {
     }
 
     case '/opus':
-      settings.model = 'claude-opus-4-7';
-      return 'Switched to Opus 4.7';
+      settings.model = 'claude-opus-4-8';
+      return 'Switched to Opus 4.8';
 
     case '/sonnet':
       settings.model = 'sonnet';
@@ -2589,33 +3078,128 @@ async function handleSlashCommand(chatId, text) {
         : `Backend switched to CODEX (${currentId}). No prior-backend gap context to inject. ${resumeNote}`;
     }
 
+    case '/or':
+    case '/openrouter': {
+      const [subRaw, ...rest] = parts.slice(1);
+      const sub = (subRaw || '').toLowerCase();
+      if (!sub || sub === 'help') {
+        return [
+          'OpenRouter profiles:',
+          '  /or list',
+          '  /or profile <name> [--full]',
+          '  /or set <name> <provider/model>',
+          '  /or providers <name> --order A,B,C --fallbacks on|off',
+          '  /or pack <name> <core|browser|google-full|marketing|automation|creative|legacy-research|full>',
+          '  /or info <name>',
+          'Aliases: /kimi, /minimax, /grok, /glm, /mimo',
+        ].join('\n');
+      }
+      if (sub === 'list') return formatOpenRouterProfileList(settings);
+      if (sub === 'profile' || sub === 'use') {
+        const profileName = rest[0];
+        if (!profileName) return 'Usage: /or profile <name> [--full]';
+        try {
+          return switchToOpenRouterProfile(chatId, settings, profileName, rest.includes('--full'));
+        } catch (err) {
+          return `OpenRouter profile error: ${err.message}`;
+        }
+      }
+      if (sub === 'set') {
+        const [profileName, modelId] = rest;
+        if (!profileName || !modelId) return 'Usage: /or set <name> <provider/model>';
+        try {
+          const existing = settings.openRouterProfiles || {};
+          settings.openRouterProfiles = OpenRouterProfiles.upsertOpenRouterProfile(existing, profileName, {
+            ...(existing[profileName] || {}),
+            model: modelId,
+            display: (existing[profileName] || {}).display || profileName,
+          });
+          settings.openRouterProfile = OpenRouterProfiles.normalizeProfileName(profileName);
+          clearStoredSession('openrouter', sessionKey, `profile ${profileName} model updated`);
+          saveState();
+          const profile = resolveNamedOpenRouterProfile(settings, profileName);
+          return `OpenRouter profile saved: ${profile.name} → ${profile.model}`;
+        } catch (err) {
+          return `OpenRouter profile error: ${err.message}`;
+        }
+      }
+      if (sub === 'providers') {
+        const profileName = rest[0];
+        if (!profileName) return 'Usage: /or providers <name> --order A,B,C --fallbacks on|off';
+        try {
+          const current = resolveNamedOpenRouterProfile(settings, profileName);
+          const provider = { ...(current.provider || {}) };
+          const orderIdx = rest.indexOf('--order');
+          if (orderIdx !== -1 && rest[orderIdx + 1]) provider.order = OpenRouterProfiles.parseProviderOrder(rest[orderIdx + 1]);
+          const fallbackIdx = rest.indexOf('--fallbacks');
+          if (fallbackIdx !== -1 && rest[fallbackIdx + 1]) {
+            const val = rest[fallbackIdx + 1].toLowerCase();
+            provider.allow_fallbacks = ['on', 'true', 'yes', '1'].includes(val);
+          }
+          settings.openRouterProfiles = OpenRouterProfiles.upsertOpenRouterProfile(settings.openRouterProfiles || {}, current.name, {
+            ...current,
+            provider,
+          });
+          clearStoredSession('openrouter', sessionKey, `profile ${current.name} providers updated`);
+          saveState();
+          const updated = resolveNamedOpenRouterProfile(settings, current.name);
+          return `OpenRouter providers saved for ${updated.name}: order=${(updated.provider.order || []).join(',') || 'default'} fallbacks=${updated.provider.allow_fallbacks === false ? 'off' : 'on'}`;
+        } catch (err) {
+          return `OpenRouter provider error: ${err.message}`;
+        }
+      }
+      if (sub === 'pack') {
+        const [profileName, packRaw] = rest;
+        if (!profileName || !packRaw) return 'Usage: /or pack <name> <core|browser|google-full|marketing|automation|creative|legacy-research|full>';
+        try {
+          const current = resolveNamedOpenRouterProfile(settings, profileName);
+          const toolPack = normalizeOpenRouterToolPack(packRaw);
+          settings.openRouterProfiles = OpenRouterProfiles.upsertOpenRouterProfile(settings.openRouterProfiles || {}, current.name, {
+            ...current,
+            toolPack,
+          });
+          clearStoredSession('openrouter', sessionKey, `profile ${current.name} tool pack updated`);
+          saveState();
+          return `OpenRouter tool pack saved for ${current.name}: ${toolPack}`;
+        } catch (err) {
+          return `OpenRouter tool pack error: ${err.message}`;
+        }
+      }
+      if (sub === 'info') {
+        const profileName = rest[0] || settings.openRouterProfile || OPENROUTER_DEFAULT_PROFILE;
+        try {
+          const profile = resolveNamedOpenRouterProfile(settings, profileName);
+          return [
+            `OpenRouter profile: ${profile.name}`,
+            `  Model ID: ${profile.model}`,
+            `  Display: ${profile.display}`,
+            `  Context window: ${profile.contextWindow ? formatTokenAmount(profile.contextWindow) : 'unknown'}`,
+            `  Compaction: ${formatTokenAmount(openRouterThreshold(profile))}`,
+            `  Provider order: ${(profile.provider.order || []).join(', ') || 'default'}`,
+            `  Fallbacks: ${profile.provider.allow_fallbacks === false ? 'off' : 'on'}`,
+            `  Tool pack: ${profile.toolPack || 'core'}`,
+          ].join('\n');
+        } catch (err) {
+          return `OpenRouter profile error: ${err.message}`;
+        }
+      }
+      return `Unknown /or command "${sub}". Use /or help.`;
+    }
+
     case '/kimi': {
       const sub = arg.toLowerCase();
       if (sub && sub !== '--full') {
         return `Unknown Kimi option "${arg}". Use /kimi or /kimi --full.`;
       }
-      const previousBackend = getBackend(chatId);
-      const sessionKey = String(chatId);
-      let transferContext = null;
-      let transferMode = null;
-      if (previousBackend !== 'kimi') {
-        const since = sub === '--full' ? null : getBackendArrival(sessionKey, previousBackend);
-        transferContext = buildGapTranscript(previousBackend, sessionKey, since, 'kimi');
-        transferMode = sub === '--full' ? 'full' : 'gap';
-        if (transferContext) {
-          log(`Prebuilt ${previousBackend}→kimi ${transferMode} for ${sessionKey}: ${transferContext.length} chars`);
-        } else {
-          log(`No ${previousBackend}→kimi ${transferMode} to inject for ${sessionKey}`);
-        }
+      return switchToOpenRouterProfile(chatId, settings, 'kimi', sub === '--full');
+    }
+
+    case '/minimax': {
+      const sub = arg.toLowerCase();
+      if (sub && sub !== '--full') {
+        return `Unknown MiniMax option "${arg}". Use /minimax or /minimax --full.`;
       }
-      setBackend(chatId, 'kimi', transferContext ? { context: transferContext, mode: transferMode } : undefined);
-      markBackendArrival(sessionKey, 'kimi');
-      const resumeNote = getStoredSessionId('kimi', sessionKey)
-        ? "Today's Kimi thread will resume on your next message."
-        : 'Next Kimi message starts a fresh thread.';
-      return transferContext
-        ? `Backend switched to KIMI (${KIMI_MODEL} via OpenRouter). Gap transcript is ready. ${resumeNote}`
-        : `Backend switched to KIMI (${KIMI_MODEL} via OpenRouter). Experimental lane active. ${resumeNote}`;
+      return switchToOpenRouterProfile(chatId, settings, 'minimax', sub === '--full');
     }
 
     case '/grok': {
@@ -2623,28 +3207,23 @@ async function handleSlashCommand(chatId, text) {
       if (sub && sub !== '--full') {
         return `Unknown Grok option "${arg}". Use /grok or /grok --full.`;
       }
-      const previousBackend = getBackend(chatId);
-      const sessionKey = String(chatId);
-      let transferContext = null;
-      let transferMode = null;
-      if (previousBackend !== 'grok') {
-        const since = sub === '--full' ? null : getBackendArrival(sessionKey, previousBackend);
-        transferContext = buildGapTranscript(previousBackend, sessionKey, since, 'grok');
-        transferMode = sub === '--full' ? 'full' : 'gap';
-        if (transferContext) {
-          log(`Prebuilt ${previousBackend}→grok ${transferMode} for ${sessionKey}: ${transferContext.length} chars`);
-        } else {
-          log(`No ${previousBackend}→grok ${transferMode} to inject for ${sessionKey}`);
-        }
+      return switchToOpenRouterProfile(chatId, settings, 'grok', sub === '--full');
+    }
+
+    case '/glm': {
+      const sub = arg.toLowerCase();
+      if (sub && sub !== '--full') {
+        return `Unknown GLM option "${arg}". Use /glm or /glm --full.`;
       }
-      setBackend(chatId, 'grok', transferContext ? { context: transferContext, mode: transferMode } : undefined);
-      markBackendArrival(sessionKey, 'grok');
-      const resumeNote = getStoredSessionId('grok', sessionKey)
-        ? "Today's Grok thread will resume on your next message."
-        : 'Next Grok message starts a fresh thread.';
-      return transferContext
-        ? `Backend switched to GROK (${GROK_MODEL} via OpenRouter). Gap transcript is ready. ${resumeNote}`
-        : `Backend switched to GROK (${GROK_MODEL} via OpenRouter). ${resumeNote}`;
+      return switchToOpenRouterProfile(chatId, settings, 'glm', sub === '--full');
+    }
+
+    case '/mimo': {
+      const sub = arg.toLowerCase();
+      if (sub && sub !== '--full') {
+        return `Unknown MiMo option "${arg}". Use /mimo or /mimo --full.`;
+      }
+      return switchToOpenRouterProfile(chatId, settings, 'mimo', sub === '--full');
     }
 
     case '/claude': {
@@ -2788,8 +3367,18 @@ async function handleSlashCommand(chatId, text) {
       // Cold start: also clear arrival so next switch's gap window starts from now.
       clearBackendArrival(sessionKey, clearKind);
       delete state.exchangeCount[sessionKey];
+      if (state.checkpointHeadersAtReset) delete state.checkpointHeadersAtReset[sessionKey];
       saveState();
       return `${backend.toUpperCase()} session cleared. Next message starts fresh.`;
+    }
+
+    case '/compact': {
+      const backend = getBackend(chatId);
+      if (!state.compactionPending) state.compactionPending = {};
+      state.compactionPending[sessionKey] = true;
+      saveState();
+      const thresholdMap = { claude: '350k', codex: '250k', kimi: '210k', minimax: '160k', openrouter: 'profile threshold' };
+      return `${backend.toUpperCase()} compaction queued. Your next message will trigger summarization (Haiku-driven for Claude/Codex, OpenCode-side for OpenRouter profiles). The conversation continues; older messages get replaced with a structured summary. Auto-fires at ${thresholdMap[backend] || 'threshold'} for ${backend}.`;
     }
 
     case '/usage': {
@@ -2810,28 +3399,48 @@ async function handleSlashCommand(chatId, text) {
     case '/stats': {
       const last = settings.lastResult;
       if (!last) return 'No stats yet. Send a message first.';
+      const ctxKey = `${last.backend}:${last.sessionId || 'default'}`;
+      let statsLast = { ...last };
+      if (last.backend === 'codex' && last.sessionId) {
+        const snapshot = readCodexLatestTokenSnapshot(last.sessionId);
+        if (snapshot?.usage) statsLast.usage = snapshot.usage;
+        if (snapshot?.contextWindow) statsLast.contextWindow = snapshot.contextWindow;
+      }
+      if (!statsLast.usage && (state.contextTokens || {})[ctxKey]) {
+        statsLast.usage = { contextTokens: (state.contextTokens || {})[ctxKey] };
+      }
+      const profile = statsLast.backend === 'openrouter'
+        ? resolveNamedOpenRouterProfile(settings, statsLast.openRouterProfile || settings.openRouterProfile)
+        : null;
       const lines = [
         `Last response stats:`,
-        `  Backend: ${(last.backend || 'claude').toUpperCase()}`,
-        `  Model: ${last.model === KIMI_MODEL ? KIMI_DISPLAY : (last.model === GROK_MODEL ? GROK_DISPLAY : (MODEL_DISPLAY[last.model] || last.model))}`,
-        `  Duration: ${(last.duration / 1000).toFixed(1)}s`,
-        `  Turns: ${last.turns}`,
+        `  Backend: ${(statsLast.backend || 'claude').toUpperCase()}`,
+        `  Model: ${statsLast.backend === 'openrouter' && profile ? openRouterProfileDisplay(profile) : (statsLast.model === KIMI_MODEL ? KIMI_DISPLAY : (statsLast.model === MINIMAX_MODEL ? MINIMAX_DISPLAY : (MODEL_DISPLAY[statsLast.model] || statsLast.model)))}`,
+        ...Stats.formatStatsContextLines(statsLast, profile),
+        `  Duration: ${(statsLast.duration / 1000).toFixed(1)}s`,
+        `  Turns: ${statsLast.turns}`,
       ];
-      if (isCodexFamilyBackend(last.backend) && last.usage) {
-        const inTok = last.usage.inputTokens || 0;
-        const cached = last.usage.cachedInputTokens || 0;
-        const outTok = last.usage.outputTokens || 0;
+      if (isCodexFamilyBackend(statsLast.backend) && statsLast.usage) {
+        const inTok = statsLast.usage.inputTokens || 0;
+        const cached = statsLast.usage.cachedInputTokens || 0;
+        const outTok = statsLast.usage.outputTokens || 0;
         const uncached = Math.max(0, inTok - cached);
-        const cachedPct = inTok > 0 ? ((cached / inTok) * 100).toFixed(0) : '0';
-        lines.push(`  Tokens: in ${inTok} / out ${outTok}`);
-        lines.push(`  Cache: ${cached} cached (${cachedPct}%) / ${uncached} uncached`);
-        if (last.turns > 1) {
-          lines.push(`  ⚠️ Cumulative — Codex reports total thread tokens, not per-turn`);
+        const cachedPct = inTok > 0 ? ((cached / inTok) * 100).toFixed(1) : '0';
+        lines.push(`  Current turn: in ${inTok} / out ${outTok}`);
+        lines.push(`  Current cache: ${cached} cached (${cachedPct}%) / ${uncached} uncached`);
+        if (statsLast.usage.totalInputTokens && statsLast.usage.totalInputTokens !== inTok) {
+          const totalIn = statsLast.usage.totalInputTokens || 0;
+          const totalOut = statsLast.usage.totalOutputTokens || 0;
+          const totalCached = statsLast.usage.totalCachedInputTokens || 0;
+          const totalUncached = Math.max(0, totalIn - totalCached);
+          const totalCachedPct = totalIn > 0 ? ((totalCached / totalIn) * 100).toFixed(1) : '0';
+          lines.push(`  Command total: in ${totalIn} / out ${totalOut}`);
+          lines.push(`  Command cache: ${totalCached} cached (${totalCachedPct}%) / ${totalUncached} uncached`);
         }
       } else {
-        lines.push(`  Cost: $${last.cost}`);
+        lines.push(`  Cost: $${statsLast.cost}`);
       }
-      lines.push(`  Session: ${last.sessionId || 'none'}`);
+      lines.push(`  Session: ${statsLast.sessionId || 'none'}`);
       return lines.join('\n');
     }
 
@@ -2847,17 +3456,22 @@ async function handleSlashCommand(chatId, text) {
       const bridgePid = fs.existsSync(PID_PATH) ? fs.readFileSync(PID_PATH, 'utf8').trim() : '?';
       const cronCount = cronJobs.length;
       const backend = getBackend(chatId);
-      const currentModel = backend === 'kimi'
+      const currentOrProfile = backend === 'openrouter' ? resolveActiveOpenRouterProfile(settings) : null;
+      const currentModel = backend === 'openrouter'
+        ? currentOrProfile.model
+        : backend === 'kimi'
         ? KIMI_MODEL
-        : backend === 'grok'
-        ? GROK_MODEL
+        : backend === 'minimax'
+        ? MINIMAX_MODEL
         : backend === 'codex'
         ? (settings.codexModel || CODEX_DEFAULT_MODEL)
         : (settings.model || DEFAULT_MODEL);
-      const modelDisplay = backend === 'kimi'
+      const modelDisplay = backend === 'openrouter'
+        ? openRouterProfileDisplay(currentOrProfile)
+        : backend === 'kimi'
         ? KIMI_DISPLAY
-        : backend === 'grok'
-        ? GROK_DISPLAY
+        : backend === 'minimax'
+        ? MINIMAX_DISPLAY
         : backend === 'codex'
         ? currentModel
         : (MODEL_DISPLAY[currentModel] || currentModel);
@@ -2897,13 +3511,15 @@ async function handleSlashCommand(chatId, text) {
         '/codex — Use Codex (GPT) backend, resuming today\'s Codex thread if it exists',
         '/codex --full — Use Codex with raw Claude replay',
         '/codex help — List GPT models',
-        '/kimi — Experimental Kimi K2.6 backend via OpenRouter',
-        '/kimi --full — Use Kimi with raw previous-backend replay',
-        '/grok — Grok 4.3 backend via OpenRouter',
-        '/grok --full — Use Grok with raw previous-backend replay',
+        '/or list — List OpenRouter profiles',
+        '/or profile <name> — Use an OpenRouter profile',
+        '/or set <name> <provider/model> — Save an OpenRouter profile',
+        '/or providers <name> --order A,B --fallbacks on|off — Configure routing',
+        '/kimi, /minimax, /grok, /glm, /mimo — Convenience aliases for OpenRouter profiles',
         '',
         '— Claude models —',
-        '/opus — Opus 4.7',
+        '/opus — Opus 4.8',
+        '/opus4.7 — Opus 4.7 (legacy)',
         '/opus4.6 — Opus 4.6 (legacy)',
         '/sonnet — Sonnet 4.6',
         '/haiku — Haiku 4.5',
@@ -2916,11 +3532,12 @@ async function handleSlashCommand(chatId, text) {
         '/5.3-codex, /5.2, /5.2-codex, /5.1-codex-max, /5.1-codex-mini',
         '',
         '— Session —',
-        '/reset — Clear current backend\'s session',
-        '/fresh — Alias for /reset; clear current backend session',
+        '/reset — Clear current backend\'s session (aliases /new and /fresh)',
+        '/fresh — same as /reset',
+        '/compact — Manually trigger compaction for current backend',
         '/session — Show session info',
         '/catchup — Pull context from the OTHER backend into this one (use if a handoff was lost to rate-limit or crash)',
-        '/stats — Last response stats (cached %, cumulative warning)',
+        '/stats — Last response stats and context window usage',
         '/usage — Plan usage (5h + 7d) for Claude and Codex',
         '/todos — Plans Trello (Today, Tomorrow, This Week, etc.) — alias /plans',
         '/effort <low|medium|high|xhigh|max> — Set Claude/Codex thinking effort',
@@ -2973,6 +3590,12 @@ async function handleTelegramMessage(item) {
   // Increment exchange counter for this session
   if (!state.exchangeCount[sessionKey]) state.exchangeCount[sessionKey] = 0;
   state.exchangeCount[sessionKey]++;
+  // Baseline the daily-log checkpoint-header count at session start so we only
+  // count checkpoints written DURING this session (header-count delta signal).
+  if (!state.checkpointHeadersAtReset) state.checkpointHeadersAtReset = {};
+  if (state.checkpointHeadersAtReset[sessionKey] === undefined) {
+    state.checkpointHeadersAtReset[sessionKey] = countCheckpointHeaders();
+  }
 
   // Build prompt — for /search, wrap with QMD instruction
   let prompt = text;
@@ -2980,23 +3603,20 @@ async function handleTelegramMessage(item) {
     prompt = `Search memory using the QMD search_memory tool for: ${text.slice(8)}. Return the results.`;
   }
 
-  // Checkpoint enforcement: inject reminder after N exchanges without a checkpoint
+  // Checkpoint enforcement: nudge after N exchanges unless a NEW "## Checkpoint"
+  // header has appeared in today's daily log since this session's baseline
+  // (header-count delta, shared signal across all surfaces, replaces mtime proxy).
   if (state.exchangeCount[sessionKey] >= CHECKPOINT_THRESHOLD && state.exchangeCount[sessionKey] % CHECKPOINT_THRESHOLD === 0) {
-    const today = new Date().toISOString().slice(0, 10);
-    const dailyLog = path.join(MEMORY_DIR, `${today}.md`);
-    let needsCheckpoint = true;
-    try {
-      if (fs.existsSync(dailyLog)) {
-        const logStat = fs.statSync(dailyLog);
-        const minutesSinceWrite = (Date.now() - logStat.mtimeMs) / (1000 * 60);
-        if (minutesSinceWrite < 5) needsCheckpoint = false;
-      }
-    } catch {}
-    if (needsCheckpoint) {
-      prompt = `${prompt}\n\n[CHECKPOINT NOW — ${state.exchangeCount[sessionKey]} messages since last write]`;
-      log(`Checkpoint reminder injected after ${state.exchangeCount[sessionKey]} exchanges`);
-    } else {
+    if (!state.checkpointHeadersAtReset) state.checkpointHeadersAtReset = {};
+    const baseline = state.checkpointHeadersAtReset[sessionKey] || 0;
+    const headerCount = countCheckpointHeaders();
+    if (headerCount > baseline) {
+      // A checkpoint was written since baseline, clear and stay quiet.
       state.exchangeCount[sessionKey] = 0;
+      state.checkpointHeadersAtReset[sessionKey] = headerCount;
+    } else {
+      prompt = `${prompt}\n\n[CHECKPOINT CHECK - ${state.exchangeCount[sessionKey]} messages since the last log write. If a decision, client/pipeline update, task completion, or topic-end happened since then, write it to today's daily log now and promote any durable rule per AGENTS.md. If nothing meaningful happened, skip and keep going.]`;
+      log(`Checkpoint check injected after ${state.exchangeCount[sessionKey]} exchanges`);
     }
     saveState();
   }
@@ -3033,15 +3653,56 @@ async function handleTelegramMessage(item) {
 
   // Backend-specific options
   const claudeModel = settings.model || DEFAULT_MODEL;
-  const codexModel = backend === 'kimi' ? KIMI_MODEL : (backend === 'grok' ? GROK_MODEL : (settings.codexModel || CODEX_DEFAULT_MODEL));
-  const codexProvider = (backend === 'kimi' || backend === 'grok') ? 'openrouter' : null;
+  const activeOpenRouterProfile = (backend === 'openrouter' || backend === 'kimi' || backend === 'minimax')
+    ? resolveNamedOpenRouterProfile(settings, backend === 'kimi' ? 'kimi' : backend === 'minimax' ? 'minimax' : settings.openRouterProfile)
+    : null;
+  const codexModel = backend === 'openrouter'
+    ? activeOpenRouterProfile.model
+    : backend === 'kimi'
+    ? KIMI_MODEL
+    : backend === 'minimax'
+    ? MINIMAX_MODEL
+    : (settings.codexModel || CODEX_DEFAULT_MODEL);
+  const codexProvider = (backend === 'kimi' || backend === 'minimax' || backend === 'openrouter') ? 'openrouter' : null;
   const effort = settings.effort || 'xhigh';
   const codexVerbosity = settings.codexVerbosity || null;
+
+  // CLAUDE COMPACTION pre-turn: if last turn breached threshold, summarize via Haiku and clear session.
+  if (backend === 'claude' && state.compactionPending && state.compactionPending[sessionKey]) {
+    const oldSid = getStoredSessionId('claude', sessionKey);
+    if (oldSid) {
+      log(`[claude] compaction triggered for ${sessionKey} (session ${oldSid})`);
+      try { await sendMessage(chatId, '🗜️ Compacting Claude session (threshold reached, summarizing prior context)…'); } catch {}
+      const items = extractClaudeMessagesForSummary(oldSid);
+      const summary = await runHaikuSummary(items, 'Claude session');
+      if (summary) {
+        state.compactionSummary = state.compactionSummary || {};
+        state.compactionSummary[sessionKey] = { backend: 'claude', summary, ts: new Date().toISOString() };
+        clearStoredSession('claude', sessionKey, 'compaction');
+        log(`[claude] compaction success: summary ${summary.length} chars, session cleared`);
+      } else {
+        log(`[claude] compaction summary failed, clearing session anyway to free context`);
+        clearStoredSession('claude', sessionKey, 'compaction-failed');
+      }
+      delete state.compactionPending[sessionKey];
+      saveState();
+    } else {
+      delete state.compactionPending[sessionKey];
+      saveState();
+    }
+  }
 
   // Claude: inject primer on fresh sessions AND/OR transfer context on codex→claude switch
   let appendSystemPrompt = null;
   if (backend === 'claude') {
     const parts = [];
+    // Compaction summary takes precedence — prepend before primer
+    if (state.compactionSummary && state.compactionSummary[sessionKey] && state.compactionSummary[sessionKey].backend === 'claude') {
+      parts.push(`PRIOR CONTEXT (compacted summary from earlier in this session day):\n${state.compactionSummary[sessionKey].summary}`);
+      log(`[claude] injecting compaction summary into primer for ${sessionKey}`);
+      delete state.compactionSummary[sessionKey];
+      saveState();
+    }
     if (!getStoredSessionId('claude', sessionKey)) {
       const today = getCurrentSessionDay();
       const sessionStartDone = state.sessionStartRanToday === today;
@@ -3062,10 +3723,46 @@ async function handleTelegramMessage(item) {
     transferContext = null;
   }
 
+  // CODEX COMPACTION pre-turn: same pattern, summary becomes transferContext addendum
+  if (backend === 'codex' && state.compactionPending && state.compactionPending[sessionKey]) {
+    const oldTid = getStoredSessionId('codex', sessionKey);
+    if (oldTid) {
+      const threshold = BACKEND_COMPACTION_THRESHOLDS.codex;
+      const snapshot = readCodexLatestTokenSnapshot(oldTid);
+      const actualFilled = contextTokensFromUsage(snapshot?.usage, 'codex');
+      if (threshold && actualFilled > 0 && actualFilled < threshold) {
+        log(`[codex] stale compaction flag cleared for ${sessionKey}: actual context ${actualFilled} < ${threshold}`);
+        delete state.compactionPending[sessionKey];
+        if (!state.contextTokens) state.contextTokens = {};
+        state.contextTokens[`codex:${oldTid}`] = actualFilled;
+        saveState();
+      } else {
+        log(`[codex] compaction triggered for ${sessionKey} (thread ${oldTid})`);
+        try { await sendMessage(chatId, '🗜️ Compacting Codex session (threshold reached, summarizing prior context)…'); } catch {}
+        const items = extractCodexMessagesForSummary(oldTid);
+        const summary = await runHaikuSummary(items, 'Codex thread');
+        if (summary) {
+          const sumBlock = `PRIOR CONTEXT (compacted summary from earlier in this session day):\n${summary}\n\n`;
+          transferContext = sumBlock + (transferContext || '');
+          clearStoredSession('codex', sessionKey, 'compaction');
+          log(`[codex] compaction success: summary ${summary.length} chars, thread cleared`);
+        } else {
+          log(`[codex] compaction summary failed, clearing thread anyway`);
+          clearStoredSession('codex', sessionKey, 'compaction-failed');
+        }
+        delete state.compactionPending[sessionKey];
+        saveState();
+      }
+    } else {
+      delete state.compactionPending[sessionKey];
+      saveState();
+    }
+  }
+
   try {
     const result = await runBackend(backend, prompt, {
       timeout: 7200,
-      idleTimeout: (backend === 'kimi' || backend === 'grok') ? 900 : undefined,
+      idleTimeout: (backend === 'kimi' || backend === 'minimax' || backend === 'openrouter') ? 900 : undefined,
       model: claudeModel,
       codexModel: codexModel,
       codexProvider: codexProvider,
@@ -3080,13 +3777,36 @@ async function handleTelegramMessage(item) {
     // Save stats for /stats command
     settings.lastResult = {
       backend: backend,
-      model: isCodexFamilyBackend(backend) ? codexModel : claudeModel,
+      model: backend === 'openrouter'
+        ? activeOpenRouterProfile.model
+        : isCodexFamilyBackend(backend) ? codexModel : claudeModel,
+      openRouterProfile: activeOpenRouterProfile ? activeOpenRouterProfile.name : null,
       duration: result.duration || 0,
       turns: result.turns,
       cost: result.cost,
       usage: result.usage,
       sessionId: result.sessionId,
+      contextWindow: result.contextWindow || 0,
     };
+
+    // Track context fill per (backend, sessionId): store latest known context snapshot.
+    // For Codex, cached_input_tokens is a subset of input_tokens, so do not add it twice.
+    const ctxKey = `${backend}:${result.sessionId || 'default'}`;
+    if (!state.contextTokens) state.contextTokens = {};
+    if (result.usage) {
+      const filled = contextTokensFromUsage(result.usage, backend);
+      if (filled > 0) state.contextTokens[ctxKey] = filled;
+      // Check claude/codex compaction threshold (kimi/minimax handled in their own post-turn block)
+      const threshold = BACKEND_COMPACTION_THRESHOLDS[backend];
+      if (threshold && filled >= threshold) {
+        if (!state.compactionPending) state.compactionPending = {};
+        if (!state.compactionPending[sessionKey]) {
+          log(`compaction-threshold reached for ${backend} ${sessionKey}: ${filled} >= ${threshold}; flagging next turn`);
+        }
+        state.compactionPending[sessionKey] = true;
+      }
+    }
+    saveState();
 
     if (result.text) {
       // Persist session ID on the correct backend's slot only after we have
@@ -3165,10 +3885,18 @@ function runCronCommand(command, options = {}) {
       cwd: WORKSPACE,
       env: cleanEnv,
       stdio: ['ignore', 'pipe', 'pipe'],
+      detached: true, // own process group → tree-kill cascades to node/children the command spawns
     });
 
+    // Tree-kill: `bash -lc "node ..."` forks node as a child, so signalling only the bash
+    // parent orphans the real work. Negative-PID kill takes out the whole group.
+    const killTree = (signal) => {
+      try { process.kill(-proc.pid, signal); }
+      catch { try { proc.kill(signal); } catch { /* gone */ } }
+    };
+
     activeSubprocess = proc;
-    activeKillFn = (sig) => proc.kill(sig);
+    activeKillFn = killTree;
     const startTime = Date.now();
     let stdout = '';
     let stderr = '';
@@ -3178,9 +3906,9 @@ function runCronCommand(command, options = {}) {
 
     const timeoutMs = (options.timeout || 300) * 1000;
     const timer = setTimeout(() => {
-      log(`Cron command timed out after ${timeoutMs}ms, killing...`);
-      proc.kill('SIGTERM');
-      setTimeout(() => proc.kill('SIGKILL'), 5000);
+      log(`Cron command timed out after ${timeoutMs}ms, killing tree...`);
+      killTree('SIGTERM');
+      setTimeout(() => killTree('SIGKILL'), 5000);
     }, timeoutMs);
 
     proc.on('close', (code) => {
@@ -3210,6 +3938,32 @@ function runCronCommand(command, options = {}) {
       reject(new Error(`Failed to spawn cron command: ${err.message}`));
     });
   });
+}
+
+function verifyCronResult(item, result, startedAtMs, backendLabel) {
+  if (item.command) return;
+
+  const text = (result?.text || '').trim();
+  const turns = result?.turns || 0;
+  const usage = result?.usage || {};
+  const inputTokens = usage.inputTokens || usage.totalInputTokens || 0;
+  const outputTokens = usage.outputTokens || usage.totalOutputTokens || 0;
+
+  if (!text && turns === 0 && inputTokens === 0 && outputTokens === 0) {
+    throw new Error(`Cron "${item.name}" produced no model output on ${backendLabel} (0 turns, 0 tokens)`);
+  }
+
+  if (item.name === 'daily-newsletter') {
+    const day = getCurrentSessionDay(new Date(startedAtMs));
+    const newsletterPath = path.join(WORKSPACE, 'business', 'newsletters', `daily-${day}.md`);
+    if (!fs.existsSync(newsletterPath)) {
+      throw new Error(`daily-newsletter did not create ${newsletterPath}`);
+    }
+    const stat = fs.statSync(newsletterPath);
+    if (stat.mtimeMs + 1000 < startedAtMs) {
+      throw new Error(`daily-newsletter left ${newsletterPath} unchanged`);
+    }
+  }
 }
 
 async function handleCronJob(item) {
@@ -3243,6 +3997,26 @@ async function handleCronJob(item) {
           codexVerbosity: codexChatSettings.codexVerbosity || null,
         })
       );
+    } else if (cronBackend === 'openrouter' || cronBackend === 'kimi' || cronBackend === 'minimax') {
+      const cronSettings = primaryChat ? getSettings(primaryChat) : {};
+      const profile = cronBackend === 'kimi'
+        ? resolveNamedOpenRouterProfile(cronSettings, 'kimi')
+        : cronBackend === 'minimax'
+        ? resolveNamedOpenRouterProfile(cronSettings, 'minimax')
+        : resolveActiveOpenRouterProfile(cronSettings);
+      const ocModel = profile.modelWithProvider;
+      const ocConfigPath = openRouterConfigPathForProfile(profile);
+      const cronPrompt = `${buildCodexCronContext()}\n\n# CRON TASK\n\n${prompt}`;
+      result = await runOpenCode(cronPrompt, null, {
+        model: ocModel,
+        timeout: timeout || 300,
+        idleTimeout: 300,
+        workspace: WORKSPACE,
+        log,
+        activeRefs: { setSubprocess: () => {}, setKillFn: () => {} },
+        openRouterKey: readKeychainSecret('OPENROUTER_API_KEY'),
+        configPath: ocConfigPath,
+      });
     } else {
       result = await runClaude(prompt, null, {
         timeout: timeout || 300,
@@ -3253,11 +4027,15 @@ async function handleCronJob(item) {
       });
     }
 
+    verifyCronResult(item, result, startTime, command ? 'command' : cronBackend);
+
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
     const costStr = command
       ? 'command'
       : cronBackend === 'codex'
       ? `tokens in=${result.usage?.inputTokens || 0}/out=${result.usage?.outputTokens || 0}`
+      : (cronBackend === 'openrouter' || cronBackend === 'kimi' || cronBackend === 'minimax')
+      ? `tokens in=${result.usage?.inputTokens || 0}/out=${result.usage?.outputTokens || 0} cost=$${(result.cost || 0).toFixed(4)}`
       : `$${result.cost}`;
     log(`Cron ${name} [${command ? 'command' : cronBackend}] completed: ${duration}s, ${result.turns} turns, ${costStr}`);
 
@@ -3270,6 +4048,7 @@ async function handleCronJob(item) {
           clearStoredSession('claude', key);
           clearBackendArrival(key, 'claude');
           state.exchangeCount[key] = 0;
+          if (state.checkpointHeadersAtReset) delete state.checkpointHeadersAtReset[key];
         }
       }
       for (const key of Object.keys(state.codexSessions)) {
@@ -3279,11 +4058,11 @@ async function handleCronJob(item) {
           clearBackendArrival(key, 'codex');
         }
       }
-      for (const key of Object.keys(state.grokSessions || {})) {
-        if (state.grokSessions[key]) {
-          log(`Session-audit: clearing Grok thread ${state.grokSessions[key]} for chat ${key}`);
-          clearStoredSession('grok', key);
-          clearBackendArrival(key, 'grok');
+      for (const key of Object.keys(state.minimaxSessions || {})) {
+        if (state.minimaxSessions[key]) {
+          log(`Session-audit: clearing MiniMax thread ${state.minimaxSessions[key]} for chat ${key}`);
+          clearStoredSession('minimax', key);
+          clearBackendArrival(key, 'minimax');
         }
       }
       for (const key of Object.keys(state.kimiSessions || {})) {
@@ -3291,6 +4070,13 @@ async function handleCronJob(item) {
           log(`Session-audit: clearing Kimi thread ${state.kimiSessions[key]} for chat ${key}`);
           clearStoredSession('kimi', key);
           clearBackendArrival(key, 'kimi');
+        }
+      }
+      for (const key of Object.keys(state.openrouterSessions || {})) {
+        if (state.openrouterSessions[key]) {
+          log(`Session-audit: clearing OpenRouter session ${state.openrouterSessions[key]} for chat ${key}`);
+          clearStoredSession('openrouter', key);
+          clearBackendArrival(key, 'openrouter');
         }
       }
       saveState();
@@ -3434,24 +4220,19 @@ async function pollTelegram() {
         continue;
       }
 
-      // Handle /stop immediately — bypass queue, kill active subprocess
-      if (msg.text && msg.text.trim().toLowerCase() === '/stop') {
-        if (activeSubprocess && activeKillFn) {
-          log(`/stop received — killing active subprocess (PID ${activeSubprocess.pid})`);
-          const killFn = activeKillFn; // capture before close event nulls it
-          killFn('SIGTERM');
-          setTimeout(() => killFn('SIGKILL'), 5000);
-          // Clear the message queue so queued messages don't fire after stop
-          telegramQueue.length = 0;
-          await sendMessage(chatId, 'Stopped. Task killed and queue cleared.');
-        } else {
-          await sendMessage(chatId, 'Nothing running to stop.');
-        }
+      // Normalize the leading slash-command: drop @botname suffix, casing, and any args.
+      // Telegram clients can deliver "/stop", "/stop@NativeClawdBot", or "/stop " — all should match.
+      const cmd = msg.text ? msg.text.trim().toLowerCase().split(/\s+/)[0].replace(/@[a-z0-9_]+$/, '') : '';
+
+      // Handle /stop immediately — bypass queue, tree-kill the active subprocess
+      if (cmd === '/stop') {
+        const killed = stopActiveTask('telegram /stop');
+        await sendMessage(chatId, killed ? 'Stopped. Task killed and queue cleared.' : 'Nothing running to stop.');
         continue;
       }
 
       // Handle /restart — send confirmation then exit with code 1 so launchd restarts us
-      if (msg.text && msg.text.trim().toLowerCase() === '/restart') {
+      if (cmd === '/restart') {
         log('/restart received — restarting service...');
         await sendMessage(chatId, "Restarting... I'll be back in a few seconds.");
         state.pendingRestartConfirm = { chatId, ts: Date.now() };
@@ -3742,6 +4523,28 @@ async function main() {
   // Reload cron schedule every 5 minutes (picks up changes without restart)
   setInterval(loadCronSchedule, 300000);
 
+  // Out-of-band kill switch #2: `touch <bridge-dir>/STOP` stops the active task without Telegram.
+  // Same purpose as SIGUSR2, but file-based so it works even if you don't have the PID handy.
+  const STOP_SENTINEL = path.join(__dirname, 'STOP');
+  try { fs.unlinkSync(STOP_SENTINEL); } catch {} // clear any stale sentinel from a prior run
+  try {
+    fs.watch(__dirname, (evt, fname) => {
+      if (fname === 'STOP' && fs.existsSync(STOP_SENTINEL)) {
+        const killed = stopActiveTask('STOP sentinel file');
+        try { fs.unlinkSync(STOP_SENTINEL); } catch {}
+        const primary = ALLOWED_CHAT_IDS[0];
+        if (primary) {
+          sendMessage(primary, killed
+            ? 'Stopped via STOP file. Task killed and queue cleared.'
+            : 'STOP file: nothing was running.').catch(() => {});
+        }
+      }
+    });
+    log('STOP sentinel watcher active (touch telegram-bridge/STOP to kill the active task)');
+  } catch (err) {
+    log(`Could not start STOP sentinel watcher: ${err.message}`);
+  }
+
   // Start Telegram polling loop
   log('Telegram polling started');
   while (true) {
@@ -3752,6 +4555,8 @@ async function main() {
 // Graceful shutdown
 function shutdown(signal) {
   log(`Received ${signal}, shutting down...`);
+  // Don't leave a detached child running when we exit/restart
+  try { if (activeKillFn) activeKillFn('SIGTERM'); } catch {}
   saveState();
   // Clean up PID file
   try { fs.unlinkSync(PID_PATH); } catch {}
@@ -3761,6 +4566,19 @@ function shutdown(signal) {
 
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+
+// Out-of-band kill switch: `kill -USR2 $(cat bridge.pid)` stops the active task WITHOUT a restart
+// and without needing Telegram — covers the case where the bot is network-deaf and /stop can't arrive.
+// (SIGUSR2 chosen over SIGUSR1 because Node reserves SIGUSR1 for the inspector.)
+process.on('SIGUSR2', () => {
+  const killed = stopActiveTask('SIGUSR2 (local kill)');
+  const primary = ALLOWED_CHAT_IDS[0];
+  if (primary) {
+    sendMessage(primary, killed
+      ? 'Stopped via local kill (SIGUSR2). Task killed and queue cleared.'
+      : 'Local kill (SIGUSR2): nothing was running.').catch(() => {});
+  }
+});
 process.on('uncaughtException', (err) => {
   log(`UNCAUGHT EXCEPTION: ${err.message}\n${err.stack}`);
   saveState();

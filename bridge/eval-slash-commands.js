@@ -24,6 +24,9 @@ const checks = [
         '/claude',
         '/codex --full',
         '/claude --full',
+        '/or list',
+        '/or profile',
+        '/or set',
         '/opus',
         '/sonnet',
         '/haiku',
@@ -133,7 +136,7 @@ const checks = [
     name: 'buildGapTranscript replaces summary+replay path and applies hard cap',
     run() {
       const patterns = [
-        /function buildGapTranscript\(sourceBackend, sessionKey, sinceISO\)/,
+        /function buildGapTranscript\(sourceBackend, sessionKey, sinceISO, targetBackend = null\)/,
         /const GAP_CAP_CHARS = \d+/,
         /while \(totalChars > GAP_CAP_CHARS && exchanges\.length > 1\)/,
         /# GAP TRANSCRIPT/,
@@ -154,7 +157,7 @@ const checks = [
         /function getBackendArrival\(chatId, backend\)/,
         /function markBackendArrival\(chatId, backend, when\)/,
         /function clearBackendArrival\(chatId, backend\)/,
-        /clearBackendArrival\(chatId, kind\)/,
+        /clearBackendArrival\(sessionKey, clearKind\)/,
       ];
       return patterns.filter((p) => !p.test(source)).map((p) => `missing ${p}`);
     },
@@ -173,25 +176,25 @@ const checks = [
     name: 'gap injection callers log explicitly when transcript is empty',
     run() {
       const patterns = [
-        /No claude→codex (full )?gap to inject/,
-        /No codex→claude (full )?gap to inject/,
-        /Transfer claude→codex gap empty/,
-        /Transfer codex→claude gap empty/,
+        /No .*→codex (full )?gap to inject/,
+        /No .*→claude (full )?gap to inject/,
+        /Transfer claude→.* gap empty/,
+        /Transfer .*→claude gap empty/,
       ];
       return patterns.filter((p) => !p.test(source)).map((p) => `missing ${p}`);
     },
   },
   {
-    name: 'first-run onboarding is Telegram-first and config-gated',
+    name: 'OpenRouter profile slash commands are documented and implemented',
     run() {
       const patterns = [
-        /firstRun: \{\},/,
-        /config\.firstRunOnboarding !== false/,
-        /function buildFirstRunWelcome\(\)/,
-        /function buildFirstRunPromptContext\(\)/,
-        /USER\.md/,
-        /MEMORY\.md/,
-        /TOOLS\.md/,
+        /case '\/or':/,
+        /case '\/openrouter':/,
+        /\/or list/,
+        /\/or profile <name>/,
+        /\/or set <name> <provider\/model>/,
+        /function switchToOpenRouterProfile/,
+        /OpenRouterProfiles\.upsertOpenRouterProfile/,
       ];
       return patterns.filter((p) => !p.test(source)).map((p) => `missing ${p}`);
     },

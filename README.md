@@ -2,15 +2,18 @@
 
 NativeClaw is a personal AI agent that runs as a managed background service on macOS, Linux, or Windows and talks to you through Telegram.
 
-It started as a Claude Code bridge. Current NativeClaw can run Claude, Codex (OpenAI CLI), Kimi (via OpenRouter), or Grok (via OpenRouter) as the active backend, keep persistent workspace memory, run scheduled jobs, handle common media inputs, and survive service restarts.
+It started as a Claude Code bridge. Current NativeClaw can run Claude, Codex (OpenAI CLI), or any configured OpenRouter profile as the active backend, keep persistent workspace memory, run scheduled jobs, handle common media inputs, and survive service restarts.
+
+> [!WARNING]
+> **Deprecated as of 2026-06-15.** The Telegram bridge is being sunset. Starting June 15, 2026, Claude Agent SDK / `claude -p` usage (which the Claude backend depends on) moves off plan limits onto separate metered credits, changing the cost model this project was built around. **`v2.1.0` is the final feature release.** Existing installs keep running and the Codex / OpenRouter backends are unaffected, but no further bridge development is planned.
 
 ## What It Does
 
-- Responds to Telegram messages through Claude Code, Codex CLI, or OpenCode (for Kimi & Grok via OpenRouter)
-- Switches backends with `/claude`, `/codex`, `/kimi`, and `/grok`
+- Responds to Telegram messages through Claude Code, Codex CLI, or OpenCode for OpenRouter profiles
+- Switches backends with `/claude`, `/codex`, `/or profile <name>`, plus convenience aliases such as `/kimi`, `/minimax`, and `/grok`
 - Preserves backend-switch continuity with raw gap transcripts
-- Auto-compacts long sessions on Kimi (~180k) and Grok (~150k) lanes; `/compact` triggers manual compaction across all four backends
-- Shows live context-window usage per backend with `/stats` (per-message JSONL accuracy across multi-tool turns)
+- Auto-compacts long sessions by backend/profile threshold; `/compact` triggers manual compaction
+- Shows live context-window usage per backend with `/stats`
 - Runs bridge-level scheduled jobs such as briefs, audits, queue recovery, and heartbeats
 - Keeps durable memory in workspace files instead of relying on chat history
 - Supports images, voice notes, audio files, and document attachments
@@ -19,7 +22,7 @@ It started as a Claude Code bridge. Current NativeClaw can run Claude, Codex (Op
 
 ## What's Current
 
-Current bridge version: `v2.0.0`.
+Current bridge version: `v2.1.0` (final feature release — see deprecation notice above).
 
 **v2.0 is a major release** — NativeClaw becomes an installable assistant with a visual setup flow and a persistent control panel. See [v2/README.md](v2/README.md) and [v2/CHANGELOG.md](v2/CHANGELOG.md) for v2.0-specific docs.
 
@@ -29,9 +32,9 @@ v2.0 highlights:
 - **Cross-platform parity** — macOS (launchd), Linux (systemd), Windows (Task Scheduler + DPAPI). `install.sh` and `install.ps1` produce identical installs.
 - **Backup / Restore / Doctor** — `nativeclaw backup`, `nativeclaw restore <zip>`, `nativeclaw doctor` for diagnostic bundles
 - **xAI Grok STT** voice transcription (fast + cheap; OpenAI Whisper as fallback)
-- **Kimi / Grok auto-compaction** at ~180k / ~150k thresholds via `lib/compaction.ts`
+- **OpenRouter profiles** — Kimi, MiniMax, Grok, or any OpenRouter model ID through one configurable lane
 - **`/compact` slash command** — manual compaction across all four backends
-- **`/stats` context window display** — shows `Context: <window> (<filled>k filled)` per backend with per-message JSONL accuracy
+- **`/stats` context window display** — separates context window from current context usage
 
 Carried over from v1.10:
 - **Agent reliability stack**: QMD semantic memory search, feedback-loop discipline, platform keychain for API keys, MCP probe + wrapper, task queue, session self-audit, memory-reminder hooks
@@ -53,12 +56,12 @@ See **[v2/CHANGELOG.md](v2/CHANGELOG.md)** for v2.0 changes and **[CHANGELOG.md]
 - At least one backend installed:
   - Claude Code CLI (`claude`) with an active Claude subscription, **or**
   - Codex CLI (`codex`) with an active ChatGPT/OpenAI account, **or**
-  - OpenCode CLI (`opencode`) for Kimi and/or Grok via OpenRouter
+  - OpenCode CLI (`opencode`) for OpenRouter profiles
   - Any combination is supported.
 - **xAI API key** for voice transcription via Grok STT (OpenAI Whisper supported as fallback)
-- **OpenRouter API key** if using Kimi or Grok backends
+- **OpenRouter API key** if using OpenRouter profiles
 
-> **Note on Kimi:** Kimi K2.6 is shipped as a first-class backend but is still stabilizing under heavy load. The bridge runs it with shorter timeout/idle limits than Claude/Codex. Stable fallbacks: `/claude` and `/codex`.
+> **Note on OpenRouter:** Kimi, MiniMax, Grok, and future models are profiles. Stable native fallbacks remain `/claude` and `/codex`.
 
 Before running PowerShell scripts on Windows, open PowerShell as Administrator and run:
 
@@ -98,7 +101,7 @@ The wizard runs as a browser flow at `127.0.0.1:9292` (or terminal TUI mode if y
 
 1. **Welcome** — quick orientation
 2. **Prereq** — checks Node.js and available backend CLIs (Claude / Codex / OpenCode); installs missing pieces with SSE-streamed progress
-3. **Backend** — choose any combination: Claude, Codex, Kimi, Grok
+3. **Backend** — choose Claude, Codex, OpenRouter profiles, or a combination
 4. **Identity** — what your agent should be called, what it should call you
 5. **Telegram** — paste your bot token from @BotFather
 6. **Features** — optional: xAI voice key, OpenRouter API key, Nano Banana image gen, QMD semantic memory, prompt hooks
@@ -143,14 +146,14 @@ NativeClaw is designed so setup is the only terminal-heavy part. After the bridg
 3. Run `/status` to confirm the bridge is alive.
 4. Tell the agent who you are and what you want help with.
 5. Let the agent write durable context into `USER.md`, `MEMORY.md`, and `TOOLS.md`.
-6. Use `/claude`, `/codex`, `/kimi`, or `/grok` to switch between any backends you installed.
+6. Use `/claude`, `/codex`, `/or profile <name>`, `/kimi`, `/minimax`, or `/grok` to switch between installed backends/profiles.
 
 Set `"firstRunOnboarding": false` in `config.json` if you want to skip the Telegram welcome.
 
 Plain-English concepts:
 - **Telegram bot:** the private chat surface where you talk to your agent.
 - **Bot token:** the secret Telegram gives NativeClaw so it can receive and send bot messages.
-- **Backend:** the model CLI that answers messages. Claude, Codex, Kimi, and Grok are all supported; you can install any combination. Kimi and Grok run through OpenCode + OpenRouter, so they share an `OPENROUTER_API_KEY`.
+- **Backend:** the model CLI that answers messages. Claude and Codex are native lanes. OpenRouter profiles run through OpenCode and share an `OPENROUTER_API_KEY`.
 - **MCP:** a tool connector. MCP servers let the agent talk to apps and data sources such as calendars, files, GitHub, or custom APIs. Edit them through the Settings UI MCP tab or by hand in `.mcp.json`.
 - **QMD:** optional semantic memory search. It embeds memory files with Google's Gemini embedding API so the agent can search past decisions by meaning, not just exact keywords.
 
@@ -160,8 +163,7 @@ Plain-English concepts:
 User (Telegram) -> Bridge (Node.js) -> Active Backend -> Response -> Telegram
                           ├─ Claude Code CLI
                           ├─ Codex CLI
-                          ├─ OpenCode (Kimi via OpenRouter)
-                          └─ OpenCode (Grok via OpenRouter)
+                          └─ OpenCode (OpenRouter profile)
                           ↓
                 Bridge Cron Scheduler -> active backend or command-only cron
                           ↓
@@ -208,10 +210,11 @@ Important files after install:
 | `/codex` | Use Codex backend |
 | `/codex --full` | Use Codex and force raw gap transcript injection from previous backend |
 | `/codex help` | List Codex model shortcuts |
-| `/kimi` | Use Kimi backend (Kimi K2.6 via OpenRouter) |
-| `/kimi --full` | Use Kimi and force raw gap transcript injection from previous backend |
-| `/grok` | Use Grok backend (Grok 4.3 via OpenRouter) |
-| `/grok --full` | Use Grok and force raw gap transcript injection from previous backend |
+| `/or list` | List OpenRouter profiles |
+| `/or profile <name>` | Use an OpenRouter profile |
+| `/or set <name> <provider/model>` | Save a custom OpenRouter profile |
+| `/or providers <name> --order A,B --fallbacks on\|off` | Configure OpenRouter provider routing |
+| `/kimi`, `/minimax`, `/grok` | Convenience aliases for OpenRouter profiles |
 | `/catchup` | Pull recent context from the OTHER backend without switching backends |
 | `/5.5`, `/5.4`, `/5.4-mini`, `/5.3-codex`, `/5.2`, `/5.2-codex`, `/5.1-codex-max`, `/5.1-codex-mini` | Set Codex model |
 | `/opus` | Switch Claude model to Opus 4.7 |
@@ -285,7 +288,7 @@ Smoke test:
 codex exec "Say OK" -c model_reasoning_effort='"xhigh"' -c model_verbosity='"low"'
 ```
 
-**Kimi & Grok:** Both run through OpenCode (`opencode` CLI on PATH) using OpenRouter as the upstream. The bridge reads `OPENROUTER_API_KEY` from your OS keychain. MCP servers configured in `.mcp.json` are loaded automatically by OpenCode at runtime; you can also edit them from the Settings UI MCP tab.
+**OpenRouter profiles:** Kimi, MiniMax, Grok, and any custom OpenRouter model ID run through OpenCode (`opencode` CLI on PATH). The bridge reads `OPENROUTER_API_KEY` from your OS keychain. MCP servers configured in `.mcp.json` are loaded automatically by OpenCode at runtime; you can edit profiles and provider routing from slash commands or Settings UI.
 
 **Bridge eval harness** (validates all slash commands across all backends):
 
