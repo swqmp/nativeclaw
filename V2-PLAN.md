@@ -123,30 +123,30 @@ Outputs `nativeclaw-diag-YYYY-MM-DD-HHMM.zip`. User DMs the zip to whoever is su
 
 ---
 
-### F. v2 Agent Intelligence Features (Formerly Hermes-Derived)
+### F. Agent Intelligence Features (Updated After v2.0 Ship)
 
-Research into Hermes Agent + testing of OpenCode/NativeClaw hybrid architecture surfaced five priority features for v2.0. These are **locked** for inclusion, not candidates.
+Research into Hermes Agent + testing of OpenCode/NativeClaw hybrid architecture surfaced five priority features. After the May 9 audit, the v2.0/v2.1 split is:
 
 | # | Feature | What it solves | Scope | Status |
 |---|---------|-------------|-------|--------|
-| 1 | **Skills auto-extraction** | After complex multi-step tasks, auto-craft a reusable `skills/auto-extracted/<id>.md` capturing tool sequence + reasoning pattern. Next similar task auto-loads the skill. | Bridge level — pattern detection after tool-heavy turns | **Locked for v2.0** |
-| 2 | **Context compaction (Mode A / OpenCode)** | When Kimi/Grok conversation history approaches context limit, auto-summarize oldest 50% of messages → inject as "Prior context" system message. Prevents the 262K wall. | Bridge-level session management; compression via lightweight model call | **Locked for v2.0** |
-| 3 | **Subagent delegation fix** | Spawn background agents as `child_process` with own OpenCode session. Parent returns immediately, polls for completion file on subsequent turns. No blocking. | Bridge `spawnSubagent()` refactor + completion-watch loop | **Locked for v2.0** |
-| 4 | **Background review enhancement** | Every 8-10 Claude Code messages: lightweight Haiku/GPT-mini "memory extraction" pass → append to session scratchpad → promote to MEMORY.md at session end. | Light subagent on existing backend — no bridge change | **Locked for v2.0** |
+| 1 | **Skills auto-extraction** | After complex multi-step tasks, auto-craft reusable skills. | Bridge level | **Pulled** - bag-of-words implementation produced unusable output |
+| 2 | **Context compaction (OpenRouter profiles)** | When an OpenRouter profile approaches context limit, summarize older history and start fresh with recap. | Bridge-owned inline compaction | **Shipped in v2.0** |
+| 3 | **Subagent delegation fix** | Spawn background agents without blocking Telegram turns. | Bridge `spawnSubagent()` refactor + completion-watch loop | **Deferred to v2.1** |
+| 4 | **Background review enhancement** | Periodic memory extraction pass. | Light subagent on existing backend | **Deferred** - AGENTS.md checkpoint discipline is enough for v2.0 |
 | 5 | **Continuous background review** | Long-running subagent that watches session transcripts in near-realtime, captures decisions as they happen. | Independent worker process, not ride-along per turn | **Investigate → likely v2.1** |
 
-**How context compaction works with the single-process model (Mode A):**
+**How context compaction works now:**
 
-1. Bridge maintains a per-session transcript file (e.g., `~/.claude/sessions/kimi/<id>.jsonl`) that records every message
-2. On each turn, bridge counts cumulative conversation size (system prompt + history + current message)
+1. OpenRouter profile sessions run through OpenCode and are stored in OpenCode's SQLite session store
+2. On each turn, bridge tracks turn usage and keeps the running session high-water mark
 3. When approaching threshold:
-   - **Kimi:** ~180K tokens (262K limit minus safety margin)
-   - **Grok:** ~150K tokens (1M limit but xAI's 200-tool cap is already handled by router)
-   - **Claude Code:** ~80K tokens (triggers at 65% of 200K to leave room for Claude's native compaction)
-4. Bridge spawns a **compression run**: `opencode run --model openrouter/anthropic/claude-haiku-4.5 --prompt "Summarize these N messages into 1-2 paragraphs capturing key decisions and open items. Keep it factual, not conversational."`
-5. Bridge receives summary back, then starts a **fresh session** with: system prompt + `{"role": "system", "content": "PRIOR CONTEXT: [summary]"}` + most recent 10 messages (the "live" window)
-6. From user perspective, the conversation continues seamlessly. The fresh session means OpenCode cold-start tax, but the cached system prompt makes it equivalent to a normal resume turn (~2s penalty, not 30s)
-7. For Claude Code lanes: this is a NO-OP. Claude handles its own compaction natively. The bridge only monitors and logs when it happens.
+   - **Kimi profile:** ~210K tokens by default
+   - **MiniMax profile:** ~160K tokens by default
+   - **Grok profile:** ~350K tokens by default
+   - Custom profiles can set `contextWindow` and `compactionThreshold`
+4. Bridge asks the active agent to write a checkpoint, then runs a sidecar summarizer
+5. Bridge starts a fresh OpenCode session with standing context + structured recap
+6. Claude and Codex remain native lanes. Codex rollover is token-aware; Claude uses its own native behavior plus bridge stats.
 
 This is analogous to what Hermes calls "context compression," but adapted for our stateless-turn architecture.
 
@@ -168,17 +168,7 @@ This is analogous to what Hermes calls "context compression," but adapted for ou
 Tonight's investigation produces a yes/no/defer decision per candidate. See Scope section F. Three candidates surfaced from Apr 28 research; final v2.0 inclusion pending the deeper dive. Trello card on Plans/Today bucket tracks the investigation task.
 
 ### 2. Voice transcription provider
-Currently bridge uses OpenAI cloud Whisper (whisper-1). Need a comparison study before v2.0 to decide what to default to, and what to offer:
-
-- **OpenAI Whisper API** (current) — paid, network-dependent, decent quality
-- **Local whisper.cpp** — free, private, fast on Apple Silicon, ~1GB model
-- **faster-whisper** (CTranslate2) — local, often 2-4x faster than vanilla
-- **distil-whisper** — smaller/faster, slight quality trade-off
-- **Groq Whisper API** — much faster than OpenAI, cheaper
-- **Deepgram / AssemblyAI** — managed alternatives, real-time streaming
-- **gpt-4o-transcribe** — newer multimodal option
-
-Deliverable: `docs/voice-transcription-research.md` comparing latency, cost per minute, quality (WER), install effort, supported languages, privacy story. Recommendation: which to ship as default + which to expose as user choice in Connections tab.
+Resolved for v2.0: xAI Grok STT is the default. OpenAI Whisper and local transcription remain fallback options.
 
 ### 3. Google Workspace OAuth client
 - **Option A:** ship a NativeClaw-owned shared OAuth client; users authenticate against it. Lower friction, but Jamiah owns the audit trail and verification status.
@@ -286,7 +276,7 @@ Power users who want nothing to change can ignore the wizard and settings UI ent
 
 ## v2 Candidate Decision — Mode B Universal (added 2026-05-06)
 
-**Open question for v2 architecture:** should NativeClaw standardize on OpenCode CLI as the single backend runner across all four lanes (Claude, Codex GPT, Kimi, Grok), enabling a single persistent `opencode serve` daemon that keeps MCPs warm for every turn regardless of which model is invoked?
+**Open question for future architecture:** should NativeClaw standardize on OpenCode CLI as the single backend runner across Claude, Codex GPT, and OpenRouter profiles, enabling a single persistent `opencode serve` daemon that keeps MCPs warm for every turn regardless of model?
 
 **Surfaced from:** the OpenCode migration prep (2026-05-06). Smoke test confirmed OpenCode handles all four model providers via OpenRouter, supports our 25 MCPs, has a clean JSON event schema, and ships `opencode serve` natively.
 
@@ -310,6 +300,40 @@ Power users who want nothing to change can ignore the wizard and settings UI ent
 
 ---
 
+## v3 Candidate — Subscription-Session Router (added 2026-05-15)
+
+**Idea from Jamiah:** later NativeClaw could route Telegram turns into existing subscription-backed TUI/session runners instead of relying on `claude -p` / Agent SDK-style programmatic calls. In rough terms: keep Telegram as the control surface, but have the bridge manage Claude, Codex, and OpenRouter-style sessions as live session runners, preserving subscription value where possible and avoiding unnecessary programmatic billing.
+
+**Why it matters:** Anthropic's June 15, 2026 Agent SDK credit change makes `claude -p`/SDK usage a separate credit bucket. If a future bridge can safely drive native interactive/session modes, NativeClaw may keep more work inside normal subscription lanes instead of paying per-token or burning limited Agent SDK credits.
+
+**Key constraint:** do not make the model itself manually manage unmanaged terminal sessions. The bridge must own lifecycle, session IDs, routing, locks, status, recovery, and Telegram delivery. The agent should make routing decisions, not babysit fragile PTYs.
+
+**Open research questions:**
+- Can Claude's interactive CLI/TUI be driven safely enough for production, or is `claude -p` the only reliable noninteractive surface?
+- Can Codex CLI be kept in a stable long-lived session with clean JSON/event extraction?
+- Does OpenRouter/OpenCode remain better as an explicit programmatic lane rather than a subscription-preservation lane?
+- What are the ToS / stability / failure-mode risks of TUI automation vs official programmatic APIs?
+
+**Decision gate:** revisit after v2.1 subagent delegation ships and after real June 15 Agent SDK billing behavior is observed. This is probably v3 architecture, not v2.1.
+
+---
+
+## v3 Candidate — Telegram Bot-to-Bot Messaging (added 2026-05-18)
+
+**Source:** Pavel Durov announcement 2026-05-18 (`https://x.com/durov/status/2056386732598432093`, 195k views): "AI devs asked for this — and we delivered. Bots can now talk to other bots on Telegram. Autonomous agents now have a communication layer humans can follow."
+
+**Why it matters for NativeClaw:** today's subagent delegation (v2.1 `/bg`) is a file-drop + bridge-poll pattern hidden from the user. If subagents can be addressable Telegram bots, delegation becomes visible in-thread — Whet calls a specialized bot (image gen, OCR, research, voice), the conversation is auditable, and the human sees the work without extra UI. Potential architecture: per-capability bots (e.g. `@whet_image_bot`, `@whet_ocr_bot`) that Whet messages directly; replies route back into the active thread.
+
+**Open research questions:**
+- What exactly does the Bot API surface look like? Tweet announces but didn't link docs — need to read the Telegram Bot API changelog / @BotFather notes.
+- Is bot-to-bot rate-limited differently from bot-to-human?
+- Does message routing back to the originating user thread require explicit thread/topic IDs, or does Telegram model bots as full participants in groups/threads?
+- How does this compose with our existing per-chat session/backend state machine?
+
+**Decision gate:** after v2.1 subagent delegation ships and we have real usage data on `/bg`. If delegation feels invisible/awkward in v2.1, bot-to-bot could be the v3 surface for it.
+
+---
+
 ## v2.1 Locked Spec — Subagent Delegation (added 2026-05-07)
 
 Decided 2026-05-07 with Whet. Originally listed under § F as "Locked for v2.0" but pulled to v2.1 because the orphan module (`lib/subagent-delegation.ts`) wasn't actually wired and needed a real spec before implementation.
@@ -330,7 +354,7 @@ Telegram message regardless of outcome. Status enum: `completed | failed | timeo
 Full primer (SOUL + USER + MEMORY + last 3 daily logs + TOOLS), same as a fresh `/reset` turn. No gap-transcript injection — subagent is its own thing, not a backend handoff.
 
 ### Continuity
-Standalone. Subagent runs in its own session. Result drops to Telegram as a free-standing message, not threaded into the originating Claude/Codex/Kimi/Grok session history.
+Standalone. Subagent runs in its own session. Result drops to Telegram as a free-standing message, not threaded into the originating Claude/Codex/OpenRouter profile session history.
 
 ### Caps
 - Wall-clock: 10 min default (override `/bg --max 30`, hard ceiling 60 min)
@@ -355,7 +379,7 @@ On startup, bridge rediscovers `~/.claude/.subagents/inflight/*.json`:
 - If dead: check for `done/<id>.json`; if missing, mark status `orphaned`, write minimal result, deliver to Telegram
 
 ### Self-spawn (agent-initiated)
-Whet (and any other agent on the install) can fire subagents via shared CLI: `bash ~/.claude/scripts/subagent fire --prompt "..." --backend <auto|claude|codex|kimi|grok> [--max] [--cost]`. Returns `{id, status: "queued"}` immediately. Same code path as `/bg`.
+Whet (and any other agent on the install) can fire subagents via shared CLI: `bash ~/.claude/scripts/subagent fire --prompt "..." --backend <auto|claude|codex|openrouter> [--profile <name>] [--max] [--cost]`. Returns `{id, status: "queued"}` immediately. Same code path as `/bg`.
 
 **Default agent pattern: fire-and-forget.** Agent calls `subagent fire` and returns. Telegram gets the result async via the standard delivery path. Agent does NOT poll its own subagent results unless explicitly synthesizing.
 
@@ -371,7 +395,7 @@ Whet (and any other agent on the install) can fire subagents via shared CLI: `ba
 ### CLI
 ```
 ~/.claude/scripts/subagent
-  fire --prompt "..." --backend <auto|claude|codex|kimi|grok> [--max 600] [--cost 2]
+  fire --prompt "..." --backend <auto|claude|codex|openrouter> [--profile <name>] [--max 600] [--cost 2]
   poll <id>
   list
   kill <id>
@@ -391,4 +415,3 @@ Whet (and any other agent on the install) can fire subagents via shared CLI: `ba
 
 ### Build estimate
 ~7-8 hours real work. Existing `lib/subagent-delegation.ts` is partially reusable (detached-spawn pattern is correct); throw out the OpenCode-only assumption and the dead `idleTimer` no-op.
-

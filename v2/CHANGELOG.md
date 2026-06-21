@@ -13,10 +13,11 @@ A major release. NativeClaw becomes an installable assistant with a visual setup
 - **Backup / Restore CLI** — `nativeclaw backup` zips workspace (excludes secrets by default; `--include-secrets` opts in). `nativeclaw restore` unpacks an archive on a fresh machine. Settings UI Backup tab triggers the same flow with one click.
 - **Diagnostic Dump** — `nativeclaw doctor` bundles logs, sanitized state, MCP health, system info into a zip you can DM for support. Settings UI Logs tab has the same as a one-click export.
 - **Voice transcription** — xAI Grok STT default (`api.x.ai/v1/stt`, `grok-stt` model). Wizard prompts for an xAI API key and links to console.x.ai for signup. Stored in OS keychain.
-- **Context compaction** — `lib/compaction.ts` monitors token totals across Claude / Codex / Kimi / Grok lanes. Auto-summarizes oldest messages on Kimi (~180k) and Grok (~150k) to prevent context-wall failures. Claude and Codex use their native auto-compaction.
-- **`/compact` slash command** — Manual compaction trigger across all four backends. Pipes to native compaction for Claude/Codex; invokes `lib/compaction.ts` for Kimi/Grok.
-- **Cron routing fix** — kimi/grok backend crons route through `runOpenCode` instead of falling through to Claude.
-- **/stats context window display** — `/stats` now shows `Context: <window> (<filled>k filled)` per backend (200k Claude default / 1M Claude Opus 4.7 / 128k Codex / 262k Kimi / 1M Grok), reading per-message usage from the session JSONL for accuracy across multi-tool turns.
+- **OpenRouter profiles** — Kimi, MiniMax, Grok, and custom OpenRouter model IDs now share one profile-based OpenCode lane. `/or list`, `/or profile`, `/or set`, and `/or providers` manage model IDs and provider routing.
+- **Context compaction** — Bridge-owned compaction monitors Claude, Codex, and OpenRouter-profile thresholds. The stale exported `lib/compaction.ts` module was removed; the live bridge is the source of truth.
+- **`/compact` slash command** — Manual compaction trigger across native and OpenRouter profile backends.
+- **Cron routing fix** — OpenRouter profile crons route through `runOpenCode` instead of falling through to Claude.
+- **/stats context window display** — `/stats` now separates `Context window` from `Current context`, and Codex uses `last_token_usage` instead of cumulative command totals.
 - **Cross-platform keychain shim and Windows DPAPI bindings** for credential storage parity.
 
 ### Changed
@@ -29,12 +30,13 @@ A major release. NativeClaw becomes an installable assistant with a visual setup
 - **OpenCode plugin hooks** (originally Phase A) — pulled before adoption due to 30-60s plugin-loader cold start per turn. Replaced architecturally by bridge-side stat capture and agent-owned memory discipline (`AGENTS.md` checkpoint rules).
 - **`lib/voice-handler.ts`** — orphan module with Groq/OpenAI/local fallback logic. Superseded by xAI Grok STT in production. Removed from source + dist.
 - **`lib/skills-extractor.ts`** — orphan module that auto-generated "skill" markdown via bag-of-words pattern matching on assistant prose. Output was unusable; module never wired. Removed from source + dist.
+- **`lib/compaction.ts`** — stale exported module with old Kimi/Grok assumptions. Removed from v2 exports; bridge inline compaction remains the maintained implementation.
 
 ### Deferred to v2.1
 
 - **Subagent Delegation** — `/bg <prompt>` slash command with detached-process subagents, fire-and-forget delivery to Telegram, two-pass MEMORY evaluation. Full spec in `V2-PLAN.md` § "v2.1 Locked Spec — Subagent Delegation".
 - **Background memory review** — automatic Haiku-driven memory extraction every N turns. Skipped because the AGENTS.md manual checkpoint discipline already covers this. Revisit with subagent infrastructure.
-- **Bridge-side OpenCode tool-prefix injection** — `lib/bridge-checkpoint.ts` left in tree but unwired. May be revisited if Kimi/Grok output visibility becomes a problem.
+- **Bridge-side OpenCode tool-prefix injection** — `lib/bridge-checkpoint.ts` left in tree but unwired. May be revisited if OpenRouter profile output visibility becomes a problem.
 
 ### Migration from v1.10.x
 

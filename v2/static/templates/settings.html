@@ -60,7 +60,9 @@
         <div class="field"><label>Agent name</label><input id="agentName" /></div>
         <div class="field"><label>User name</label><input id="userName" /></div>
         <div class="field"><label>Default model</label><select id="defaultModel"><option value="sonnet">Claude Sonnet 4.6</option><option value="opus">Claude Opus 4.6</option><option value="haiku">Claude Haiku 4.5</option></select></div>
-        <div class="field"><label>Default backend</label><select id="defaultBackend"><option value="claude">Claude</option><option value="codex">Codex (OpenAI)</option><option value="kimi">Kimi (OpenRouter)</option><option value="grok">Grok (OpenRouter)</option></select></div>
+        <div class="field"><label>Default backend</label><select id="defaultBackend"><option value="claude">Claude</option><option value="codex">Codex (OpenAI)</option><option value="openrouter">OpenRouter profile</option></select></div>
+        <div class="field"><label>Default OpenRouter profile</label><input id="defaultOpenRouterProfile" placeholder="kimi" /></div>
+        <div class="field"><label>OpenRouter profiles JSON</label><textarea id="openRouterProfilesJson" placeholder='{"kimi":{"model":"moonshotai/kimi-k2.6"}}'></textarea></div>
         <button class="btn" id="save-config">Save Config</button>
       </div>
     </div>
@@ -74,7 +76,7 @@
         <h2>Telegram</h2>
         <div class="field"><label>Bot token</label><input id="botToken" type="password" /><div class="help">Stored in config.json; never logged.</div></div>
         <h2>Voice Transcription</h2>
-        <div class="field"><label>Provider</label><select id="voiceProvider"><option value="groq">Groq Whisper (default)</option><option value="openai">OpenAI Whisper</option><option value="local">Local whisper.cpp</option></select></div>
+        <div class="field"><label>Provider</label><select id="voiceProvider"><option value="xai">xAI Grok STT (default)</option><option value="openai">OpenAI Whisper</option><option value="local">Local whisper.cpp</option></select></div>
       </div>
     </div>
 
@@ -104,7 +106,7 @@
     }));
     (async()=>{
       try { const s = await api('/api/status'); document.getElementById('bridge-status').innerHTML = '<span class="status-badge '+(s.bridgeAlive?'status-ok':'status-err')+'">'+(s.bridgeAlive?'Alive':'Dead')+'</span> last msg '+s.lastMsgTime; } catch(e){ document.getElementById('bridge-status').textContent='Error: '+e.message; }
-      try { const c = await api('/api/config'); document.getElementById('agentName').value=c.agentName||''; document.getElementById('userName').value=c.userName||''; document.getElementById('defaultModel').value=c.model||'sonnet'; document.getElementById('defaultBackend').value=c.defaultBackend||'claude'; } catch{}
+      try { const c = await api('/api/config'); document.getElementById('agentName').value=c.agentName||''; document.getElementById('userName').value=c.userName||''; document.getElementById('defaultModel').value=c.model||'sonnet'; document.getElementById('defaultBackend').value=c.defaultBackend||'claude'; document.getElementById('defaultOpenRouterProfile').value=c.defaultOpenRouterProfile||'kimi'; document.getElementById('openRouterProfilesJson').value=JSON.stringify(c.openRouterProfiles||{}, null, 2); } catch{}
     })();
   </script>
 </body>

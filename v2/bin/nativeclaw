@@ -41,7 +41,7 @@ Commands:
 
 Environment:
   NATIVECLAW_WORKSPACE   Path to workspace (default: ~/.claude)
-  NATIVECLAW_BACKEND   Default backend (claude|codex|kimi|grok)
+  NATIVECLAW_BACKEND   Default backend (claude|codex|openrouter)
   NODE_ENV             development | production
 `);
 }

@@ -7,11 +7,9 @@
 │   ├── status              # Bridge health snapshot
 │   └── bridge-wrapper      # Managed bridge runner (restart on crash)
 ├── lib/
-│   ├── compaction.ts        # Context-window compaction module
-│   ├── skills-extractor.ts # Auto-extract reusable skills
 │   ├── subagent-delegation.ts # Background agent spawning
-│   ├── voice-handler.ts   # Groq/OpenAI/local transcription
 │   ├── credentials.ts     # Cross-platform keychain abstraction
+│   ├── openrouter-profiles.ts # OpenRouter profile schema and resolver
 │   └── bridge-checkpoint.ts # Bridge-side checkpoint visibility
 ├── wizard/
 │   ├── setup-core.ts       # Shared setup logic (web + terminal)

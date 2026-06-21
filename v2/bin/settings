@@ -14,7 +14,6 @@ const crypto = require('crypto');
 
 const HOME = process.env.HOME || process.env.USERPROFILE;
 const SETTINGS_DIR = path.join(HOME, '.claude', 'nativeclaw-settings');
-const TOKEN_FILE = path.join(SETTINGS_DIR, '.token');
 const LAST_PING_FILE = path.join(SETTINGS_DIR, '.last-ping');
 const IDLE_TIMEOUT_MS = 30 * 60 * 1000;
 const BASE_PORT = 9292;
@@ -31,19 +30,9 @@ const SECRET_FIELDS = ['botToken', 'openaiApiKey', 'anthropicApiKey', 'xaiApiKey
 
 function generateToken() { return crypto.randomBytes(32).toString('hex'); }
 
-function readToken() {
-  try { return fs.readFileSync(TOKEN_FILE, 'utf8').trim(); } catch { return null; }
-}
-
 function getAuthToken() {
-  let token = readToken();
-  if (!token) {
-    token = generateToken();
-    fs.mkdirSync(SETTINGS_DIR, { recursive: true });
-    fs.writeFileSync(TOKEN_FILE, token);
-    fs.chmodSync(TOKEN_FILE, 0o600);
-  }
-  return token;
+  fs.mkdirSync(SETTINGS_DIR, { recursive: true });
+  return generateToken();
 }
 
 function updatePing() { fs.writeFileSync(LAST_PING_FILE, String(Date.now())); }
@@ -272,9 +261,10 @@ function buildHTML(token, port) {
         <select id="defaultBackend">
           <option value="claude">Claude</option>
           <option value="codex">Codex (OpenAI)</option>
-          <option value="kimi">Kimi (OpenRouter, experimental)</option>
-          <option value="grok">Grok (OpenRouter)</option>
+          <option value="openrouter">OpenRouter profile</option>
         </select></div>
+      <div class="field"><label>Default OpenRouter profile</label><input id="defaultOpenRouterProfile" placeholder="kimi" /><div class="help">Used by the generic OpenRouter backend. Aliases like /kimi and /minimax still select their named profiles.</div></div>
+      <div class="field"><label>OpenRouter profiles JSON</label><textarea id="openRouterProfilesJson" placeholder='{"kimi":{"model":"moonshotai/kimi-k2.6"}}'></textarea><div class="help">Profiles use OpenRouter model IDs such as <code>moonshotai/kimi-k2.6</code>. Optional provider routing supports <code>order</code> and <code>allow_fallbacks</code>.</div></div>
       <div class="field"><label>Default effort</label>
         <select id="defaultEffort">
           <option value="low">low</option>
@@ -391,6 +381,8 @@ async function loadConfig() {
     document.getElementById('userName').value = c.userName || '';
     document.getElementById('defaultModel').value = c.model || 'claude-sonnet-4-6';
     document.getElementById('defaultBackend').value = c.defaultBackend || 'claude';
+    document.getElementById('defaultOpenRouterProfile').value = c.defaultOpenRouterProfile || 'kimi';
+    document.getElementById('openRouterProfilesJson').value = JSON.stringify(c.openRouterProfiles || {}, null, 2);
     document.getElementById('defaultEffort').value = c.effort || 'medium';
     document.getElementById('voiceProvider').value = c.voiceProvider || 'xai';
     document.getElementById('botToken').placeholder = c.botToken === '••• set •••' ? 'Bot token set — leave blank to keep' : 'Paste bot token';
@@ -486,8 +478,14 @@ document.getElementById('save-config').addEventListener('click', async () => {
     userName: document.getElementById('userName').value.trim(),
     model: document.getElementById('defaultModel').value,
     defaultBackend: document.getElementById('defaultBackend').value,
+    defaultOpenRouterProfile: document.getElementById('defaultOpenRouterProfile').value.trim() || 'kimi',
     effort: document.getElementById('defaultEffort').value,
   };
+  const rawProfiles = document.getElementById('openRouterProfilesJson').value.trim();
+  if (rawProfiles) {
+    try { updates.openRouterProfiles = JSON.parse(rawProfiles); }
+    catch(e) { toast('OpenRouter profiles JSON is invalid: ' + e.message, 'err'); return; }
+  }
   try {
     await api('/api/config', { method:'POST', body: JSON.stringify(updates) });
     toast('Config saved');

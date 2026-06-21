@@ -134,9 +134,7 @@ export class WizardServer {
       <option value="both">Claude + Codex (recommended)</option>
       <option value="claude">Claude only — flat-rate via Claude Max</option>
       <option value="codex">Codex (OpenAI) only</option>
-      <option value="kimi">Kimi (OpenRouter, experimental)</option>
-      <option value="grok">Grok (OpenRouter)</option>
-      <option value="all">All four</option>
+      <option value="openrouter">OpenRouter profiles (Kimi, MiniMax, Grok, etc.)</option>
     </select>
     <div class="btn-row">
       <button class="btn secondary" onclick="prev()">Back</button>
@@ -437,7 +435,7 @@ show(0);
       { cmd: 'node', args: ['-v'], label: 'Node.js' },
       { cmd: 'claude', args: ['--version'], label: 'Claude CLI' },
       { cmd: 'codex', args: ['--version'], label: 'Codex CLI' },
-      { cmd: 'opencode', args: ['--version'], label: 'OpenCode (for Kimi/Grok)' },
+      { cmd: 'opencode', args: ['--version'], label: 'OpenCode (for OpenRouter profiles)' },
     ];
     let i = 0;
     const next = () => {

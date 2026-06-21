@@ -7,7 +7,7 @@
 - **One of the following AI backends:**
   - Claude CLI (via Anthropic)
   - Codex CLI (via OpenAI)
-  - OpenCode CLI (for Kimi/Grok via OpenRouter)
+  - OpenCode CLI (for configurable OpenRouter profiles)
 - **Telegram bot token** — from @BotFather
 - **macOS / Linux / Windows**
 
@@ -101,7 +101,7 @@ nativeclaw setup
 ```
 
 It will ask for:
-1. **Backend choice** — Claude / Codex / Kimi / Grok / multiple
+1. **Backend choice** — Claude / Codex / OpenRouter profiles / multiple
 2. **Agent identity** — name, user name, vibe template
 3. **Telegram connection** — bot token + auto-detect chat ID
 4. **Optional features** — QMD memory, voice transcription
@@ -149,7 +149,7 @@ schtasks /Run /TN "NativeClaw"
 | `nativeclaw: command not found` | Ensure `~/.local/bin` (macOS/Linux) or the equivalent is on your PATH |
 | `tsc: not found` | Run `npm install` again; check that `typescript` is in `node_modules/.bin` |
 | Bridge not starting | Run `nativeclaw status` to see errors; check `~/.claude/logs/telegram-bridge.log` |
-| Kimi/Grok crons running on Claude | Ensure `~/.claude/telegram-bridge/bridge.js` has the cron fix from v2.0. Run `npm run build` |
+| OpenRouter profile crons running on Claude | Ensure `~/.claude/telegram-bridge/bridge.js` has the v2.0 OpenRouter cron branch. Run `npm run build` |
 | Settings UI 404 | Check token in URL matches the server's generated token |
 | Windows certificate issues | Make sure `cmdkey` or Credential Manager is available |
 

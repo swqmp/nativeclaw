@@ -1,0 +1,44 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "openrouter": {
+      "models": {
+        "minimax/minimax-m2.7": {
+          "options": {
+            "provider": {
+              "order": [
+                "Fireworks",
+                "Morph",
+                "SambaNova"
+              ],
+              "allow_fallbacks": false
+            }
+          }
+        }
+      }
+    }
+  },
+  "mcp": {
+    "tool-router": {
+      "type": "local",
+      "command": [
+        "node",
+        "/Users/iamiahbartlett/.claude/workspace/system/mcp/tool-router/server.js"
+      ],
+      "enabled": true,
+      "environment": {
+        "TOOL_ROUTER_CONFIG": "/Users/iamiahbartlett/.claude/workspace/system/mcp/tool-router/wrapped-config.json"
+      }
+    }
+  },
+  "permission": {
+    "read": "allow",
+    "edit": "allow",
+    "bash": "allow",
+    "webfetch": "allow",
+    "external_directory": {
+      "/Users/iamiahbartlett/*": "allow",
+      "/tmp/*": "allow"
+    }
+  }
+}

@@ -3,6 +3,12 @@
 
 export { NativeClawSetup } from './wizard/setup-core';
 export { WizardServer } from './wizard/server';
-export { ContextCompaction, MODEL_COMPACTION_THRESHOLDS } from './lib/compaction';
 export { SubagentDelegator } from './lib/subagent-delegation';
 export { getCredentials } from './lib/credentials';
+export {
+  DEFAULT_OPENROUTER_PROFILES,
+  normalizeModelId,
+  normalizeProfileName,
+  parseProviderOrder,
+  resolveOpenRouterProfile,
+} from './lib/openrouter-profiles';

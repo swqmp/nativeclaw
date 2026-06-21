@@ -16,13 +16,13 @@ If the bridge is down, restart with the method for your OS:
 
 ## Common Issues
 
-### 1. Kimi/Grok crons silently falling through to Claude
+### 1. OpenRouter profile crons silently falling through to Claude
 
-**Symptom:** Bridge log shows crons like `Cron heartbeat completed: $0.20, 5 turns` but without `[kimi]` / `[grok]` bracketed backend in the log line.
+**Symptom:** Bridge log shows crons like `Cron heartbeat completed: $0.20, 5 turns` but without `[openrouter]` or the active profile lane in the log line.
 
 **Fix:** Ensure `~/.claude/telegram-bridge/bridge.js` has the cron routing fix from v2.0. Look for:
 ```js
-} else if (cronBackend === 'kimi' || cronBackend === 'grok') {
+} else if (cronBackend === 'openrouter' || cronBackend === 'kimi' || cronBackend === 'minimax') {
   ... runOpenCode(...)
 ```
 

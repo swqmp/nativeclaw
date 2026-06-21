@@ -1,30 +1,27 @@
 #!/usr/bin/env node
 
 /**
- * Cron Routing Test — Validate kimi/grok crons hit runOpenCode
+ * Cron Routing Test — Validate OpenRouter-profile crons hit runOpenCode
  * Usage: node test-cron-routing.js
  */
 
 const assert = require('assert');
-const bridgePath = require('path').join(
-  process.env.HOME || process.env.USERPROFILE,
-  '.claude', 'telegram-bridge', 'bridge.js'
-);
+const path = require('path');
+const bridgePath = process.env.NATIVECLAW_BRIDGE_PATH
+  || path.resolve(__dirname, '..', '..', 'bridge', 'bridge.js');
 
 // Read bridge.js as text and validate the routing logic exists
 const code = require('fs').readFileSync(bridgePath, 'utf8');
 
 // Assertions
-assert(code.includes("cronBackend === 'kimi' || cronBackend === 'grok'"), 'Missing kimigrok branch');
+assert(code.includes("cronBackend === 'openrouter' || cronBackend === 'kimi' || cronBackend === 'minimax'"), 'Missing OpenRouter cron branch');
 assert(code.includes("runOpenCode(cronPrompt, null,"), 'Missing runOpenCode call in cron');
-assert(code.includes("openrouter/moonshotai/kimi-k2.6"), 'Missing kimi model string');
-assert(code.includes("openrouter/x-ai/grok-4.3"), 'Missing grok model string');
-assert(code.includes(".config/opencode/opencode.json"), 'Missing kimi config path');
-assert(code.includes(".config/opencode/opencode.grok.json"), 'Missing grok config path');
+assert(code.includes("resolveActiveOpenRouterProfile"), 'Missing active OpenRouter profile resolver');
+assert(code.includes("openRouterConfigPathForProfile"), 'Missing OpenRouter profile config path helper');
 assert(code.includes("readKeychainSecret('OPENROUTER_API_KEY')"), 'Missing OpenRouter key read');
 
 console.log('✅ All cron routing assertions passed.');
-console.log('When bridge restarts, Kimi/Grok crons will route correctly.\n');
+console.log('When bridge restarts, OpenRouter profile crons will route correctly.\n');
 
 // Optionally validate syntax by requiring (will crash if syntax error)
 try {

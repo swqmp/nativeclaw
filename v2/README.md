@@ -2,7 +2,7 @@
 
 ⚡ **NativeClaw** — a personal AI agent that lives in your terminal and texts you back.
 
-> Works with Claude, Codex, Kimi, and Grok. Runs 24/7 as a background service.
+> Works with Claude, Codex, and configurable OpenRouter profiles. Runs 24/7 as a background service.
 
 ---
 
@@ -44,7 +44,7 @@ Follow the prompts. You will need:
 
 ## Features
 
-- **🤖 Multi-backend** — Claude, Codex (OpenAI), Kimi (OpenRouter), Grok (OpenRouter)
+- **🤖 Multi-backend** — Claude, Codex (OpenAI), and OpenRouter profiles (Kimi, MiniMax, Grok, etc.)
 - **💬 Telegram** — Text + voice messages. Replies in the same chat.
 - **🧠 Persistent memory** — SOUL.md, MEMORY.md, daily logs. Survives reboots.
 - **📅 Crons** — Morning brief, heartbeat, session audit, tasks queue recovery
@@ -72,7 +72,7 @@ manages sessions, schedules crons, and wires 25+ MCP servers.
 
 | Version | Date | What's New |
 |---------|------|-----------|
-| v2.0.0 | 2026-05 | Setup wizard, settings UI, Windows port, voice (xAI Grok STT), Kimi/Grok auto-compaction, `/compact`, `/stats` context window |
+| v2.0.0 | 2026-05 | Setup wizard, settings UI, Windows port, voice (xAI Grok STT), OpenRouter profiles, `/compact`, `/stats` context window |
 | v1.10.4 | 2026-04 | Tool router, OpenCode lanes, cron routing fixes |
 | v1.10.0 | 2026-04 | Agent reliability stack — memory, MCP health, context preservation |
 | v1.9.x | 2026-03 | Codex-OpenRouter integration, subagent background workers |

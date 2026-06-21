@@ -6,7 +6,7 @@ const HOME = process.env.HOME || process.env.USERPROFILE || '';
 
 interface WizardState {
   step: number;
-  backend: 'claude' | 'codex' | 'both' | 'kimi' | 'grok';
+  backend: 'claude' | 'codex' | 'both' | 'openrouter';
   agentName: string;
   userName: string;
   botToken: string;
@@ -64,7 +64,7 @@ export class NativeClawSetup {
     console.log('You will need:');
     console.log('  • A Telegram bot token (from @BotFather)');
     console.log('  • Node.js 18+ installed');
-    console.log('  • Claude CLI and/or Codex CLI (and/or OpenCode for Kimi/Grok)\n');
+    console.log('  • Claude CLI and/or Codex CLI (and/or OpenCode for OpenRouter profiles)\n');
     return 'continue';
   }
 
@@ -118,9 +118,7 @@ export class NativeClawSetup {
         { name: 'both', message: 'Claude + Codex (recommended)' },
         { name: 'claude', message: 'Claude only' },
         { name: 'codex', message: 'Codex (OpenAI) only' },
-        { name: 'kimi', message: 'Kimi (OpenRouter — experimental)' },
-        { name: 'grok', message: 'Grok (OpenRouter — experimental)' },
-        { name: 'all', message: 'All four (Claude + Codex + Kimi + Grok)' },
+        { name: 'openrouter', message: 'OpenRouter profiles (Kimi, MiniMax, Grok, etc.)' },
       ],
     });
     this.state.backend = backend;
@@ -277,6 +275,23 @@ export class NativeClawSetup {
       workspace: path.join(HOME, '.claude', 'workspace'),
       model: 'sonnet',
       defaultBackend: this.state.backend === 'both' ? 'claude' : this.state.backend,
+      defaultOpenRouterProfile: 'kimi',
+      openRouterProfiles: {
+        kimi: {
+          model: 'moonshotai/kimi-k2.6',
+          display: 'Kimi K2.6',
+          contextWindow: 262144,
+          compactionThreshold: 210000,
+          provider: { order: ['WandB', 'Cloudflare', 'Fireworks'], allow_fallbacks: false },
+        },
+        minimax: {
+          model: 'minimax/minimax-m2.7',
+          display: 'MiniMax M2.7',
+          contextWindow: 197000,
+          compactionThreshold: 160000,
+          provider: { order: ['Fireworks', 'Morph', 'SambaNova'], allow_fallbacks: false },
+        },
+      },
       agentName: this.state.agentName,
       userName: this.state.userName,
       mcpConfig: path.join(HOME, '.claude', '.mcp.json'),

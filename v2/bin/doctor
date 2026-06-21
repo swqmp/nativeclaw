@@ -35,7 +35,7 @@ function sanitizeState(raw) {
   try {
     const obj = JSON.parse(raw);
     // redact session IDs
-    ['sessions', 'codexSessions', 'kimiSessions', 'grokSessions'].forEach((k) => {
+    ['sessions', 'codexSessions', 'kimiSessions', 'minimaxSessions', 'openrouterSessions'].forEach((k) => {
       if (obj[k]) obj[k] = '<redacted>';
     });
     return JSON.stringify(obj, null, 2);

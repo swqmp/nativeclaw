@@ -6,18 +6,51 @@
   "workspace": "~/.claude/workspace",
   "model": "sonnet",
   "defaultBackend": "claude",
+  "defaultOpenRouterProfile": "kimi",
   "agentName": "Whet",
   "userName": "User",
   "mcpConfig": "~/.claude/.mcp.json",
   "cronSchedule": "~/.claude/cron-schedule.json",
   "compactionThresholds": {
-    "openrouter/moonshotai/kimi-k2.6": 180000,
+    "openrouter/moonshotai/kimi-k2.6": 210000,
+    "openrouter/minimax/minimax-m2.7": 160000,
     "openrouter/x-ai/grok-4.3": 350000,
     "openrouter/anthropic/claude-haiku-4.5": 100000,
     "claude-sonnet-4.6": 140000
   },
-  "voiceProvider": "groq",
-  "voiceModel": "whisper-large-v3",
+  "openRouterProfiles": {
+    "kimi": {
+      "model": "moonshotai/kimi-k2.6",
+      "display": "Kimi K2.6",
+      "contextWindow": 262144,
+      "compactionThreshold": 210000,
+      "provider": {
+        "order": ["WandB", "Cloudflare", "Fireworks"],
+        "allow_fallbacks": false
+      }
+    },
+    "minimax": {
+      "model": "minimax/minimax-m2.7",
+      "display": "MiniMax M2.7",
+      "contextWindow": 197000,
+      "compactionThreshold": 160000,
+      "provider": {
+        "order": ["Fireworks", "Morph", "SambaNova"],
+        "allow_fallbacks": false
+      }
+    },
+    "grok": {
+      "model": "x-ai/grok-4.3",
+      "display": "Grok 4.3",
+      "contextWindow": 1000000,
+      "compactionThreshold": 350000,
+      "provider": {
+        "allow_fallbacks": true
+      }
+    }
+  },
+  "voiceProvider": "xai",
+  "voiceModel": "grok-stt",
   "debugLogging": false,
   "version": "2.0.0"
 }
